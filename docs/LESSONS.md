@@ -367,3 +367,17 @@ personal data** (this repo is public; use repo-relative paths).
   `derive(Clone, Copy)` — an ergonomics detail, not a behavioural change. The by-value copy is a
   documented divergence (ADR-0032); a consumer needing zero-copy snapshots layers it on the storage
   backend.
+- **A read/byte stream is a no-wait iterator over what you locally have, not an async tail.** Upstream's
+  `createReadStream`/`createByteStream` are async, backpressured, optionally `live` (tail for new blocks),
+  and the byte stream addresses the *value* byte layout. At L1 the behaviour-under-test collapses to a
+  synchronous `Iterator`: the read stream yields decoded blocks over `[start, end)` (forward or reverse,
+  `end` clamped to `len`), and the byte stream `seek`s to the start block then emits whole **encoded**
+  blocks until the byte budget is spent (an empty-payload block is still emitted while budget > 0 — that's
+  the "decode blocks that don't contribute to byte length" case; with framing an "empty" payload is a
+  1-byte block, but the property "every block in range is emitted" still holds). Two consequences fall out
+  for free: (1) `live` has nothing to tail (no peer), so **accept-and-ignore** it — upstream's "live should
+  be ignored" then passes by construction; (2) absent blocks (`clear`ed / never downloaded) are *skipped*
+  (no-wait, matching `get`'s `None`), so a stream over a holey core yields the present blocks in order.
+  Keep byte offsets over the **encoded** layout the tree authenticates (not the payload — the `padding`
+  divergence, ADR-0022); derive the test's offsets/lengths from `block(i).len()`, not hardcoded payload
+  sizes. `createWriteStream` is just buffered `append` — no new L1 behaviour, don't build a type for it.

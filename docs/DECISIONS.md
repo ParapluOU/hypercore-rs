@@ -608,3 +608,39 @@ layer it on the storage backend) and **defer**: `signedLength` propagation over 
 per-call snapshotting during a live download, `createReadStream`/streams (`streams.js`), and the
 session/atom cases (sessions/networking, out of scope). Soundness of the independent-authentication
 property rests on the same head-signature + inclusion-proof guarantees the core already provides.
+
+## ADR-0033 — Read/byte streams are no-wait L1 iterators; byte addressing is encoded-byte, padding-free
+**Context:** Upstream hypercore (`reference/js/hypercore/test/streams.js`) exposes
+`createReadStream({ start, end, live, reverse, snapshot })` — an async iterator over **decoded** blocks —
+and `createByteStream({ byteOffset, byteLength })` — an async iterator over **raw block buffers** covering
+a byte range, located by the byte-seek — plus `createWriteStream` (a writable that appends). `live` tails
+the log for newly-appended blocks; both are Node duplex/readable streams with backpressure; and the byte
+stream's offsets are over the raw **value** byte layout (upstream stores values un-framed). The
+async-runtime/duplex-stream machinery is session/runtime plumbing, `live` tailing is networking, and
+value-byte addressing needs the per-block framing `padding` we deliberately omitted (ADR-0022).
+**Decision:** Reimplement the **L1 behaviour-under-test** as synchronous Rust **iterators**:
+- `read_stream(ReadStreamOptions { start, end, reverse, live })` → `ReadStream`, yielding
+  `Result<T, Error>` for each **present** block in `[start, end)`, forward or `reverse`. `end` defaults to
+  and is clamped to `len()`. It is **no-wait** (consistent with `get`): an absent block — never downloaded
+  or dropped by `clear` — is *skipped*, not waited on (there is no peer at L1). `live` is accepted but
+  **ignored** (no async tail to keep open), so upstream's "live should be ignored" case ports directly
+  (set `live: true`, the stream still stops at `end`).
+- `byte_stream(ByteStreamOptions { byte_offset, byte_length })` → `ByteStream`, yielding
+  `Result<Vec<u8>, Error>` of whole **encoded** blocks covering `[byte_offset, byte_offset+byte_length)`:
+  `seek(byte_offset)` locates the start block, whole blocks are emitted until the byte budget is consumed
+  (`byte_length` defaults to the rest of the log), and an empty-payload block is still emitted while the
+  budget is non-zero (upstream's "decode previous blocks even though they don't contribute to byte
+  length"). Offsets address the **encoded** byte layout the tree authenticates, not the decoded payload —
+  the `padding` divergence (ADR-0022): a consumer subtracts its own framing before seeking; a non-boundary
+  offset emits the whole block it lands in.
+- `createWriteStream` is a buffered `append` of the same blocks — no new L1 behaviour — so it is covered by
+  `append`/batch and is **not** given its own type.
+**Consequence:** `streams.js` moves `[ ]`→`[~]`: read/byte stream iteration (start/end/reverse, the
+byteOffset/byteLength cases, empty-payload blocks, and the L1 form of "live ignored") is ported and
+host-safe under `just verify`, reusing the existing `get`/`block`/`seek`. We **diverge** on byte
+addressing (encoded bytes vs upstream's value bytes + `padding` — identical observable behaviour for a
+framing-aware consumer) and **defer**: `live` tailing (async/networking), duplex-stream backpressure (Node
+runtime), sub-block byte slicing of a non-boundary offset + `padding`, and the snapshot/session-bound
+stream variants (`{ snapshot }` / atom — sessions/networking, out of scope). `move-to.js` (the move-to
+operation) and the write-stream object remain. Soundness is unchanged — streams are read-only views over
+already-authenticated blocks.

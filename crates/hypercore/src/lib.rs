@@ -56,6 +56,52 @@ pub struct Truncation {
     pub to: u64,
 }
 
+/// Options for [`Hypercore::read_stream`] — a forward (or `reverse`) iteration
+/// over the decoded blocks in `[start, end)`. The L1 form of upstream's
+/// `createReadStream` options.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadStreamOptions {
+    /// First block index to emit (inclusive). Default `0`.
+    pub start: u64,
+    /// One past the last block index to emit (exclusive). `None` means the log's
+    /// current length; an explicit value is clamped to it. Default `None`.
+    pub end: Option<u64>,
+    /// Emit the range highest-index-first. Default `false`.
+    pub reverse: bool,
+    /// Upstream's `live` (keep tailing past `end` for newly-appended blocks). At
+    /// L1 there is no peer/async tail, so a read stream is always a point-in-time
+    /// view of `[start, end)` and this flag is **ignored** (deferred with
+    /// networking). Kept so upstream's "live should be ignored" case ports
+    /// directly — set it `true` and the stream still stops at `end`.
+    pub live: bool,
+}
+
+impl Default for ReadStreamOptions {
+    fn default() -> Self {
+        Self { start: 0, end: None, reverse: false, live: false }
+    }
+}
+
+/// Options for [`Hypercore::byte_stream`] — yields whole encoded blocks covering
+/// the byte range `[byte_offset, byte_offset + byte_length)`. The L1 form of
+/// upstream's `createByteStream` options.
+#[derive(Clone, Copy, Debug)]
+pub struct ByteStreamOptions {
+    /// Byte offset at which to start. The stream begins at the block this offset
+    /// falls in (located via the tree's [`seek`](merkle::MerkleTree::seek)).
+    /// Default `0`.
+    pub byte_offset: u64,
+    /// Number of bytes to cover from `byte_offset`. `None` means "to the end" —
+    /// the log's total byte length minus `byte_offset`. Default `None`.
+    pub byte_length: Option<u64>,
+}
+
+impl Default for ByteStreamOptions {
+    fn default() -> Self {
+        Self { byte_offset: 0, byte_length: None }
+    }
+}
+
 /// Errors from a [`Hypercore`], parameterised over the backend's error type.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<SE> {
@@ -386,6 +432,48 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         Ok(cleared)
     }
 
+    /// A read stream over the decoded blocks in a range — the L1 form of upstream
+    /// `createReadStream`. Yields each present block's value in index order (or
+    /// reverse, per [`ReadStreamOptions::reverse`]); `start`/`end` bound it to
+    /// `[start, end)` (`end` defaults to, and is clamped to, [`len`](Self::len)).
+    ///
+    /// It is a **no-wait** stream (consistent with [`get`](Self::get)): a block in
+    /// the range that is absent — never downloaded, or dropped by
+    /// [`clear`](Self::clear) — is *skipped* rather than waited on, since at L1
+    /// there is no peer to fetch it from. Each item is a `Result` because reading
+    /// or decoding a present block can still fail (storage / codec error). `live`
+    /// is ignored (see [`ReadStreamOptions`]).
+    ///
+    /// A `createWriteStream` is just a buffered [`append`](Self::append) of the
+    /// same blocks, so it adds no L1 behaviour and is covered by append/batch.
+    pub fn read_stream(&self, opts: ReadStreamOptions) -> ReadStream<'_, T, C, S> {
+        let end = opts.end.unwrap_or_else(|| self.tree.len()).min(self.tree.len());
+        let lo = opts.start.min(end);
+        ReadStream { core: self, lo, hi: end, reverse: opts.reverse }
+    }
+
+    /// A byte stream over the log — the L1 form of upstream `createByteStream`.
+    /// Yields whole **encoded** blocks (the raw stored bytes, exactly as the
+    /// Merkle tree committed them) covering the byte range `[byte_offset,
+    /// byte_offset + byte_length)`: it [`seek`](merkle::MerkleTree::seek)s to the
+    /// block containing `byte_offset` and emits whole blocks until the byte budget
+    /// is consumed (`byte_length` defaults to "to the end"). A block whose payload
+    /// is empty is still emitted as long as the budget is not yet exhausted
+    /// (upstream's "decode previous blocks even though they don't contribute to
+    /// byte length").
+    ///
+    /// Byte offsets address the **encoded** byte layout the tree authenticates,
+    /// not the decoded payload — we keep per-block framing out of L1 (the seek
+    /// `padding` divergence, ADR-0022); a consumer subtracts its own framing
+    /// before seeking. A non-boundary `byte_offset` emits the whole block it lands
+    /// in (sub-block slicing is deferred). No-wait, like [`read_stream`](Self::read_stream).
+    pub fn byte_stream(&self, opts: ByteStreamOptions) -> ByteStream<'_, T, C, S> {
+        let total = self.tree.byte_length();
+        let budget = opts.byte_length.unwrap_or_else(|| total.saturating_sub(opts.byte_offset));
+        let (start_block, _) = self.tree.seek(opts.byte_offset);
+        ByteStream { core: self, next: start_block, budget }
+    }
+
     /// A Merkle inclusion proof for `index` (pair with [`Self::head`] to make it
     /// independently verifiable).
     pub fn proof(&self, index: u64) -> Option<Proof> {
@@ -413,6 +501,72 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
                     && self.public.verify(&head_message(h.fork, h.length, &h.root), &h.sig)
             }
         }
+    }
+}
+
+/// Lazy iterator returned by [`Hypercore::read_stream`]. Yields `Result<T, _>`
+/// for each present block in the configured range (forward or reverse),
+/// no-wait-skipping absent blocks. See [`Hypercore::read_stream`] for semantics.
+pub struct ReadStream<'a, T, C, S> {
+    core: &'a Hypercore<T, C, S>,
+    /// Remaining range is the half-open `[lo, hi)`; forward emits from `lo` up,
+    /// reverse from `hi` down.
+    lo: u64,
+    hi: u64,
+    reverse: bool,
+}
+
+impl<T, C: Codec<T>, S: Store> Iterator for ReadStream<'_, T, C, S> {
+    type Item = Result<T, Error<S::Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.lo < self.hi {
+            let i = if self.reverse {
+                self.hi -= 1;
+                self.hi
+            } else {
+                let i = self.lo;
+                self.lo += 1;
+                i
+            };
+            match self.core.get(i) {
+                Ok(Some(v)) => return Some(Ok(v)),
+                Ok(None) => continue, // absent block: no-wait skip
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+}
+
+/// Lazy iterator returned by [`Hypercore::byte_stream`]. Yields `Result<Vec<u8>,
+/// _>` of whole encoded blocks covering the configured byte range. See
+/// [`Hypercore::byte_stream`] for semantics.
+pub struct ByteStream<'a, T, C, S> {
+    core: &'a Hypercore<T, C, S>,
+    /// Next block index to consider.
+    next: u64,
+    /// Remaining byte budget; the stream stops once it reaches `0`.
+    budget: u64,
+}
+
+impl<T, C: Codec<T>, S: Store> Iterator for ByteStream<'_, T, C, S> {
+    type Item = Result<Vec<u8>, Error<S::Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.budget > 0 && self.next < self.core.len() {
+            let i = self.next;
+            self.next += 1;
+            match self.core.block(i) {
+                Ok(Some(bytes)) => {
+                    self.budget = self.budget.saturating_sub(bytes.len() as u64);
+                    return Some(Ok(bytes));
+                }
+                Ok(None) => continue, // absent block: no-wait skip
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
     }
 }
 
@@ -2467,5 +2621,148 @@ mod tests {
         }
         // Clearing presence does not touch the tree, so the prefix is still fully shared.
         assert_eq!(snap.signed_length(&core), 4);
+    }
+
+    // ---- read / byte streams (upstream `streams.js`, L1) ----
+
+    /// Collect a read stream into the decoded values, asserting no read error.
+    fn collect_read(core: &ByteCore, opts: ReadStreamOptions) -> Vec<Vec<u8>> {
+        core.read_stream(opts).map(|r| r.unwrap()).collect()
+    }
+
+    /// Collect a byte stream into the raw encoded-block byte vectors.
+    fn collect_bytes(core: &ByteCore, opts: ByteStreamOptions) -> Vec<Vec<u8>> {
+        core.byte_stream(opts).map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn read_stream_basic_and_range() {
+        // Upstream `streams.js`: "basic read stream" + "read stream with start /
+        // end" (+ "basic write+read stream", which is append-then-read at L1).
+        let core = core_with(60, &["hello", "world", "verden", "welt"]);
+        let all: Vec<Vec<u8>> = ["hello", "world", "verden", "welt"].iter().map(|s| blk(s)).collect();
+
+        // whole log
+        assert_eq!(collect_read(&core, ReadStreamOptions::default()), all);
+
+        // start: 1 -> from index 1 to the end
+        assert_eq!(
+            collect_read(&core, ReadStreamOptions { start: 1, ..Default::default() }),
+            all[1..].to_vec()
+        );
+
+        // start: 2, end: 3 -> just block 2
+        assert_eq!(
+            collect_read(&core, ReadStreamOptions { start: 2, end: Some(3), ..Default::default() }),
+            all[2..3].to_vec()
+        );
+
+        // reverse over the whole log
+        let mut rev = all.clone();
+        rev.reverse();
+        assert_eq!(collect_read(&core, ReadStreamOptions { reverse: true, ..Default::default() }), rev);
+
+        // empty range (start >= end) yields nothing; an out-of-range end clamps to len
+        assert!(collect_read(
+            &core,
+            ReadStreamOptions { start: 3, end: Some(3), ..Default::default() }
+        )
+        .is_empty());
+        assert_eq!(
+            collect_read(&core, ReadStreamOptions { start: 1, end: Some(99), ..Default::default() }),
+            all[1..].to_vec()
+        );
+    }
+
+    #[test]
+    fn read_stream_end_ignores_live() {
+        // Upstream `streams.js`: "read stream with end and live (live should be
+        // ignored)" — with `end` set, `live: true` must not tail; the stream stops
+        // at `end`. (At L1 `live` is always ignored — there is no peer to tail.)
+        let core = core_with(61, &["alpha", "beta", "gamma", "delta", "epsilon"]);
+        let collected =
+            collect_read(&core, ReadStreamOptions { end: Some(3), live: true, ..Default::default() });
+        let expected: Vec<Vec<u8>> = ["alpha", "beta", "gamma"].iter().map(|s| blk(s)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn read_stream_skips_cleared_holes() {
+        // The read stream is no-wait: a block dropped by `clear` is skipped (not
+        // waited on) — the L1 consequence of `get` returning `None` for an absent
+        // block. The stream yields the present blocks in order, both directions.
+        let mut core = core_with(62, &["a", "b", "c", "d", "e"]);
+        assert_eq!(core.clear(1, 3).unwrap(), 2, "drop blocks 1 and 2");
+        assert_eq!(
+            collect_read(&core, ReadStreamOptions::default()),
+            vec![blk("a"), blk("d"), blk("e")],
+            "holes skipped"
+        );
+        assert_eq!(
+            collect_read(&core, ReadStreamOptions { reverse: true, ..Default::default() }),
+            vec![blk("e"), blk("d"), blk("a")]
+        );
+    }
+
+    #[test]
+    fn byte_stream_basic_and_ranges() {
+        // Upstream `streams.js`: "basic byte stream" + the byteOffset/byteLength
+        // cases. A byte stream yields whole *encoded* blocks covering a byte range;
+        // we address the encoded byte layout the tree authenticates (the `padding`
+        // divergence, ADR-0022), so offsets/lengths are derived from the encoded
+        // sizes rather than the raw payload sizes.
+        let core = core_with(63, &["hello", "world", "verden", "welt"]);
+        let enc: Vec<Vec<u8>> = (0..4).map(|i| core.block(i).unwrap().unwrap()).collect();
+        let size = |i: usize| enc[i].len() as u64;
+        let off = |i: usize| (0..i).map(size).sum::<u64>(); // byte offset at the start of block i
+
+        // whole log (default offset 0, default length)
+        assert_eq!(collect_bytes(&core, ByteStreamOptions::default()), enc);
+
+        // byteOffset at block 1, byteLength covering exactly blocks 1 and 2
+        assert_eq!(
+            collect_bytes(
+                &core,
+                ByteStreamOptions { byte_offset: off(1), byte_length: Some(size(1) + size(2)) }
+            ),
+            vec![enc[1].clone(), enc[2].clone()]
+        );
+
+        // byteOffset at block 2, byteLength covering exactly block 2
+        assert_eq!(
+            collect_bytes(
+                &core,
+                ByteStreamOptions { byte_offset: off(2), byte_length: Some(size(2)) }
+            ),
+            vec![enc[2].clone()]
+        );
+
+        // byteOffset at block 2, default byteLength -> to the end (blocks 2 and 3)
+        assert_eq!(
+            collect_bytes(&core, ByteStreamOptions { byte_offset: off(2), byte_length: None }),
+            vec![enc[2].clone(), enc[3].clone()]
+        );
+
+        // a byteOffset at/past the end yields nothing
+        let total = core.byte_length();
+        assert!(collect_bytes(
+            &core,
+            ByteStreamOptions { byte_offset: total, byte_length: None }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn byte_stream_yields_empty_payload_blocks() {
+        // Upstream `streams.js`: "basic byte stream w/ empty buffers" — blocks with
+        // empty payloads are still emitted (they do not end the stream) as long as
+        // the byte budget isn't exhausted. With our framing an empty payload still
+        // encodes to a 1-byte block (the ADR-0022 padding divergence), so the
+        // observable property — every block in the byte range is emitted — holds.
+        let core = core_with(64, &["hello", "world", "", "", "end"]);
+        assert_eq!(core.len(), 5, "all blocks appended");
+        let enc: Vec<Vec<u8>> = (0..5).map(|i| core.block(i).unwrap().unwrap()).collect();
+        // the default byte stream covers the whole log -> every block, incl. the empties
+        assert_eq!(collect_bytes(&core, ByteStreamOptions::default()), enc);
     }
 }

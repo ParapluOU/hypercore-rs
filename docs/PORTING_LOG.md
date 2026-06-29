@@ -1504,3 +1504,71 @@ Repo-relative paths only — no private or personal data (this repo is public).
   - more natively-testable rows: `hypercore` `move-to.js` / `streams.js` (the rest of the
     snapshot/seek/stream family); `merkle` reorg-by-proof / `additionalNodes`; `manifest.js`
     (signing config); the replication re-download that refills a cleared block + `purge`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 30: `hypercore` read / byte streams (`streams.js`)
+
+**Did**
+- Picked the next natively-testable, in-scope red item: `hypercore` **streams**
+  (`reference/js/hypercore/test/streams.js`), reusing the existing `get`/`block`/`seek`. (The other
+  non-env-blocked candidate — the deferred fork/merge consensus, ADR-0015 — LESSONS.md says to defer
+  until the JS oracle, gate #4, can cross-check it; gate #4 is still env-blocked, so attempting it now
+  would defy the project's own recorded guidance.)
+- Added two synchronous **iterator**-based streams to `Hypercore` (+ their option structs):
+  - `read_stream(ReadStreamOptions { start, end, reverse, live })` → `ReadStream`, yielding
+    `Result<T, Error>` for each **present** block in `[start, end)`, forward or `reverse`. `end` defaults
+    to and is clamped to `len()`. It is **no-wait** (like `get`): an absent block — never downloaded or
+    dropped by `clear` — is *skipped*, not waited on (no peer at L1). `live` is accepted but **ignored**
+    (no async tail), so upstream's "live should be ignored" ports directly.
+  - `byte_stream(ByteStreamOptions { byte_offset, byte_length })` → `ByteStream`, yielding
+    `Result<Vec<u8>, Error>` of whole **encoded** blocks covering `[byte_offset, byte_offset+byte_length)`:
+    `seek(byte_offset)` locates the start block, whole blocks are emitted until the byte budget is consumed
+    (`byte_length` defaults to the rest of the log), and an empty-payload block is still emitted while the
+    budget is non-zero. Offsets address the **encoded** byte layout the tree authenticates (the `padding`
+    divergence, ADR-0022) — a consumer subtracts its own framing.
+  - `createWriteStream` is buffered `append` (no new L1 behaviour), so it gets no type — covered by
+    append/batch.
+- 5 asserting tests (hypercore 46→51; workspace 143→148): `read_stream_basic_and_range` (whole log /
+  `start` / `start`+`end` / reverse / empty range / out-of-range `end` clamped — upstream "basic read
+  stream" + "read stream with start / end" + "basic write+read stream"); `read_stream_end_ignores_live`
+  (upstream "read stream with end and live (live should be ignored)"); `read_stream_skips_cleared_holes`
+  (the no-wait consequence — a `clear`ed hole is skipped in both directions); `byte_stream_basic_and_ranges`
+  (whole log + the byteOffset/byteLength cases + past-the-end yields nothing — offsets derived from the
+  encoded `block(i).len()`); `byte_stream_yields_empty_payload_blocks` (upstream "basic byte stream w/
+  empty buffers" — every block in range emitted, incl. empty payloads). `just verify` green: **148 native
+  tests** (autobase 24 across files + codec 8 + hypercore 51 + identity 4 + merkle 44 + storage 17) + wasm
+  build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0033: read/byte streams are **no-wait L1 iterators**, not async backpressured duplex streams. Byte
+  addressing is over the **encoded** layout the tree authenticates (padding-free, ADR-0022), not upstream's
+  value-byte layout. `live` is accepted-but-ignored; absent blocks are skipped. We **defer**: `live`
+  tailing (async/networking), duplex backpressure (Node runtime), sub-block byte slicing of a non-boundary
+  offset + `padding`, the `createWriteStream` object (= buffered `append`), and the snapshot/session-bound
+  stream variants (sessions/networking). `streams.js` moves `[ ]`→`[~]`; `move-to.js` (the move-to op)
+  remains.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A read/byte stream at L1 is a **no-wait iterator over what you locally have**, not an async tail: the
+  read stream yields decoded blocks over `[start,end)` (forward/reverse, `end` clamped to `len`); the byte
+  stream `seek`s the start block then emits whole encoded blocks until the byte budget is spent (empty-
+  payload blocks still emitted while budget > 0). `live` has nothing to tail ⇒ accept-and-ignore it (the
+  "live should be ignored" case passes by construction); absent (`clear`ed) blocks are skipped (matching
+  `get`'s `None`). Keep byte offsets over the **encoded** layout (ADR-0022) and derive test offsets from
+  `block(i).len()`. `createWriteStream` is just buffered `append` — no new L1 behaviour.
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable
+    under the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend
+    `[ ]` would also wire the bitfield's deferred `open`/`flush` persistence (and persist the presence
+    map / snapshots);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view
+    layer (`apply.js`/`anchors.js`);
+  - more natively-testable rows: `hypercore` `move-to.js` (the move-to operation + write-stream object);
+    `merkle` reorg-by-proof / `additionalNodes`; `manifest.js` (signing config); the replication
+    re-download that refills a cleared block + `purge`; `hyperbee`.

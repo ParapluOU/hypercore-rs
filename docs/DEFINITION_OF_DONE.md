@@ -92,7 +92,15 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `None`, a captured block independently authenticated against the snapshot head, and
       `signed_length(&core)` ≡ upstream `signedLength` via the shared-prefix LCA; ADR-0032 — by-value
       divergence from upstream's shared-storage COW; `signedLength`-over-replication / implicit-download
-      snapshots / streams deferred, tracked on `snapshots.js`) — `purge`/physical-reclamation
+      snapshots deferred, tracked on `snapshots.js`) +
+      **read/byte streams** (`read_stream(ReadStreamOptions{start,end,reverse,live})` → a no-wait
+      `ReadStream` iterator over the decoded blocks in `[start,end)` ≡ upstream `createReadStream` —
+      `end` clamped to `len`, absent/cleared blocks skipped, `live` accepted-but-ignored so "live should
+      be ignored" ports directly; `byte_stream(ByteStreamOptions{byte_offset,byte_length})` → a
+      `ByteStream` iterator over whole **encoded** blocks covering a byte range ≡ `createByteStream`,
+      `seek`-located, empty-payload blocks still emitted; encoded-byte (padding-free, ADR-0022)
+      addressing; ADR-0033 — `live` tailing / duplex backpressure / sub-block slicing / write-stream
+      object deferred, tracked on `streams.js`) — `purge`/physical-reclamation
       guarantees + the replication re-download that refills a cleared block tracked on `clear.js`
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks
