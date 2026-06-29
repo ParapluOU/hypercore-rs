@@ -125,3 +125,29 @@ Repo-relative paths only — no private or personal data (this repo is public).
 **Next**
 - `hypercore`: the typed, signed, append-only log — `append`/`get`/`verify` over `codec` + `merkle`
   + `identity` + `storage` (port `basic.js` / `core.js` behaviours). Then proof-based replication.
+
+---
+
+## 2026-06-29 — Iteration 5: `hypercore`
+
+**Did**
+- Implemented `Hypercore<T, C: Codec<T>, S: Store>`: `append` (encode → store → merkle → sign the
+  new head), `get` (decode), `block` (raw encoded bytes), `proof`, `verify_head`, and a free
+  `verify_block(public, head, index, enc, proof)` so any holder of the author's public key can
+  confirm a block belongs to the log. 5 asserting tests; `just verify` green.
+
+**Decisions**
+- The Merkle tree commits to the **codec-encoded** bytes (what's stored). Verifiers check encoded
+  bytes against the signed head, then decode — decode is strictly post-verification.
+- The head signs `(length, root)` under a domain tag; ed25519 determinism makes the whole log
+  reproducible for a fixed author + appends.
+
+**Lessons**
+- Real bug caught by the gate: feeding the *raw value* (not the encoded block) to `verify_block`
+  fails, because the tree hashes encoded blocks. The proven unit is the encoded block. Fixed within
+  the iteration by adding `block()` and verifying encoded bytes — exactly the "else, fix" path.
+
+**Next**
+- `hypercore` replication: a verify-only `Replica` that, given the signed head + per-block proofs,
+  accepts blocks and ends **byte-identical** to the source (the DoD replication property).
+- Then the `autobase` linearizer (causal DAG order + deterministic tiebreak).
