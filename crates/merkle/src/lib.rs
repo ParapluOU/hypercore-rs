@@ -356,6 +356,77 @@ impl MerkleTree {
         self.collect_upgrade(l, old, old_root_set, out);
         self.collect_upgrade(r, old, old_root_set, out);
     }
+
+    /// Map a byte offset to the block it falls in: returns `(block, offset)`
+    /// where `offset` is the offset *within* that block. A byte offset that lands
+    /// exactly on a block boundary belongs to the block it starts. For `bytes`
+    /// past the end of the log, returns `(len(), bytes - total_byte_length)`
+    /// (mirroring the upstream linear seek).
+    ///
+    /// O(log n): instead of summing every leaf, it descends the flat tree using
+    /// each subtree's committed byte `size` to skip whole subtrees — yet it agrees
+    /// with the linear scan for every offset (the upstream "basic tree seeks"
+    /// property). This is byte-addressed random access; it never inspects payload
+    /// contents, only the authenticated byte sizes.
+    pub fn seek(&self, bytes: u64) -> (u64, u64) {
+        let mut remaining = bytes;
+        for root in self.roots() {
+            if root.size > remaining {
+                return self.seek_descend(root.index, remaining);
+            }
+            remaining -= root.size;
+        }
+        (self.length, remaining)
+    }
+
+    /// Descend the subtree rooted at `index` (whose committed `size > bytes`) to
+    /// the leaf containing byte `bytes`, returning `(block, offset_within_block)`.
+    fn seek_descend(&self, mut index: u64, mut bytes: u64) -> (u64, u64) {
+        loop {
+            match flat::children(index) {
+                None => return (index / 2, bytes),
+                Some((l, r)) => {
+                    let left = self.nodes[&l];
+                    if left.size > bytes {
+                        index = l;
+                    } else {
+                        bytes -= left.size;
+                        index = r;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A proof that byte offset `bytes` falls in a particular block, verifiable
+    /// against the signed root without any block data. Returns `None` if `bytes`
+    /// is at or past the end of the log (there is no block to locate).
+    ///
+    /// Structurally it is the target block's inclusion path (siblings + roots)
+    /// plus the leaf node itself; [`SeekProof::verify`] recomputes the
+    /// left-cumulative byte size from the authenticated left-sibling and
+    /// left-root sizes, so an untrusted holder cannot lie about where a byte
+    /// offset lands. The byte-offset analogue of [`MerkleTree::proof`].
+    pub fn seek_proof(&self, bytes: u64) -> Option<SeekProof> {
+        let (block, _offset) = self.seek(bytes);
+        if block >= self.length {
+            return None; // past the end (also covers the empty tree)
+        }
+        let roots = self.roots();
+        let root_set: BTreeSet<u64> = roots.iter().map(|n| n.index).collect();
+        let mut cur = block * 2;
+        let mut siblings = Vec::new();
+        while !root_set.contains(&cur) {
+            siblings.push(self.nodes[&flat::sibling(cur)]);
+            cur = flat::parent(cur);
+        }
+        Some(SeekProof {
+            bytes,
+            leaf: self.nodes[&(block * 2)],
+            siblings,
+            roots,
+        })
+    }
 }
 
 /// A self-contained inclusion proof: the sibling hashes from a block's leaf up
@@ -406,6 +477,98 @@ impl Proof {
             None => return false,
         }
         &tree_hash(&roots) == expected_root
+    }
+}
+
+/// A self-contained proof that a byte offset falls in a particular block: the
+/// target leaf node plus its inclusion path (siblings to the containing root)
+/// and every root. Carries **no block data** — a seek locates a block, it does
+/// not reveal its contents. The byte-offset analogue of [`Proof`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeekProof {
+    /// The byte offset this proof locates.
+    pub bytes: u64,
+    /// The target leaf node (its `index` is `block * 2`).
+    pub leaf: Node,
+    /// Sibling nodes, bottom-up, to the containing root.
+    pub siblings: Vec<Node>,
+    /// All roots of the tree at proof time.
+    pub roots: Vec<Node>,
+}
+
+impl SeekProof {
+    /// Verify against the trusted `expected_root` and, if valid, return the
+    /// authenticated `(block, offset_within_block)` that byte `bytes` lands in.
+    ///
+    /// Soundness: the leaf climbs to its containing root via [`parent_hash`]
+    /// (which binds each child's hash **and** byte size), and the recomputed root
+    /// is substituted into the roots before checking [`tree_hash`] against
+    /// `expected_root` — so every size used below is authenticated. The
+    /// left-cumulative byte size of the target block is the sum of the sizes of
+    /// the **left** siblings met while climbing (each the full subtree preceding
+    /// the target) plus the sizes of the roots to the left of the containing
+    /// root. The byte offset is in this block iff
+    /// `cumulative <= bytes < cumulative + leaf.size`; since the blocks' byte
+    /// intervals are disjoint and contiguous, exactly one block satisfies it, so
+    /// a prover cannot pass off a different block (its authenticated sizes will
+    /// not bracket `bytes`). Any tampering breaks the climb or the bracket and
+    /// yields `None`.
+    pub fn verify(&self, expected_root: &Hash) -> Option<(u64, u64)> {
+        // Climb the leaf to its containing root, accumulating the byte sizes of
+        // every left sibling (each precedes the target block in its entirety).
+        let mut node = self.leaf;
+        let mut left_sum: u64 = 0;
+        for sib in &self.siblings {
+            let p = flat::parent(node.index);
+            let (left, right) = if sib.index < node.index {
+                left_sum += sib.size;
+                (*sib, node)
+            } else {
+                (node, *sib)
+            };
+            node = Node {
+                index: p,
+                hash: parent_hash(&left, &right),
+                size: left.size + right.size,
+            };
+        }
+
+        // Add the sizes of the roots strictly to the left of the containing root.
+        // (Root indices increase left-to-right, so a smaller index is to the left.)
+        let mut root_left_sum: u64 = 0;
+        let mut found = false;
+        for r in &self.roots {
+            if r.index == node.index {
+                found = true;
+            } else if r.index < node.index {
+                root_left_sum += r.size;
+            }
+        }
+        if !found {
+            return None; // the climb did not end on a known root (e.g. dropped sibling)
+        }
+        let cumulative = root_left_sum + left_sum;
+
+        // Substitute the recomputed root (do not trust the proof's copy); the
+        // whole-tree hash must match, which authenticates every size used above.
+        let mut roots = self.roots.clone();
+        match roots.iter_mut().find(|r| r.index == node.index) {
+            Some(slot) => *slot = node,
+            None => return None,
+        }
+        if &tree_hash(&roots) != expected_root {
+            return None;
+        }
+
+        // The byte offset must land within this (authenticated) block.
+        if self.bytes < cumulative {
+            return None;
+        }
+        let offset = self.bytes - cumulative;
+        if offset >= self.leaf.size {
+            return None;
+        }
+        Some((self.leaf.index / 2, offset))
     }
 }
 
@@ -1026,5 +1189,173 @@ mod tests {
         // 2. the new blocks [old, 14) verify against the same (now trusted) head
         let rp = t.range_proof(old, 14).unwrap();
         assert!(rp.verify(&blocks[old as usize..], &new_root));
+    }
+
+    // A tree with varied (cycling 1..=5) block sizes so byte seeks are non-trivial.
+    fn varied_tree(n: usize) -> (MerkleTree, Vec<Vec<u8>>) {
+        let mut t = MerkleTree::new();
+        let mut blocks = Vec::new();
+        for i in 0..n {
+            let b = vec![b'a' + (i % 26) as u8; (i % 5) + 1];
+            t.append(&b);
+            blocks.push(b);
+        }
+        (t, blocks)
+    }
+
+    // The naive linear reference for a byte seek (sum leaf sizes left-to-right).
+    fn linear_seek(blocks: &[Vec<u8>], bytes: u64) -> (u64, u64) {
+        let mut remaining = bytes;
+        for (i, b) in blocks.iter().enumerate() {
+            if b.len() as u64 > remaining {
+                return (i as u64, remaining);
+            }
+            remaining -= b.len() as u64;
+        }
+        (blocks.len() as u64, remaining)
+    }
+
+    // The tree-accelerated seek agrees with the linear reference for every byte
+    // offset — ports `merkle-tree.js` "basic tree seeks". Also checks past-the-end.
+    #[test]
+    fn seek_matches_linear_all_sizes() {
+        for n in 1..=20usize {
+            let (t, blocks) = varied_tree(n);
+            let total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+            for bytes in 0..total {
+                assert_eq!(
+                    t.seek(bytes),
+                    linear_seek(&blocks, bytes),
+                    "tree seek must match linear seek (n={n}, bytes={bytes})"
+                );
+            }
+            // Past-the-end: exactly at total lands on (len, 0); beyond carries over.
+            assert_eq!(t.seek(total), (n as u64, 0));
+            assert_eq!(t.seek(total + 3), (n as u64, 3));
+        }
+    }
+
+    // Every in-range byte offset has a seek proof that verifies against the signed
+    // root and returns the same `(block, offset)` as the local seek.
+    #[test]
+    fn seek_proof_roundtrip_all_sizes() {
+        for n in 1..=20usize {
+            let (t, blocks) = varied_tree(n);
+            let root = t.root_hash();
+            let total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+            for bytes in 0..total {
+                let sp = t.seek_proof(bytes).expect("in-range seek has a proof");
+                assert_eq!(
+                    sp.verify(&root),
+                    Some(t.seek(bytes)),
+                    "seek proof must authenticate the local seek (n={n}, bytes={bytes})"
+                );
+            }
+        }
+    }
+
+    // Hand-checked block boundaries: a byte exactly on a block start belongs to
+    // that block at offset 0; the byte before it is the last byte of the previous.
+    #[test]
+    fn seek_proof_pins_block_at_boundaries() {
+        // sizes 1,2,3,4,5 -> cumulative starts 0,1,3,6,10, total 15
+        let (t, _) = varied_tree(5);
+        let root = t.root_hash();
+        let starts = [0u64, 1, 3, 6, 10];
+        for (block, &start) in starts.iter().enumerate() {
+            let size = (block % 5) as u64 + 1;
+            // first byte of the block
+            assert_eq!(t.seek_proof(start).unwrap().verify(&root), Some((block as u64, 0)));
+            // last byte of the block
+            let last = start + size - 1;
+            assert_eq!(
+                t.seek_proof(last).unwrap().verify(&root),
+                Some((block as u64, size - 1))
+            );
+        }
+    }
+
+    // A seek at or past the end of the log has no block to locate.
+    #[test]
+    fn seek_proof_past_end_is_none() {
+        let (t, blocks) = varied_tree(7);
+        let total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+        assert!(t.seek_proof(total).is_none(), "byte == total is past the last block");
+        assert!(t.seek_proof(total + 5).is_none(), "byte past total is unlocatable");
+        assert!(MerkleTree::new().seek_proof(0).is_none(), "empty tree has no blocks");
+    }
+
+    // Tamper-rejection across every input the verifier trusts.
+    #[test]
+    fn seek_proof_rejects_tampering() {
+        let (t, blocks) = varied_tree(11);
+        let root = t.root_hash();
+        // byte offset inside block 4 (an interior block, so the proof has siblings
+        // and the climb crosses at least one root boundary).
+        let cum4: u64 = blocks[..4].iter().map(|b| b.len() as u64).sum();
+        let bytes = cum4 + 0; // first byte of block 4
+        let sp = t.seek_proof(bytes).unwrap();
+        assert!(!sp.siblings.is_empty(), "interior block needs siblings");
+        assert_eq!(sp.verify(&root), Some((4, 0))); // honest baseline
+
+        // tampered leaf hash
+        let mut bad = sp.clone();
+        bad.leaf.hash[0] ^= 0xff;
+        assert!(bad.verify(&root).is_none(), "tampered leaf hash rejects");
+
+        // tampered leaf size (would shift the bracket; the climb also diverges)
+        let mut bad = sp.clone();
+        bad.leaf.size += 1;
+        assert!(bad.verify(&root).is_none(), "tampered leaf size rejects");
+
+        // tampered sibling
+        let mut bad = sp.clone();
+        bad.siblings[0].hash[0] ^= 0xff;
+        assert!(bad.verify(&root).is_none(), "tampered sibling rejects");
+
+        // tampered untouched root entry (the containing root is substituted over,
+        // so mutate a different one — bound by tree_hash).
+        let root_indices: Vec<u64> = sp.roots.iter().map(|n| n.index).collect();
+        let leaf_root = {
+            // find which root the leaf climbs to, to mutate a *different* one
+            let mut node = sp.leaf.index;
+            while !root_indices.contains(&node) {
+                node = flat::parent(node);
+            }
+            node
+        };
+        let other = sp.roots.iter().position(|r| r.index != leaf_root);
+        assert!(other.is_some(), "an 11-block tree has multiple roots");
+        let mut bad = sp.clone();
+        bad.roots[other.unwrap()].hash[0] ^= 0xff;
+        assert!(bad.verify(&root).is_none(), "tampered untouched root rejects");
+
+        // wrong expected root
+        let mut wrong = root;
+        wrong[0] ^= 0xff;
+        assert!(sp.verify(&wrong).is_none(), "wrong expected root rejects");
+
+        // dropped sibling -> climb cannot reach a real root
+        let mut bad = sp.clone();
+        bad.siblings.pop();
+        assert!(bad.verify(&root).is_none(), "dropped sibling rejects");
+
+        // tampered `bytes` to a value in a *different* block: the proof genuinely
+        // proves block 4's interval, which no longer brackets the byte -> None.
+        let mut bad = sp.clone();
+        bad.bytes = cum4 + (blocks[4].len() as u64); // first byte of block 5
+        assert!(bad.verify(&root).is_none(), "bytes outside the proven block rejects");
+    }
+
+    // A power-of-two tree has a single root; seeks/proofs still hold.
+    #[test]
+    fn seek_proof_single_root() {
+        let (t, blocks) = varied_tree(8); // one root (index 7)
+        assert_eq!(t.roots().len(), 1, "8 blocks => single root");
+        let root = t.root_hash();
+        let total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+        for bytes in 0..total {
+            assert_eq!(t.seek_proof(bytes).unwrap().verify(&root), Some(t.seek(bytes)));
+        }
     }
 }

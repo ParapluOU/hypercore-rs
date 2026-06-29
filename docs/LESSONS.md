@@ -116,6 +116,21 @@ personal data** (this repo is public; use repo-relative paths).
   cheap (no block data) and catches the fork before a single new block is fetched — the cross-length
   analogue of `conflicting_heads`/`ForkProof`. The empty replica (length 0) has no anchor, so it has no
   upgrade gate; it replicates from scratch against the head directly.
+- **A byte-offset seek proof is an inclusion proof read for *sizes*, not data.** To prove "byte `X` lands
+  in block `B`" against the signed root, you don't need the block's bytes — you need its *position* and the
+  *cumulative byte size* of everything to its left, both already authenticated by the tree. Ship the target
+  leaf node + its inclusion siblings + the roots (the same shape as a block proof, minus the data). The
+  verifier climbs the leaf to its root with `parent_hash` (which binds each child's hash **and** size) and
+  checks `tree_hash == expected_root`, which authenticates every size on the path; then the block's
+  left-cumulative size is just the sum of the **left** siblings' sizes met while climbing plus the sizes of
+  the roots left of the containing root, and the offset is in the block iff `cumulative <= X < cumulative +
+  leaf.size`. Because the blocks' byte intervals are disjoint and contiguous, exactly one block brackets `X`,
+  so a forged-block proof fails the bracket (its authenticated sizes won't contain `X`) — no separate
+  "is this the right block" check needed. Tamper tests: a tampered `bytes` field that stays *within the
+  proven block* is still a correct proof for that offset (not an attack) — to test rejection, move `bytes`
+  into a *different* block's interval. And the local tree-accelerated seek (descend by subtree `size`) must be
+  asserted equal to a naive linear scan for **every** offset — that equivalence is the whole point of the
+  O(log n) descent. Keep `padding`/framing out of L1: it's application byte-layout, not log structure.
 - **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
   writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
   sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which

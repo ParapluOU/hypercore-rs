@@ -270,3 +270,30 @@ block+upgrade object) and the gate purely verifying. We **defer** signed-length 
 live system — they return with networking (ADR-0003) and the `fast-forward.js` row. The empty-replica case
 (`old = 0`) has no trusted anchor, so it has no upgrade gate and replicates from scratch against the head
 directly. `core.js` moves toward verified incremental replication.
+
+## ADR-0022 — Byte-offset seek is a tree-accelerated locator + a standalone, data-free seek proof
+**Context:** Upstream hypercore (`reference/js/hypercore/lib/merkle-tree.js`) supports **byte seeks** two ways:
+a local `ByteSeeker` that descends the flat tree by subtree byte `size` to map a byte offset to a block in
+O(log n) (the `merkle-tree.js` "basic tree seeks" test asserts it equals a linear scan), and a **seek proof**
+(`seekProof`/`verifyTree`'s seek branch) that an untrusted peer sends so a verifier can confirm the mapping
+against the signed root. Upstream **bundles** the seek nodes into the same wire proof object as block/upgrade
+(`proof.seek.nodes`, with the block leaf sometimes doubling as a seek node), and threads a `padding` parameter
+(per-block framing overhead subtracted from each node's size).
+**Decision:** Implement the L1 behaviour as two pieces, kept **separate** (consistent with ADR-0017/0020):
+- `MerkleTree::seek(bytes) -> (block, offset)` — the tree-accelerated locator (descend by subtree `size`),
+  agreeing with the linear scan for every offset; past-the-end returns `(len, bytes - total)` like upstream's
+  linear seek. No `padding` (that is application framing — it would leak domain/byte-layout assumptions into
+  L1; a consumer subtracts its own framing before seeking).
+- `MerkleTree::seek_proof(bytes) -> Option<SeekProof>` + `SeekProof::verify(expected_root) -> Option<(block,
+  offset)>` — a **standalone, data-free** proof. It is the target block's inclusion path (siblings + roots +
+  the leaf node) plus the byte offset; `verify` climbs the leaf to its root via `parent_hash` (which binds each
+  child's hash **and** size), substitutes the recomputed root, checks `tree_hash == expected_root`, then derives
+  the block's left-cumulative byte size from the **authenticated** left-sibling and left-root sizes and accepts
+  iff `cumulative <= bytes < cumulative + leaf.size`. Carries no block data (a seek locates, it does not reveal).
+**Consequence:** Byte-addressed random access + a verifiable byte→block locator are ported and compose with the
+existing inclusion `Proof` (fetch the located block's data with a separate `proof`). We **keep proofs separate**
+(no block+seek+upgrade bundle) and **defer** `padding`, the bundled-wire seek (where the block leaf doubles as a
+seek node), and reorg/recovery — `merkle-tree.js` stays `[~]`, `merkle-tree-recovery.js` `[ ]`. Soundness rests
+on the same hash/size binding (`parent_hash` over child sizes, `tree_hash` over root sizes) the scheme already
+assumes, plus the disjoint-contiguous-interval argument: exactly one block's authenticated byte interval brackets
+`bytes`, so a prover cannot pass off a different block.

@@ -50,8 +50,10 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] Workspace scaffold (no data types)
 - [x] `merkle` — tree + inclusion **and range** proofs + tamper-rejection (contiguous-range proof via
       depth-climb, off-path-only boundary nodes, ADR-0017) + **length-extension `upgrade` proofs**
-      (data-free consistency / anti-fork-across-lengths, ADR-0020); upstream seek/`additionalNodes`/reorg
-      tracked separately on `merkle-tree.js`/`merkle-tree-recovery.js`
+      (data-free consistency / anti-fork-across-lengths, ADR-0020) + **byte-offset seek** (tree-accelerated
+      `seek` == linear scan + standalone data-free `SeekProof` locating byte→block against the signed root,
+      ADR-0022); upstream `additionalNodes`/seek-`padding`/reorg tracked separately on
+      `merkle-tree.js`/`merkle-tree-recovery.js`
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend

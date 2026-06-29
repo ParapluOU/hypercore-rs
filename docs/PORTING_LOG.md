@@ -557,3 +557,60 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then the wasm runtime / IndexedDB gate (#2); merkle **seek** + `merkle-tree-recovery.js` reorg;
   `autobase` `topolist.js` ordering; and the view/apply layer (`apply.js`/`anchors.js`) the
   `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 15: `merkle` byte-offset seek + verifiable seek proof
+
+**Did**
+- Added **byte-offset seek** to `crates/merkle` — the L1 behaviour behind upstream `merkle-tree.js`'s
+  "basic tree seeks" + seek-proof cases, the byte-offset analogue of inclusion proofs:
+  - `MerkleTree::seek(bytes) -> (block, offset)` — a **tree-accelerated** locator that descends the flat
+    tree by each subtree's committed byte `size` (O(log n)), mapping a byte offset to the block it lands in
+    and the offset within. A byte exactly on a block boundary belongs to the block it starts; past-the-end
+    returns `(len, bytes - total)` (mirroring the upstream linear seek). Never inspects payloads — only the
+    authenticated byte sizes.
+  - `MerkleTree::seek_proof(bytes) -> Option<SeekProof>` + `SeekProof::verify(expected_root) -> Option<(block,
+    offset)>` — a **standalone, data-free** proof: the target block's inclusion path (siblings + roots) plus
+    the leaf node and the byte offset. `verify` climbs the leaf to its containing root via `parent_hash`
+    (binds each child's hash **and** size), substitutes the recomputed root, checks `tree_hash ==
+    expected_root` (authenticating every size on the path), then derives the block's left-cumulative byte
+    size from the **left** siblings met while climbing + the roots left of the containing root, and accepts
+    iff `cumulative <= bytes < cumulative + leaf.size`. Returns the authenticated `(block, offset)`; `None`
+    past the end (also the empty tree).
+- 6 asserting tests (merkle 18→24): the tree seek equals a naive linear scan for **every** byte offset over
+  sizes 1..=20 (varied per-block sizes) incl. past-the-end (the "basic tree seeks" property); every in-range
+  offset's seek proof verifies and returns the same `(block, offset)` as the local seek; hand-checked block
+  boundaries (first/last byte of each block in a 5-block tree); seek-proof past-the-end / empty-tree ⇒ `None`;
+  tamper-rejection (tampered leaf hash/size, tampered sibling, tampered **untouched** root, wrong expected
+  root, dropped sibling, and `bytes` moved into a *different* block's interval); single-root (power-of-two)
+  sanity. `just verify` green (76 native tests + wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0022: byte seek is a tree-accelerated locator + a **standalone, data-free** seek proof, kept separate
+  from block/upgrade proofs (consistent with ADR-0017/0020), not upstream's bundled `proof.seek.nodes` wire
+  object (where the block leaf sometimes doubles as a seek node). We **omit `padding`** (per-block framing
+  overhead is application byte-layout — it would leak domain assumptions into L1; a consumer subtracts its own
+  framing before seeking). Soundness rests on the existing hash/size binding (`parent_hash` over child sizes,
+  `tree_hash` over root sizes) plus the disjoint-contiguous-interval argument: exactly one block's
+  authenticated byte interval brackets `bytes`. We **defer** the bundled-wire seek, `additionalNodes`, and
+  reorg/recovery — `merkle-tree.js` stays `[~]`, `merkle-tree-recovery.js` `[ ]`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A byte-offset seek proof is an inclusion proof read for *sizes*, not data: ship the leaf + siblings + roots,
+  authenticate every size via the hash climb to the trusted root, then the left-cumulative size is just the
+  sum of left-sibling + left-root sizes and the offset is in-block iff it brackets `bytes`. Disjoint contiguous
+  intervals ⇒ exactly one block brackets `bytes`, so no separate "right block?" check is needed. A tampered
+  `bytes` *within* the proven block is still a correct proof (not an attack) — test rejection by moving `bytes`
+  into a different block's interval. Assert the O(log n) tree seek equals a naive linear scan for **every**
+  offset (that equivalence is the point); keep `padding`/framing out of L1.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple `container`
+  service not started — needs an XPC service outside the loop's allowlist — and the image pull needs network;
+  see iters 11–14). When a container runtime is *started*, build `tools/oracle/` driving the reference
+  `lib/topolist.js` (deps injected via `Module._compile`, network-free) through `scripts/node-sandbox.sh`;
+  compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2); merkle **recovery/reorg** (`merkle-tree-recovery.js`) +
+  `upgrade.additionalNodes`; `autobase` `topolist.js` ordering; and the view/apply layer
+  (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.
