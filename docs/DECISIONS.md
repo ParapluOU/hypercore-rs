@@ -429,3 +429,36 @@ concern. We still **defer** the `want`/`update` proof-narrowing wire exchange th
 supplies `ancestors` (the construction-known divergence point) and the source produces the proofs.
 `core.js` advances (secure reorg-follow ported); the deferred replica-level reorg of ADR-0025 is now
 done. Soundness rests on the same leaf/prefix-root collision-resistance the scheme already assumes.
+
+## ADR-0027 — `topolist.js` ordering: an in-Rust oracle validates priority-Kahn ≡ insertion sort
+**Context:** `reference/js/autobase/test/topolist.js` exercises upstream's incremental linearizer
+(`lib/topolist.js`). Its in-scope, L1-relevant assertion is **stable ordering** — the linearization
+is a pure function of the node set: the same DAG, delivered in any causally-valid order, yields the
+same order (the `stable ordering`, `fuzz`, and `optimistic N` tests all assert this invariance). ADR-0014
+already reimplemented the *ordering* as a **priority-Kahn** topological sort (emit the smallest
+causally-ready `NodeId`) instead of upstream's incremental insertion sort (`moveDown`/
+`moveNonOptimisticUp` with `undo`/`shared` patch-tracking), claiming the two produce the *same* order
+for causally-closed, non-optimistic DAGs — but that equivalence was never turned into an asserting test
+(the JS oracle, gate #4, is environment-blocked: iters 11–19).
+**Decision:** Port the ordering behaviour and turn ADR-0014's equivalence claim into a host-safe,
+in-Rust asserting test (`crates/autobase/tests/topolist.rs`), with **no `node` and no container**:
+- a **faithful, test-only re-statement** of upstream's *non-optimistic* `lib/topolist.js` insertion
+  sort (`topolist_oracle`: `add` → `moveDown` to the causal floor, then `moveNonOptimisticUp` past
+  strictly-smaller nodes; `cmp`/`cmpUnlinked`/`links` over `direct[a]` = explicit heads ∪ same-writer
+  predecessor — exactly the union upstream's `links` recognizes). It is a behavioural mirror used
+  *only* as a test oracle, **not** the production path.
+- a cross-check that the oracle equals our `Linearizer::order()` on the canonical `DESIGN.md` DAGs, the
+  explicit `topolist - stable ordering` example (`[a0, b0, c0, c1]`, where `c1` follows `c0` purely by
+  same-writer sequencing), and a battery of **seeded random fork/merge DAGs** (200 seeds × several
+  randomized-Kahn delivery orders) — each also asserting the oracle is itself **delivery-order
+  independent** (upstream's `stable ordering`/`fuzz` property).
+  Both topolist's non-optimistic insertion sort and our priority-Kahn compute the **lexicographically-
+  minimal linear extension under (writer key, seq)**, which is unique — hence equal.
+**Consequence:** `topolist.js` moves `[ ]`→`[~]`: the ordering/stable-ordering behaviour is ported and
+ADR-0014's priority-Kahn≡insertion-sort claim is now an asserting cross-check. We **defer** the
+**streaming-view bookkeeping** (`undo`/`shared`/`mark`/`flush`/`indexed` — a live-view patch optimization,
+not the ordering definition; we recompute `order()` each call) and **optimistic** nodes (a separate
+writer-admission feature; `optimistic.js` row `[ ]`). This in-Rust oracle **complements, does not
+replace,** the upstream-JS algorithmic-equivalence oracle (gate #4, ADR-0008): gate #4 runs the *actual*
+reference code in a sandbox and remains the deferred cross-language check; this validates the same
+equivalence at the algorithm level, host-safely, today.

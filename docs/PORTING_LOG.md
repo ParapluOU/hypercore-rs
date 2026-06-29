@@ -864,3 +864,62 @@ Repo-relative paths only — no private or personal data (this repo is public).
   reorg-by-proof/`additionalNodes` (the last `merkle-tree.js` pieces); `autobase` `topolist.js`
   ordering; and the view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js`
   view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 20: `autobase` `topolist.js` ordering (in-Rust equivalence oracle)
+
+**Did**
+- Ported the **ordering / stable-ordering behaviour** of `reference/js/autobase/test/topolist.js`
+  as `crates/autobase/tests/topolist.rs`, and turned ADR-0014's long-standing claim — that our
+  **priority-Kahn** `order()` reproduces upstream's incremental insertion sort — into a host-safe
+  asserting cross-check (the JS oracle gate #4 stays env-blocked, iters 11–19; this needs no `node`,
+  no container):
+  - A **faithful, test-only re-statement** of upstream's *non-optimistic* `lib/topolist.js`
+    insertion sort (`topolist_oracle`): push each node, `moveDown` to its causal floor (just after
+    the last node it directly depends on), then `moveNonOptimisticUp` past every strictly-smaller
+    node — with `cmp`/`cmpUnlinked`/`links` over `direct[a]` = explicit cross-heads ∪ same-writer
+    predecessor (the exact union upstream's `links` recognizes and `Linearizer::add` builds). It is
+    a behavioural mirror used *only* as an oracle, never the production path.
+  - Cross-checks that the oracle equals `Linearizer::order()` on (a) the explicit
+    `topolist - stable ordering` example `[a0, b0, c0, c1]` (where `c1` follows `c0` purely by
+    same-writer sequencing, listing *no* explicit deps) across its causally-valid add orders;
+    (b) the three canonical `DESIGN.md` DAGs (linear chain / branch tiebreak / recursive
+    `[a0, c0, a1, b0, b1, c1, b2]`), all three vs the hand-derived expected order *and* vs the
+    oracle; and (c) **200 seeded random fork/merge DAGs × several randomized-Kahn delivery orders**,
+    each asserting the oracle is itself delivery-order independent (upstream's `stable ordering` /
+    `fuzz` property) and equal to `order()`, plus per-edge causal-respect and a non-vacuity guard
+    (≥1 seed actually reorders creation order).
+- 3 asserting tests (autobase 16→19 across files: 14 unit + 2 convergence + 3 topolist).
+  `just verify` green: **101 native tests** + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0027: port `topolist.js`'s ordering behaviour via an in-Rust, test-only re-statement of the
+  non-optimistic insertion sort, asserting it equals our priority-Kahn `order()` (both compute the
+  unique **lex-minimal linear extension under (key, seq)**). It **complements, does not replace** the
+  upstream-JS oracle (gate #4) — that runs the *actual* reference code in a sandbox and stays the
+  deferred cross-language check. We **defer** the streaming-view bookkeeping (`undo`/`shared`/`mark`/
+  `flush`/`indexed` — a live-view patch optimization, not the ordering definition) and **optimistic**
+  nodes (`optimistic.js`). `topolist.js` moves `[ ]`→`[~]`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Upstream's topolist insertion sort and our priority-Kahn both compute the *lex-minimal linear
+  extension* under (key, seq) — which is unique, so they're equal node-for-node, even though the
+  per-pair "causal-or-(key,seq)" comparison is non-transitive (a causal edge can cross the key
+  tiebreak into a ≺-cycle; "always take the minimum *available* node" sidesteps it). You can prove
+  this host-safely by transliterating only the *non-optimistic* insertion sort into a test oracle
+  (its `links(a,b)` is just "b ∈ a's direct deps") and asserting equivalence over the `DESIGN.md`
+  DAGs + seeded random DAGs × delivery orders — a complement to, not a replacement for, gate #4.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not startable under the loop's scoped allowlist + image pull needs network;
+  see iters 11–19). When a container runtime is *started*, build `tools/oracle/` driving the
+  reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()` (now additionally cross-validated by the
+  iter-20 in-Rust oracle, so a green run should agree by construction).
+- Then the wasm runtime / IndexedDB gate (#2, needs headless Chrome); the **view/apply layer**
+  (`apply.js`/`anchors.js`) that the `linearizer.js`/`dags.js` `getIndexedViewLength`/`view.get`
+  view-length assertions need; and `merkle` reorg-by-proof/`additionalNodes` (the last
+  `merkle-tree.js` pieces — note ADR-0025: `additionalNodes` adds no L1 capability our standalone
+  proofs lack).

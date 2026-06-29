@@ -183,6 +183,23 @@ personal data** (this repo is public; use repo-relative paths).
   `Replica::verify_upgrade`. Test gotcha: reorg always makes the local follow the remote (up **or** down
   to the remote's length), so the post-reorg target is always the remote — don't branch on "which is
   longer".
+- **Upstream's topolist insertion sort and our priority-Kahn both compute the *lex-minimal linear
+  extension* — so they're equal, and you can prove it host-safely with an in-Rust oracle.** `topolist.js`'s
+  real assertion is **stable ordering**: same DAG ⇒ same order regardless of arrival order. Upstream gets
+  there with an incremental insertion sort (`moveDown` slides a new node to its causal floor — the spot
+  right after the last node it directly depends on — then `moveNonOptimisticUp` slides it back past every
+  *strictly smaller* node, where "smaller" is causal-first then (writer key, seq)). We get there with a
+  priority-Kahn that emits the smallest causally-ready node. Both land on the **unique** lexicographically-
+  minimal linear extension under (key, seq), so they agree node-for-node — even though the per-pair
+  comparison "causal-or-(key,seq)" is *not* transitive (a causal edge can cross the key tiebreak, making a
+  ≺-cycle), because "always take the minimum *available* node" sidesteps the non-transitivity. You don't
+  need the container/JS oracle to check this: transliterate the *non-optimistic* insertion sort into a
+  test-only Rust oracle (its `links(a,b)` is just "b ∈ a's direct deps", where direct deps = explicit heads
+  ∪ same-writer predecessor — the same union `Linearizer::add` builds and upstream's `links` recognizes) and
+  assert it equals `order()` over the `DESIGN.md` DAGs + seeded random fork/merge DAGs × several delivery
+  orders. This is a host-safe *complement* to the env-blocked gate #4, not a replacement (gate #4 runs the
+  actual reference JS). Keep `undo`/`shared`/`flush` (live-view patch tracking) and optimistic nodes out —
+  they're not the ordering definition.
 - **A replica follows a reorg by re-anchoring the upgrade proof on a *proper prefix* of its own
   history — and the claimed ancestor authenticates itself.** The same-fork length-extension gate
   (`verify_upgrade`) folds the peer's new nodes onto the replica's *entire* current head; a reorg is

@@ -76,7 +76,10 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       higher*-fork signed head, authenticate the claimed shared-prefix length by re-anchoring an
       `UpgradeProof` on the replica's own roots at that prefix, then drop the divergent suffix and
       refetch byte-identically; an over-claimed ancestor / forked old block is rejected; ADR-0026)
-- [x] `autobase` — linearizer (causal order + deterministic tiebreak)
+- [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
+      ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks
+      that priority-Kahn `order()` agrees node-for-node with it (both = the lex-minimal linear extension)
+      over the `DESIGN.md` DAGs + 200 seeded random fork/merge DAGs × delivery orders (ADR-0027)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)
 - [x] convergence simulation (gate #3) — `crates/autobase/tests/convergence.rs`: seeded random

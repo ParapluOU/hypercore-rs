@@ -45,7 +45,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `anchors.js` | [ ] | `autobase` anchoring ★ |
 | `apply.js` | [ ] | `autobase` apply/view ★ |
 | `fork.js` | [ ] | `autobase` fork handling ★ |
-| `topolist.js` | [ ] | topological list ★ |
+| `topolist.js` | [~] | **stable-ordering behaviour ported** (`crates/autobase/tests/topolist.rs`, ADR-0027): a host-safe in-Rust re-statement of upstream's *non-optimistic* insertion sort (`moveDown`/`moveNonOptimisticUp`/`cmp`/`links`) cross-checks that our priority-Kahn `order()` (ADR-0014) agrees node-for-node with it on the canonical `DESIGN.md` DAGs, the explicit `stable ordering` example, and 200 seeded random fork/merge DAGs × several delivery orders — both compute the lex-minimal linear extension under (key, seq). Streaming-view bookkeeping (`undo`/`shared`/`mark`/`flush`/`indexed`) is a live-view patch optimization, not the ordering definition (we recompute each call) — deferred; **optimistic** nodes deferred (`optimistic.js`). Complements the env-blocked JS oracle (gate #4) ★ |
 | `updates.js` | [ ] | update propagation |
 | `autoack.js` | [ ] | quorum acknowledgement |
 | `repair.js`, `snapshots.js` | [ ] | reorder repair / snapshots |
