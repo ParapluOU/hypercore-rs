@@ -37,7 +37,8 @@ Read, in order: CLAUDE.md, docs/PORTING_LOG.md, docs/DEFINITION_OF_DONE.md,
 docs/UPSTREAM_TEST_MAP.md, docs/DECISIONS.md, docs/LESSONS.md.
 
 If every box in DEFINITION_OF_DONE.md and UPSTREAM_TEST_MAP.md is already ticked,
-print the single line LOOP-DONE and stop without committing.
+output a line containing only LOOP-DONE (nothing else on that line) and stop
+without committing.
 
 Otherwise do EXACTLY ONE iteration:
 1. Pick the next red item (a capability or an upstream test to port), preferring
@@ -100,7 +101,8 @@ ${BODY}"
   rc=${PIPESTATUS[0]}
   set -e
 
-  if grep -q 'LOOP-DONE' "$tmp"; then
+  # whole-line match: prose like "this is not LOOP-DONE" must NOT trip it
+  if grep -qE '^[[:space:]]*LOOP-DONE[[:space:]]*$' "$tmp"; then
     echo "=== loop reports DONE at iteration ${i}; stopping. ==="
     break
   fi
