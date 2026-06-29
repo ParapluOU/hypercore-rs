@@ -38,8 +38,8 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 
 | File | Status | Maps to |
 |------|--------|---------|
-| `linearizer.js` | [~] | `autobase` linearizer — causal order + key/seq tiebreak ported (via DESIGN.md canonical DAGs); `shouldAck`/indexed-view assertions need quorum ★★ |
-| `dags.js` | [~] | `autobase` DAG ordering — ordering + causal-respect + determinism ported; confirmed-view-length assertions need quorum ★★ |
+| `linearizer.js` | [~] | causal order + tiebreak ported; **quorum degree (single/double) + double-quorum finalized prefix now ported** (DESIGN.md worked examples); `getIndexedViewLength`/`view.get` still need view materialization (apply layer); fork/merge confirm deferred (ADR-0015) ★★ |
+| `dags.js` | [~] | ordering + causal-respect + determinism ported; **quorum-degree confirmation ported**; confirmed-view-*length* assertions still need view materialization ★★ |
 | `basic.js` | [ ] | `autobase` basics ★ |
 | `core.js` | [ ] | `autobase` core |
 | `anchors.js` | [ ] | `autobase` anchoring ★ |

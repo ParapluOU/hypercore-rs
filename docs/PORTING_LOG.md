@@ -207,3 +207,48 @@ Repo-relative paths only — no private or personal data (this repo is public).
   define the double-quorum confirmation rule from `DESIGN.md`, and assert a quorum-finalized prefix
   never reorders. Then the generic convergence sim (gate #3) and the JS oracle (gate #4) on top of
   `order()`.
+
+---
+
+## 2026-06-29 — Iteration 8: `autobase` quorum + finalized prefix
+
+**Did**
+- Added **indexer quorum** to the `Linearizer`. `with_indexers(..)` designates the voting writers;
+  `sees(a, b)` is causal reachability (the graph equivalent of upstream `clock.includes`).
+  `quorum_degree(target)` implements the `DESIGN.md` recursion — a node has a degree-1 (single)
+  quorum once a majority of indexers reference it, degree-2 (double) once a majority reference *that*
+  quorum, etc. — via one bottom-up pass over the topo order carrying best-degree-per-indexer.
+  `finalized()` returns the conservative **snapshot/no-active-fork** prefix: the maximal prefix of
+  `order()` whose nodes have a double quorum **and** are comparable to every other node.
+- 8 new asserting tests (14 total in `autobase`): quorum degrees match the `DESIGN.md` 1'/2'/3'
+  quorum chain; the `c0-b0-c1` higher-quorum example; the conflicting single-quorum pair that must
+  **not** finalize; finalized = double-quorum prefix and is always a prefix of `order()`;
+  **finality-stability** (the finalized prefix only ever extends under cooperative growth, never
+  reorders); majority scales with indexer count (3-of-4); no-indexers ⇒ no finalization but ordering
+  intact; a non-indexing writer is ordered but never votes. `just verify` green (40 workspace tests +
+  wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0015: quorum is a recompute-from-scratch *degree* (the `DESIGN.md` definition), not upstream's
+  incremental `consensus.js` vector-clock machine — determinism stays manifest. Finalization is the
+  conservative snapshot form (double quorum + comparable-to-all); the fork/merge competition rule and
+  the **2-degree-lead caveat** (`DESIGN.md` "Tails, Forks and Merges // todo") plus view
+  materialization (`getIndexedViewLength`) are deferred. Hence the quorum DoD box and the
+  `linearizer.js`/`dags.js` rows stay `[~]`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- The quorum *degree* is a clean bottom-up recursion; the one subtlety is the author's self-vote at
+  every level up to its own degree (sound because you only test level `k-1` after the degree is
+  confirmed `≥ k-1`). Verify against the `DESIGN.md` 1'/2'/3' chain by hand.
+- A double quorum alone is **not** safe to finalize past a competing fork (the `DESIGN.md` caveat),
+  and the general rule is the whole consensus algorithm — so finalize only the snapshot/no-active-fork
+  prefix (always safe) and assert finality-*stability* as a property; defer the lead caveat to the
+  oracle iteration.
+
+**Next**
+- Strengthen quorum for **forks/merges**: confirm a merge over competing tails and the 2-degree-lead
+  caveat (`consensus.js` `_isConfirmed`/`_isConfirmableAt`), so `finalized()` advances through
+  resolved forks, not just chains.
+- Then the generic **convergence sim** (gate #3): N writers, seeded random causal visibility; assert
+  convergence + finalized-prefix-never-reorders. Then the **JS oracle** (gate #4) on `order()` +
+  `quorum_degree`.

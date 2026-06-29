@@ -30,3 +30,19 @@ personal data** (this repo is public; use repo-relative paths).
 - **Derive the tiebreak into the key type.** Making `NodeId` `Ord` as `(key, seq)` means a
   `BTreeSet` frontier *is* the "lowest key wins" tiebreak — no separate comparator, and arrival
   order can't leak in.
+- **Quorum degree is a clean bottom-up recursion; don't port the incremental machine.** Upstream's
+  `consensus.js` streams confirmation with vector clocks; the *definition* in `DESIGN.md` is a simple
+  recursion — a node has degree `k` once a majority of indexers reference a degree-`(k-1)` quorum
+  over it. One topological pass carrying "best degree per indexer in this node's causal closure"
+  reproduces every worked `DESIGN.md` example exactly. The one subtlety: **a node's own author
+  vouches every level up to that node's own degree**, so when counting voters for level `k-1` add the
+  author's `+1` — it is sound because you only test level `k-1` after the degree is already confirmed
+  `≥ k-1`. Verify the recursion against the `DESIGN.md` "1'/2'/3' quorum" chain by hand before trusting it.
+- **Finalize conservatively, then prove stability as a property.** A double quorum alone is *not*
+  safe to finalize in the presence of a competing fork (the `DESIGN.md` caveat) — and the fully
+  general rule is the whole consensus algorithm. The honest single-iteration move: finalize only the
+  snapshot/no-active-fork prefix (double quorum **and** comparable-to-every-node), which is provably
+  safe (refusing to commit is always safe) and still confirms the common chain case. Assert
+  finality-*stability* directly (a finalized prefix only ever extends under cooperative growth) rather
+  than claiming the full fork/merge rule. Defer the 2-degree-lead caveat to the iteration that has the
+  JS oracle to check against.

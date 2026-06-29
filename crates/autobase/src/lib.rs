@@ -8,9 +8,12 @@
 //! scalar (that is what makes forged "append times" a non-attack), and never by
 //! inspecting a payload (this layer is domain-agnostic, L1).
 //!
-//! This iteration implements the **linearizer**: causal order + deterministic
-//! tiebreak. Indexer-quorum finalization (which *prefix* is permanently confirmed)
-//! is the next capability and is intentionally absent here.
+//! On top of the linearizer (causal order + deterministic tiebreak) this layer
+//! adds **indexer quorum** and a **finalized prefix**: by counting how many
+//! indexers reference a node — and, recursively, how many reference *that*
+//! quorum — we determine when a node is permanently confirmed and can no longer
+//! be reordered (DESIGN.md "Consistency"). Votes are counted by causal
+//! reachability only — never a timestamp, never a payload peek.
 //!
 //! ## Clean-room divergence
 //!
@@ -82,6 +85,11 @@ pub struct Linearizer {
     dependents: BTreeMap<NodeId, BTreeSet<NodeId>>,
     /// next expected `seq` per writer — enforces append-only, gap-free delivery.
     next_seq: BTreeMap<WriterKey, u64>,
+    /// The **indexers**: writers whose references count as votes toward quorums
+    /// (DESIGN.md "Indexing Writer"). `None` ⇒ quorum disabled (pure ordering); a
+    /// node from a writer outside this set is still ordered but never votes
+    /// (a non-indexing writer).
+    indexers: Option<BTreeSet<WriterKey>>,
 }
 
 impl Linearizer {
@@ -193,6 +201,188 @@ impl Linearizer {
             .filter(|(_, d)| d.is_empty())
             .map(|(n, _)| *n)
             .collect()
+    }
+
+    /// Designate the **indexers** — the writers whose references count as votes
+    /// toward quorums (DESIGN.md "Indexing Writer"). Without this, [`finalized`]
+    /// is always empty and [`quorum_degree`] is always 0: the linearizer still
+    /// produces a deterministic order, but no prefix is ever *confirmed*.
+    ///
+    /// [`finalized`]: Self::finalized
+    /// [`quorum_degree`]: Self::quorum_degree
+    pub fn with_indexers(indexers: impl IntoIterator<Item = WriterKey>) -> Self {
+        Self {
+            indexers: Some(indexers.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
+    /// Majority of the indexer set (`⌊n/2⌋ + 1`), or `None` when quorum is disabled.
+    fn majority(&self) -> Option<usize> {
+        self.indexers.as_ref().map(|ix| ix.len() / 2 + 1)
+    }
+
+    /// Does node `a` causally see node `b` — i.e. is `b` in `a`'s causal history
+    /// (inclusive of `a == b`)? This is the graph-reachability equivalent of
+    /// upstream's `clock.includes`: votes and quorums are read from the DAG shape
+    /// alone, never from a payload or a clock value a writer reports about itself.
+    pub fn sees(&self, a: &NodeId, b: &NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+        if !self.deps.contains_key(a) || !self.deps.contains_key(b) {
+            return false;
+        }
+        let mut stack = vec![*a];
+        let mut visited: BTreeSet<NodeId> = BTreeSet::new();
+        while let Some(node) = stack.pop() {
+            if let Some(ds) = self.deps.get(&node) {
+                for d in ds {
+                    if d == b {
+                        return true;
+                    }
+                    if visited.insert(*d) {
+                        stack.push(*d);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
+    ///
+    /// A **vote** is a reference from an indexer to a node (at most one per
+    /// indexer, counted by causal reachability). Degree 1 — a *single quorum* —
+    /// means a majority of indexers reference `target`. Degree 2 — a *double
+    /// quorum* — means a majority of indexers each reference a degree-1 quorum
+    /// over `target`; and so on, recursively. The result is the highest degree
+    /// any node in the DAG witnesses over `target`.
+    ///
+    /// Returns 0 when quorum is disabled, the target is unknown, or not even a
+    /// single quorum has formed.
+    ///
+    /// Computed by a single bottom-up pass over a topological order: for every
+    /// node `v` we track, per indexer `w`, the best degree reached by any node of
+    /// `w` in `v`'s causal closure (`bestdeg`). `v` then witnesses degree `k` over
+    /// `target` once a majority of indexers vouch the previous level — `v`'s own
+    /// author vouching every level up to `v`'s degree. This recomputes from
+    /// scratch rather than maintaining upstream's incremental `Consensus` machine
+    /// (ADR-0015), so determinism is manifest.
+    pub fn quorum_degree(&self, target: &NodeId) -> usize {
+        let Some(m) = self.majority() else {
+            return 0;
+        };
+        let indexers = self.indexers.as_ref().expect("majority ⇒ indexers set");
+        if !self.deps.contains_key(target) {
+            return 0;
+        }
+
+        // bestdeg[v][w] = max degree-over-target reached by any node of indexer
+        // `w` within `v`'s causal closure (only nodes that see `target`).
+        let mut bestdeg: BTreeMap<NodeId, BTreeMap<WriterKey, i64>> = BTreeMap::new();
+        // seesx[v] = whether `v` causally sees `target`.
+        let mut seesx: BTreeMap<NodeId, bool> = BTreeMap::new();
+        let mut max_degree: i64 = 0;
+
+        // order() is a valid topological order: every dependency precedes its node.
+        for v in self.order() {
+            let mut pre: BTreeMap<WriterKey, i64> = BTreeMap::new();
+            let mut sees_target = v == *target;
+            if let Some(ds) = self.deps.get(&v) {
+                for d in ds {
+                    if seesx.get(d).copied().unwrap_or(false) {
+                        sees_target = true;
+                    }
+                    if let Some(bd) = bestdeg.get(d) {
+                        for (w, deg) in bd {
+                            let e = pre.entry(*w).or_insert(*deg);
+                            if *deg > *e {
+                                *e = *deg;
+                            }
+                        }
+                    }
+                }
+            }
+            seesx.insert(v, sees_target);
+
+            let author = v.key;
+            let author_is_indexer = indexers.contains(&author);
+            let mut deg_v: i64 = 0;
+            if sees_target {
+                // `v`'s author vouches every level up to `v`'s own degree, so it
+                // contributes +1 at the level under test (the loop only reaches
+                // level k-1 after confirming the degree is already ≥ k-1).
+                let self_vote = if author_is_indexer { 1 } else { 0 };
+                let mut d = 1i64;
+                loop {
+                    let level = d - 1;
+                    let mut count = 0usize;
+                    for w in indexers.iter() {
+                        if *w == author {
+                            continue;
+                        }
+                        if pre.get(w).map(|pd| *pd >= level).unwrap_or(false) {
+                            count += 1;
+                        }
+                    }
+                    if count + self_vote >= m {
+                        deg_v = d;
+                        d += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Record this node's own vote (only an indexer that sees the target).
+            let mut bd = pre;
+            if sees_target && author_is_indexer {
+                let e = bd.entry(author).or_insert(deg_v);
+                if deg_v > *e {
+                    *e = deg_v;
+                }
+            }
+            bestdeg.insert(v, bd);
+
+            if sees_target && deg_v > max_degree {
+                max_degree = deg_v;
+            }
+        }
+
+        max_degree.max(0) as usize
+    }
+
+    /// The **finalized prefix**: the maximal prefix of [`order`](Self::order)
+    /// whose every node has reached a **double quorum** ([`quorum_degree`] ≥ 2)
+    /// *and* is causally comparable to every other node in the DAG (no unresolved
+    /// concurrent fork around it). Once a node enters this prefix, growing the DAG
+    /// cooperatively never reorders it — the **finality-stability** property.
+    ///
+    /// This is the snapshot / no-active-fork form of finalization: it deliberately
+    /// refuses to commit *either* arm of an unresolved fork until a confirmed merge
+    /// makes the contested nodes comparable. The fork/merge competition rule and
+    /// the 2-degree-lead caveat (DESIGN.md "Tails, Forks and Merges"; upstream
+    /// `consensus.js` merge handling) are deferred — see ADR-0015.
+    ///
+    /// [`quorum_degree`]: Self::quorum_degree
+    pub fn finalized(&self) -> Vec<NodeId> {
+        if self.majority().is_none() {
+            return Vec::new();
+        }
+        let order = self.order();
+        let mut out = Vec::new();
+        for node in &order {
+            let comparable = order
+                .iter()
+                .all(|other| other == node || self.sees(node, other) || self.sees(other, node));
+            if comparable && self.quorum_degree(node) >= 2 {
+                out.push(*node);
+            } else {
+                break;
+            }
+        }
+        out
     }
 }
 
@@ -372,5 +562,148 @@ mod tests {
         let lin = Linearizer::new();
         assert!(lin.order().is_empty());
         assert!(lin.tails().is_empty());
+    }
+
+    // A fourth writer key for the majority-threshold test (d, beyond a<b<c).
+    const D: u8 = 4;
+
+    fn indexed(keys: &[u8]) -> Linearizer {
+        Linearizer::with_indexers(keys.iter().map(|&k| wk(k)))
+    }
+
+    // DESIGN.md "Quorums": in the chain `a0 - b0 - c0 - a1`, a0 accumulates a
+    // single quorum at b0, a double quorum at c0, and a triple quorum at a1.
+    #[test]
+    fn quorum_degrees_match_design_chain() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]);
+        add(&mut lin, n(C, 0), &[n(B, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 3, "a1 triple-quorums a0");
+        assert_eq!(lin.quorum_degree(&n(B, 0)), 2, "a1 double-quorums b0");
+        assert_eq!(lin.quorum_degree(&n(C, 0)), 1, "a1 single-quorums c0");
+        assert_eq!(lin.quorum_degree(&n(A, 1)), 0, "a1 itself unconfirmed");
+    }
+
+    // DESIGN.md "Higher Quorums": `c0 - b0 - c1` lifts c0 to a double quorum
+    // because writers b & c reference the single quorum that formed at b0.
+    #[test]
+    fn double_quorum_design_higher_example() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(C, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(C, 0)]);
+        add(&mut lin, n(C, 1), &[n(B, 0)]);
+
+        assert_eq!(lin.quorum_degree(&n(C, 0)), 2, "c1 double-quorums c0");
+        assert_eq!(lin.quorum_degree(&n(B, 0)), 1, "b0 single-quorumed by c1");
+    }
+
+    // DESIGN.md "Condition for Consistency": two nodes can each reach a *single*
+    // quorum yet conflict — so a single quorum must never finalize. Here c1 sees
+    // {a0, c0} and b0 sees {c0}; a0 is voted by {a, c}, c0 by {b, c}. Both reach a
+    // single quorum, but c is in both — writers b and c hold conflicting views.
+    #[test]
+    fn single_quorum_does_not_finalize() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(C, 0), &[]);
+        add(&mut lin, n(C, 1), &[n(A, 0)]); // c1: cross-ref a0, implicit pred c0
+        add(&mut lin, n(B, 0), &[n(C, 0)]);
+
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 1);
+        assert_eq!(lin.quorum_degree(&n(C, 0)), 1);
+        assert!(
+            lin.finalized().is_empty(),
+            "competing single quorums must not finalize"
+        );
+    }
+
+    // The finalized prefix is the double-quorum'd head of a chain, and it is
+    // always a genuine prefix of the deterministic order.
+    #[test]
+    fn finalized_is_a_double_quorum_prefix() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]);
+        add(&mut lin, n(C, 0), &[n(B, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+
+        let f = lin.finalized();
+        assert_eq!(f, vec![n(A, 0), n(B, 0)], "only a0,b0 are double-quorum'd");
+        assert!(lin.order().starts_with(&f), "finalized ⊑ order");
+    }
+
+    // Finality-stability: as the DAG grows cooperatively (each append references
+    // the head), the finalized prefix only ever extends — no node already
+    // finalized is dropped or reordered.
+    #[test]
+    fn finalized_prefix_only_grows() {
+        // round-robin chain a0,b0,c0,a1,b1,c1,a2,b2,c2
+        let writers = [A, B, C];
+        let steps: Vec<NodeId> = (0..9)
+            .map(|i| n(writers[i % 3], (i / 3) as u64))
+            .collect();
+
+        let mut lin = indexed(&[A, B, C]);
+        let mut prev: Vec<NodeId> = Vec::new();
+        let mut last = String::new();
+        for (i, node) in steps.iter().enumerate() {
+            let heads = if i == 0 { vec![] } else { vec![steps[i - 1]] };
+            add(&mut lin, *node, &heads);
+
+            let cur = lin.finalized();
+            assert!(cur.starts_with(&prev), "finalized must extend, never reorder");
+            assert!(lin.order().starts_with(&cur), "finalized ⊑ order at every step");
+            prev = cur;
+            last = format!("{} nodes finalized", prev.len());
+        }
+        assert!(!prev.is_empty(), "a long chain must finalize something ({last})");
+    }
+
+    // Majority is ⌊n/2⌋+1: with four indexers it takes three distinct votes to
+    // form even a single quorum.
+    #[test]
+    fn majority_threshold_scales_with_indexer_count() {
+        let mut lin = indexed(&[A, B, C, D]); // majority = 3
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]); // a0 referenced by {a,b} = 2 < 3
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 0, "two of four is not a majority");
+
+        add(&mut lin, n(C, 0), &[n(B, 0)]); // now {a,b,c} = 3 ≥ 3
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 1, "three of four is a single quorum");
+    }
+
+    // Without an indexer set the linearizer still orders, but confirms nothing.
+    #[test]
+    fn no_indexers_means_no_finalization() {
+        let mut lin = Linearizer::new();
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]);
+        add(&mut lin, n(C, 0), &[n(B, 0)]);
+
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 0);
+        assert!(lin.finalized().is_empty());
+        // ordering is unaffected
+        assert_eq!(lin.order(), vec![n(A, 0), n(B, 0), n(C, 0)]);
+    }
+
+    // A non-indexing writer is ordered but never casts a vote: its references do
+    // not move a target toward quorum.
+    #[test]
+    fn non_indexer_references_do_not_vote() {
+        // Only a & b are indexers; c is a non-indexing writer.
+        let mut lin = indexed(&[A, B]); // majority = 2
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(C, 0), &[n(A, 0)]); // c (non-indexer) references a0
+
+        // a0 has only its own indexer vote {a}; c's reference doesn't count.
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 0, "non-indexer vote ignored");
+
+        add(&mut lin, n(B, 0), &[n(C, 0)]); // b (indexer) now references a0
+        assert_eq!(lin.quorum_degree(&n(A, 0)), 1, "{{a,b}} is the quorum");
+        // c is still part of the linearization.
+        assert!(lin.order().contains(&n(C, 0)));
     }
 }

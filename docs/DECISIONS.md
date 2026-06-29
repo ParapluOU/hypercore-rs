@@ -96,3 +96,32 @@ do **not** port the `undo`/`shared` reorder-tracking (a streaming optimization) 
 consensus/quorum confirmation (next capability; the upstream `linearizer.js`/`dags.js` assertions on
 *indexed* view length depend on it). Equivalence is at the linearization level for causally-closed
 DAGs.
+
+## ADR-0015 — Quorum is a recompute-from-scratch degree; finality is the conservative snapshot form
+**Context:** Upstream confirmation lives in `reference/js/autobase/lib/consensus.js` — an
+*incremental* `Consensus` machine over vector clocks (`confirms`/`shift`/`_isConfirmed`/
+`_isConfirmableAt`, plus merge bookkeeping) that streams the indexed view as nodes arrive. The
+*definition* of a quorum, though, is in `DESIGN.md` ("Quorums"): a **vote** is a reference from an
+indexer to a node; a node has a degree-1 quorum once a majority of indexers reference it, and the
+degree increases each time a majority reference the lower-degree quorum.
+**Decision:** Reimplement the *definition*, not the machine. `quorum_degree(target)` is a single
+bottom-up pass over a topological order (`order()`): for each node we carry, per indexer, the best
+degree any of that indexer's nodes reached over the target within its causal closure, and a node
+witnesses degree `k` once a majority vouch level `k-1` (its own author vouching every level up to its
+degree). Votes are read purely from causal reachability (`sees`, the graph equivalent of
+`clock.includes`) — never a timestamp or a payload. `finalized()` returns the conservative
+**snapshot / no-active-fork** prefix: the maximal prefix of `order()` whose nodes have a **double
+quorum** (degree ≥ 2) *and* are causally comparable to every other node (no unresolved concurrent
+fork around them).
+**Consequence:** Determinism is manifest (a pure function of the DAG ⇒ replicas seeing the same set
+agree) and the recursive degree reproduces every worked `DESIGN.md` example (the `a0` 1'/2'/3'
+quorum chain; the `c0-b0-c1` higher quorum; the conflicting single-quorum pair that must *not*
+finalize). We **defer** two things, each its own iteration: (a) the fork/merge competition rule and
+the **2-degree-lead caveat** (`DESIGN.md` "Tails, Forks and Merges // todo"; `consensus.js` merge
+handling) — `finalized()` refuses to commit either arm of an unresolved fork until a confirmed merge
+makes the contested nodes comparable, which is safe but conservative (it may confirm later than
+upstream, never earlier/wrongly); and (b) view materialization, so the upstream
+`getIndexedViewLength`/`view.get` assertions in `linearizer.js`/`dags.js` stay `[~]`. Finality is
+validated as a *property* (a finalized prefix never reorders under cooperative growth), to be
+strengthened against arbitrary partitions by the convergence sim (gate #3) and the JS oracle
+(gate #4).

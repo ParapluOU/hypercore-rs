@@ -55,7 +55,8 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [ ] `storage` — IndexedDB backend (wasm)
 - [x] `hypercore` — append/get/verify + proof-based replication
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
-- [ ] `autobase` — quorum / finality-stability
+- [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
+      prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)
 - [ ] convergence simulation (gate #3)
 - [ ] JS algorithmic-equivalence oracle (gate #4)
 - [ ] WASM runtime / IndexedDB (gate #2)
