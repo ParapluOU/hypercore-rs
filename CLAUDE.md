@@ -39,6 +39,20 @@ One iteration:
 **Done** = `just verify-full` green **and** every box in `docs/DEFINITION_OF_DONE.md` and
 `docs/UPSTREAM_TEST_MAP.md` ticked.
 
+## Running iterations (for the operator)
+
+Iterations are driven by a script, invoked by number — not on a timer:
+
+```sh
+just iter 1            # run iteration 1
+just iter-range 1 5    # run 1..5, stopping on a red gate or LOOP-DONE
+scripts/iterate.sh 7   # same as `just iter 7`
+```
+
+Each invocation spawns a headless agent that performs exactly one step above, then the driver
+**independently re-runs `just verify`** and only accepts the iteration if it is green. Commits stay
+local (nothing is pushed). Env knobs: `HC_MODEL`, `HC_BUDGET` (per-iteration USD cap), `HC_PERM`.
+
 ## Where things are
 
 - `crates/` — the workspace (dependency graph in `README.md`)

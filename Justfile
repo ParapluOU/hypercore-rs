@@ -1,6 +1,14 @@
 # hypercore-rs task runner. See docs/DEFINITION_OF_DONE.md.
 # `just verify` is the loop's red/green gate.
 
+# Run one porting-loop iteration (spawns a headless agent, then re-checks the gate). e.g. `just iter 1`
+iter n:
+    scripts/iterate.sh {{n}}
+
+# Run a range of iterations, stopping on a red gate or DONE. e.g. `just iter-range 1 5`
+iter-range n m:
+    scripts/iterate.sh {{n}} {{m}}
+
 # Always-runnable gate: native tests (unit + property + ported upstream + convergence sim) + wasm compile.
 verify: test wasm
 
