@@ -82,6 +82,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       over the `DESIGN.md` DAGs + 200 seeded random fork/merge DAGs × delivery orders (ADR-0027)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)
+      + **view materialization** (`view`/`view_len`/`view_get` ≡ upstream `view`/`view.length`/`view.get`;
+      `indexed_view_len` ≡ `getIndexedViewLength` — the fork-free `linearizer.js`/`dags.js` "simple" chain
+      asserts the exact upstream `view.length 6` / `getIndexedViewLength 4`, plus cross-replica view +
+      indexed-length convergence over every DAG; ADR-0028. The L1 fold is identity — one node, one entry —
+      since apply is domain logic; the fork-case confirmed lengths await the deferred consensus)
 - [x] convergence simulation (gate #3) — `crates/autobase/tests/convergence.rs`: seeded random
       partitioned/cooperative DAGs; order + state + finalized converge across delivery orders;
       finalized prefix monotone under cooperative growth (ADR-0016)

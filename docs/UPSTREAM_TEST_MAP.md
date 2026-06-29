@@ -38,8 +38,8 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 
 | File | Status | Maps to |
 |------|--------|---------|
-| `linearizer.js` | [~] | causal order + tiebreak ported; **quorum degree (single/double) + double-quorum finalized prefix now ported** (DESIGN.md worked examples); `getIndexedViewLength`/`view.get` still need view materialization (apply layer); fork/merge confirm deferred (ADR-0015) ★★ |
-| `dags.js` | [~] | ordering + causal-respect + determinism ported; **quorum-degree confirmation ported**; confirmed-view-*length* assertions still need view materialization ★★ |
+| `linearizer.js` | [~] | causal order + tiebreak ported; **quorum degree (single/double) + double-quorum finalized prefix ported** (DESIGN.md worked examples); **view materialization ported** (ADR-0028, `crates/autobase/tests/view.rs`): `view`/`view.length`/`view.get(i)`+`null`-past-end ≡ `view()`/`view_len()`/`view_get()`, `getIndexedViewLength` ≡ `indexed_view_len()` — the fork-free `linearizer - simple` chain asserts the exact upstream numbers (`view.length 6`, `getIndexedViewLength 4`, the per-index `view.get` sequence) since our conservative double-quorum confirmation equals upstream's confirmed length on a fork-free chain, plus the cross-replica `getIndexedViewLength(a)==(b)==(c)` convergence as a property over every DAG; the fork-case confirmed lengths (`compete`/`count ordering`) need the deferred fork/merge consensus (ADR-0015) and the per-replica *partial* view needs the apply/view layer ★★ |
+| `dags.js` | [~] | ordering + causal-respect + determinism ported; **quorum-degree confirmation ported**; **view materialization ported** (ADR-0028) — `dags - simple 3` is the same fork-free chain as `linearizer - simple` (view + `getIndexedViewLength 4`); `dags - simple 2` (`n==2`, a unanimous single quorum upstream confirms but our conservative double-quorum form does not) + the fork cases' confirmed-view-*length* still need the deferred fork/merge consensus (ADR-0015) ★★ |
 | `basic.js` | [ ] | `autobase` basics ★ |
 | `core.js` | [ ] | `autobase` core |
 | `anchors.js` | [ ] | `autobase` anchoring ★ |

@@ -384,6 +384,63 @@ impl Linearizer {
         }
         out
     }
+
+    // ----------------------------------------------------------------------------------
+    // View materialization (upstream autobase's `view`).
+    //
+    // Upstream linearizes the DAG and then *applies* each node to materialize a `view`
+    // (a hypercore the consumer reads): `view.length` is the total materialized length,
+    // `view.get(i)` reads entry `i`, and `getIndexedViewLength` (DESIGN.md "Indexing")
+    // reports how much of that view is **confirmed** — the indexed prefix that can never
+    // reorder. The apply step is where *domain* logic lives, so at L1 there is nothing to
+    // apply: this layer is content-blind. The domain-agnostic materialization is therefore
+    // the identity one — **each node contributes exactly one entry, its own [`NodeId`]** —
+    // so the "view" is just the linearization and the "indexed view" is the finalized
+    // prefix. A consuming application replays `view()` through its own apply function to
+    // build the real, typed view; the ordering/confirmation it relies on lives here.
+    // See ADR-0028.
+    // ----------------------------------------------------------------------------------
+
+    /// The **materialized view**: the linearization rendered as an indexable sequence of
+    /// entries (≡ upstream `view`). At L1 each node is one entry (its [`NodeId`]), so this
+    /// equals [`order`](Self::order); a domain consumer folds these through its own apply
+    /// function to produce a typed view.
+    pub fn view(&self) -> Vec<NodeId> {
+        self.order()
+    }
+
+    /// Length of the materialized [`view`](Self::view) (≡ upstream `view.length`). One node
+    /// = one entry at L1, so this is the node count.
+    pub fn view_len(&self) -> usize {
+        self.len()
+    }
+
+    /// Entry `i` of the materialized [`view`](Self::view), or `None` past the end
+    /// (≡ upstream `view.get(i, { wait: false })` returning `null` beyond `view.length`).
+    pub fn view_get(&self, i: usize) -> Option<NodeId> {
+        self.order().into_iter().nth(i)
+    }
+
+    /// The **indexed view**: the confirmed prefix of the [`view`](Self::view) that can
+    /// never reorder — the [`finalized`](Self::finalized) prefix, which is always a prefix
+    /// of [`view`](Self::view).
+    pub fn indexed_view(&self) -> Vec<NodeId> {
+        self.finalized()
+    }
+
+    /// Length of the [`indexed_view`](Self::indexed_view) (≡ upstream
+    /// `getIndexedViewLength` — `getIndexedInfo().views[].length`). Always
+    /// `<= view_len()`.
+    ///
+    /// This is our **conservative** confirmation depth: a double-quorum, no-active-fork
+    /// prefix (ADR-0015). For a fork-free indexer chain it equals upstream's confirmed
+    /// length exactly; the cases where upstream confirms *earlier* — a unanimous single
+    /// quorum (`n` indexers, all `n` voting, e.g. `dags.js` "simple 2") and confirmation
+    /// across a resolved fork/merge — are the deferred fork/merge consensus work and are
+    /// not yet matched (ADR-0015, ADR-0028).
+    pub fn indexed_view_len(&self) -> usize {
+        self.finalized().len()
+    }
 }
 
 #[cfg(test)]

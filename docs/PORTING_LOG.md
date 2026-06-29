@@ -923,3 +923,69 @@ Repo-relative paths only — no private or personal data (this repo is public).
   view-length assertions need; and `merkle` reorg-by-proof/`additionalNodes` (the last
   `merkle-tree.js` pieces — note ADR-0025: `additionalNodes` adds no L1 capability our standalone
   proofs lack).
+
+---
+
+## 2026-06-29 — Iteration 21: `autobase` view materialization (`linearizer.js`/`dags.js`)
+
+**Did**
+- Ported the **view materialization** behaviour of `reference/js/autobase/test/linearizer.js` +
+  `dags.js` — the `view` / `view.get(i)` / `getIndexedViewLength` assertions — as thin accessors
+  over the existing linearizer plus `crates/autobase/tests/view.rs`. Upstream linearizes the DAG
+  and then *applies* each node to materialize a `view` (the apply step is where domain logic lives,
+  possibly batching entries per node); at L1 there is nothing to apply (content-blind), so the
+  domain-agnostic fold is the **identity** one — one node, one entry (its `NodeId`):
+  - `Linearizer::view()` ≡ `order()` (the materialized view); `view_len()` ≡ `view.length`
+    (node count); `view_get(i)` ≡ `view.get(i, {wait:false})` (`None` past the end);
+    `indexed_view()` ≡ `finalized()`; `indexed_view_len()` ≡ `getIndexedViewLength`
+    (`getIndexedInfo().views[].length`). A consuming app replays `view()` through *its* apply to
+    build the typed view; only the ordering/confirmation is L1.
+- 3 asserting tests (autobase 19→22 across files: 14 unit + 2 convergence + 3 topolist + 3 view):
+  - `simple_chain_view_and_indexed_length` — the fork-free `c-b-a-c-b-a` indexer chain
+    (`linearizer - simple` / `dags - simple 3`): the full view `[c0,b0,a0,c1,b1,a1]`,
+    `view_len == 6`, the per-index `view_get` sequence, `view_get(6) == None`, the single tail, and
+    **`indexed_view_len == 4`** — the double-quorum'd `[c0,b0,a0,c1]` prefix, matching upstream's
+    `getIndexedViewLength` exactly (for a fork-free chain our conservative double-quorum
+    confirmation = upstream's confirmed length; hand-verified the quorum recursion gives degrees
+    c0/b0/a0 = 3, c1 = 2, b1 = 1, a1 = 0 ⇒ prefix length 4).
+  - `recursive_dag_view_converges` — the recursive `DESIGN.md` DAG (forks: a0/c0 concurrent
+    tails): the view is the canonical `[a0,c0,a1,b0,b1,c1,b2]`, and across three causally-valid
+    delivery orders the view, every `view_get`, and the **indexed view length converge** (the
+    `getIndexedViewLength(a)==(b)==(c)` family) with the indexed view always a prefix — asserting
+    the always-true convergence/prefix properties, *not* a specific fork-case confirmed number.
+  - `non_indexer_nodes_are_in_view_but_do_not_index` — a non-indexing writer's node is in the view
+    but never advances the indexed view (the view/indexed split is orthogonal to indexer status).
+- `just verify` green: **104 native tests** + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0028: view materialization is the **identity fold** at L1 (one node = one entry, its
+  `NodeId`) — `view`/`view_get`/`indexed_view*` are thin accessors over `order()`/`finalized()`.
+  Assert the **exact upstream numbers only where our conservative confirmation matches** (the
+  fork-free chain → view 6 / indexed 4), and assert cross-replica view + indexed-length
+  **convergence** as a property over every DAG. **Defer** the indexed-length *values* where upstream
+  confirms earlier — a **unanimous single quorum** (`dags - simple 2`, `n == 2`) and confirmation
+  across a **resolved fork/merge** (`compete`/`count ordering`), both the deferred fork/merge
+  consensus (ADR-0015) — and the **per-replica partial view** (apply/view layer). `linearizer.js` /
+  `dags.js` stay `[~]`. No typed payload / per-node batch (domain concerns, ADR-0002/0007).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- At L1 the autobase "view" is the linearization itself and the "indexed view" is the finalized
+  prefix — the apply step is the domain logic you deliberately don't have, so the fold is identity.
+  Only assert the upstream `getIndexedViewLength` *number* where your confirmation rule matches it
+  (fork-free chain ✓; unanimous single quorum and resolved-fork cases confirm earlier upstream than
+  our conservative double-quorum form — assert convergence/prefix properties there, not the number).
+  A forced chain has only one valid delivery order, so a "converges across delivery orders" test
+  over it is vacuous — use a genuinely forked DAG (concurrent tails) to exercise reordering.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not startable under the loop's scoped allowlist + image pull needs network;
+  see iters 11–20). When a container runtime is *started*, build `tools/oracle/` driving the
+  reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2, needs headless Chrome); the **deferred fork/merge
+  consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a resolved fork/merge —
+  which would let `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases
+  (`dags - simple 2`, `linearizer - compete`/`count ordering`) and the **apply/view layer**
+  (`apply.js`/`anchors.js`) needed for the per-replica partial views; and `merkle`
+  reorg-by-proof/`additionalNodes` (the last `merkle-tree.js` pieces).

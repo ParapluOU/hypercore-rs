@@ -218,3 +218,23 @@ personal data** (this repo is public; use repo-relative paths).
   prefix to anchor (an upgrade proof needs `old >= 1`), so adopt the signed higher-fork head from
   scratch and let `add_block` re-verify every block. After verifying, `truncate` to `ancestors` and
   refetch the suffix with the existing `add_block` — byte-identical to the source's rewritten history.
+- **At L1 the autobase "view" is the linearization itself and the "indexed view" is the finalized
+  prefix — the apply step is the domain logic you deliberately don't have.** Upstream materializes a
+  `view` by *applying* each linearized node (where the consumer's domain logic runs, possibly emitting a
+  batch of entries per node); the tests then assert `view.length` / `view.get(i)` / `getIndexedViewLength`.
+  Since L1 is content-blind there is nothing to apply, so the domain-agnostic fold is the **identity** one
+  — one node, one entry (its `NodeId`) — making `view() ≡ order()`, `view_len()` = node count,
+  `view_get(i)` the i-th ordered node (`None` past the end ≡ `view.get(i,{wait:false}) == null`),
+  `indexed_view() ≡ finalized()`, and `indexed_view_len() ≡ getIndexedViewLength`. The consumer replays
+  `view()` through *its* apply to build the typed view; only the ordering/confirmation lives at L1.
+  Porting gotcha — **only assert the upstream `getIndexedViewLength` number where your confirmation rule
+  actually matches it**: for a fork-free indexer chain our conservative double-quorum prefix (ADR-0015)
+  *is* upstream's confirmed length (e.g. the `c-b-a-c-b-a` chain → view 6, indexed 4), so assert it; but
+  upstream confirms *earlier* in two deferred cases — a **unanimous single quorum** (`n` indexers, all `n`
+  voting: safe because a single quorum is the whole set, but our rule still demands a double quorum, so
+  `dags - simple 2`'s `getIndexedViewLength == 1` would fail against our `0`) and across a **resolved
+  fork/merge** — so do *not* hardcode those numbers; assert instead the always-true properties (view +
+  indexed-length **converge** across every causally-valid delivery order — the `(a)==(b)==(c)` family — and
+  indexed view ⊑ view). Also: a forced chain (each step has exactly one causally-ready node) has only
+  *one* valid delivery order, so a "converges across delivery orders" test over it is vacuous — use a
+  genuinely forked DAG (concurrent tails) to exercise reordering.

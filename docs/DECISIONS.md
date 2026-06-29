@@ -462,3 +462,35 @@ writer-admission feature; `optimistic.js` row `[ ]`). This in-Rust oracle **comp
 replace,** the upstream-JS algorithmic-equivalence oracle (gate #4, ADR-0008): gate #4 runs the *actual*
 reference code in a sandbox and remains the deferred cross-language check; this validates the same
 equivalence at the algorithm level, host-safely, today.
+
+## ADR-0028 — View materialization is the identity fold at L1; indexed view = the finalized prefix
+**Context:** Upstream autobase (`reference/js/autobase/test/linearizer.js`, `dags.js`) linearizes the
+multi-writer DAG and then **applies** each node to materialize a `view` (a hypercore the consumer
+reads). The tests assert `view.length` (total materialized length), `view.get(i)` (entry `i`, `null`
+past the end), and `getIndexedViewLength` (`getIndexedInfo().views[].length` — how much of the view is
+**confirmed**, the indexed prefix that can never reorder), plus that every replica agrees on these. The
+apply step is where *domain* logic lives (`apply.js`), and a node may emit a **batch** of view entries.
+**Decision:** The apply step is domain logic we deliberately do not have (L1 is content-blind), so the
+domain-agnostic materialization is the **identity fold**: each node contributes exactly one entry — its
+own `NodeId`. Expose it as thin accessors over the existing linearizer: `view()` ≡ `order()`,
+`view_len()` ≡ `view.length` (= node count, one entry per node), `view_get(i)` ≡
+`view.get(i, {wait:false})` (`None` past the end), `indexed_view()` ≡ `finalized()`, and
+`indexed_view_len()` ≡ `getIndexedViewLength`. A consuming application replays `view()` through its own
+apply function to build the real, typed view; the ordering/confirmation it relies on is what lives here.
+**Consequence:** The `view` / `view.get` / `getIndexedViewLength` behaviour is ported as
+`crates/autobase/tests/view.rs`. We assert the **exact upstream numbers only where our conservative
+confirmation matches** — the fork-free `c-b-a-c-b-a` indexer chain (`linearizer - simple` /
+`dags - simple 3`): `view_len == 6`, the per-index `view_get` sequence, `view_get(6) == None`, and
+`indexed_view_len == 4` (the double-quorum'd `[c0,b0,a0,c1]` prefix), because for a fork-free chain our
+double-quorum finalization (ADR-0015) equals upstream's confirmed length exactly. We additionally assert,
+as a **property holding for every DAG**, that the view and the indexed view length converge across all
+causally-valid delivery orders (the `getIndexedViewLength(a)==(b)==(c)` family) and that the indexed view
+is always a prefix of the view. We **defer** the indexed-length *values* where upstream confirms earlier
+than our conservative form — a **unanimous single quorum** (`dags - simple 2`, `n == 2`: a single quorum
+*is* all `n` indexers, so it is safe, but our rule still requires a double quorum) and confirmation across
+a **resolved fork/merge** (`linearizer - compete` / `count ordering`) — both the deferred fork/merge
+consensus (ADR-0015) — and the **per-replica partial view** (each base seeing a different node subset
+before full sync; cross-replica view *convergence* still holds and is the property test above). We do
+**not** add a typed payload or a per-node batch (domain concerns, ADR-0002/0007). `linearizer.js` /
+`dags.js` stay `[~]`: view materialization + the fork-free indexed length + cross-replica convergence
+ported; the fork/merge confirmed lengths and the apply/view layer (`apply.js`/`anchors.js`) remain.
