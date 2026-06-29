@@ -338,3 +338,64 @@ Repo-relative paths only — no private or personal data (this repo is public).
   + local `clock`/`consensus`/`topolist`, so the harness reconstructs `add`/`order` against it).
 - Then the wasm runtime / IndexedDB gate (#2) and the per-file upstream test rows (incl. merkle
   seek/upgrade/reorg).
+
+---
+
+## 2026-06-29 — Iteration 11: `hypercore` batch + atomic append
+
+**Did**
+- Added **batch / atomic append** to `crates/hypercore` (upstream `batch.js` / `atomic.js` essence,
+  L1): a `Batch<T>` opened with `Hypercore::batch()` records the log length it was opened against
+  (`base`); `stage(&mut batch, &value)` encodes and buffers a block **without touching the log**;
+  `batch_get(&batch, i)` reads *through* the batch (committed region from the log, staged region from
+  the buffer); `commit(batch)` applies every staged block under a **single** signed head. Commit is
+  **all-or-nothing**: blocks are written to storage first and, on any storage failure, the partial
+  writes are rolled back and the Merkle tree + signed head are left untouched (the log never advances
+  on a failed commit). Commit returns `Ok(None)` (log unchanged) on a **stale base** — the log
+  advanced past `base` since the batch opened — and an empty batch is a successful no-op.
+- 7 asserting tests (hypercore 7→14): staging leaves the log + head untouched while the batch reads
+  both regions and reports `length()` = base+staged; **commit-equivalence** (a committed batch yields
+  a head — root/length/signature — *identical* to N single appends under the same author); a committed
+  batch is invisible to verifiers (every block proves against the one head; a `Replica` rebuilds it
+  byte-identically); **stale-base rejection** (direct append during an open batch ⇒ commit refused,
+  log unchanged); empty-batch no-op; dropped-batch leaves the log unchanged; and **commit atomicity**
+  via a `FaultyStore` that injects a `put` failure mid-batch — commit errors, the partial write is
+  rolled back (no orphan blocks), length/head/reads are intact, and a later fault-free commit recovers
+  cleanly. `just verify` green (55 native tests + wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0018: model a batch as a **staged encoded buffer + atomic commit with stale-base rejection**,
+  not upstream's session/`atom`/storage-overlay machinery (sessions are out of scope per the relevance
+  filter). We port the L1 behaviour-under-test — stage-without-touching / single-head commit /
+  all-or-nothing / stale-base reject — and defer upstream's multi-session interactions, `byteLength`,
+  truncate/append events, and the `atom.flush()` storage-overlay model.
+- The **JS oracle (gate #4) is environment-blocked this iteration**, so I picked the next self-contained
+  red item instead: the Apple `container` runtime is installed but its system service is **not started**
+  (`container system start` needs an XPC service that is outside the iteration's scoped allowlist), and
+  the image pull needs network — so a green oracle run isn't reachable under the loop's permissions here.
+  Separately, an order-equivalence oracle could legitimately come back **red** (our priority-Kahn
+  `order()` vs upstream's incremental `topolist.js` insertion-sort), which is precisely the divergence it
+  exists to surface and can't be resolved without it. The oracle stays the top "Next".
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Atomic multi-step commit over a fallible byte store: do the **fallible writes first** (rolling back
+  on failure), and only mutate the in-memory source of truth (Merkle tree + signed head) **after** every
+  write has succeeded — so a partial failure can never advance the log's logical state.
+- Test atomicity with a **fault-injecting store** wrapper (fail the `put` at a chosen key); assert the
+  logical state (length/head/reads) is untouched *and* no orphan blocks remain, then that a fault-free
+  retry recovers — a happy-path-only test would never exercise the rollback.
+- The minimal-dependency path to the **JS oracle** is upstream's bare `lib/topolist.js` (the actual
+  ordering producer, ADR-0014): it needs only `b4a.compare`/`nanoassert` and synthetic node objects
+  (`writer.core.key`, `length`, `dependencies`/`dependents`, `index`) — *no* clock/consensus/writer
+  graph and none of the heavy native deps. Inject the two trivial deps via `Module._compile` over the
+  reference source (no npm, no network) and drive `Topolist.add` in causal order, comparing `.tip` to
+  our `order()`. Precondition: a **started** container runtime (`container system start`).
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) once a container runtime is *started*:
+  build `tools/oracle/` driving the reference `lib/topolist.js` (deps injected via `Module._compile`,
+  network-free) through `scripts/node-sandbox.sh`, feed it the convergence sim's seeded DAGs, and assert
+  identical order vs our `order()` (a `--ignored`, `oracle`-feature test, run by `just oracle`). This is
+  also the cross-check that lets us safely strengthen `finalized()` for forks/merges (ADR-0015).
+- Then the wasm runtime / IndexedDB gate (#2), and more upstream rows (`conflicts.js` fork detection;
+  merkle seek/upgrade/reorg).

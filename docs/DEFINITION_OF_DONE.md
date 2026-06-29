@@ -55,7 +55,8 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend
 - [ ] `storage` — IndexedDB backend (wasm)
-- [x] `hypercore` — append/get/verify + proof-based replication
+- [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
+      (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)

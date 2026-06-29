@@ -46,6 +46,43 @@ pub enum Error<SE> {
     Corrupt,
 }
 
+/// A staged, atomic multi-block append.
+///
+/// Open one with [`Hypercore::batch`], stage values into it with
+/// [`Hypercore::stage`] (the log is **not** touched — staged blocks are only
+/// visible through [`Hypercore::batch_get`]), then apply them all at once with
+/// [`Hypercore::commit`]: every staged block lands under a **single** signed
+/// head, identical to having appended them one by one. Dropping a batch without
+/// committing leaves the log unchanged. A batch records the log length it was
+/// opened against (`base`); if the log advances past that base before commit,
+/// the commit is rejected (stale base) and the batch must be rebuilt.
+pub struct Batch<T> {
+    base: u64,
+    encoded: Vec<Vec<u8>>,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T> Batch<T> {
+    /// The log length this batch was opened against.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Number of blocks staged so far.
+    pub fn staged(&self) -> usize {
+        self.encoded.len()
+    }
+
+    /// The batch's logical length (`base` + staged blocks).
+    pub fn length(&self) -> u64 {
+        self.base + self.encoded.len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.encoded.is_empty()
+    }
+}
+
 /// A typed, signed, append-only log.
 pub struct Hypercore<T, C, S> {
     author: SecretKey,
@@ -100,6 +137,80 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         let sig = self.author.sign(&head_message(length, &root));
         self.head = Some(SignedHead { length, root, sig });
         Ok(index)
+    }
+
+    /// Open an empty [`Batch`] based on the current log length.
+    pub fn batch(&self) -> Batch<T> {
+        Batch {
+            base: self.tree.len(),
+            encoded: Vec::new(),
+            _t: PhantomData,
+        }
+    }
+
+    /// Encode and stage `value` into `batch`. The log is untouched; the value is
+    /// only visible through [`Self::batch_get`] until [`Self::commit`].
+    pub fn stage(&self, batch: &mut Batch<T>, value: &T) {
+        batch.encoded.push(self.codec.encode(value));
+    }
+
+    /// Read block `index` as seen *through* `batch`: indices below the batch's
+    /// base come from the committed log, indices in the staged range from the
+    /// batch itself. `None` past the batch's end.
+    pub fn batch_get(&self, batch: &Batch<T>, index: u64) -> Result<Option<T>, Error<S::Error>> {
+        if index < batch.base {
+            return self.get(index);
+        }
+        match batch.encoded.get((index - batch.base) as usize) {
+            Some(enc) => Ok(Some(self.codec.decode(enc).map_err(Error::Codec)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically apply every staged block under a **single** signed head.
+    ///
+    /// All-or-nothing: blocks are written to storage first and, on any storage
+    /// failure, the partial writes are rolled back and the Merkle tree + signed
+    /// head are left **untouched** (the log's logical state never advances on a
+    /// failed commit). Returns the new length on success.
+    ///
+    /// Returns `Ok(None)` — leaving the log unchanged — if the log advanced past
+    /// the batch's base since it was opened (a *stale base*): the batch was built
+    /// against a head that no longer exists and must be rebuilt. An empty batch
+    /// is a successful no-op.
+    pub fn commit(&mut self, batch: Batch<T>) -> Result<Option<u64>, Error<S::Error>> {
+        if batch.base != self.tree.len() {
+            return Ok(None); // stale base: the log moved under the batch
+        }
+        if batch.encoded.is_empty() {
+            return Ok(Some(self.tree.len())); // empty batch: nothing to do
+        }
+
+        // Write every staged block first; this is the only fallible step. On
+        // failure, undo the writes already made so the tree + head — the log's
+        // source of truth — are never advanced on a partial batch.
+        let start = self.tree.len();
+        let mut written: Vec<u64> = Vec::with_capacity(batch.encoded.len());
+        for (i, enc) in batch.encoded.iter().enumerate() {
+            let idx = start + i as u64;
+            if let Err(e) = self.store.put(idx, enc) {
+                for w in &written {
+                    let _ = self.store.delete(*w);
+                }
+                return Err(Error::Storage(e));
+            }
+            written.push(idx);
+        }
+
+        // All blocks stored — now fold them into the tree and sign once.
+        for enc in &batch.encoded {
+            self.tree.append(enc);
+        }
+        let length = self.tree.len();
+        let root = self.tree.root_hash();
+        let sig = self.author.sign(&head_message(length, &root));
+        self.head = Some(SignedHead { length, root, sig });
+        Ok(Some(length))
     }
 
     /// Decode the value at `index`, or `None` if out of range.
@@ -369,5 +480,213 @@ mod tests {
         assert!(rep.add_block(&head, 0, &e0, &p0).unwrap());
         assert!(rep.add_block(&head, 1, &e1, &p1).unwrap());
         assert_eq!(rep.len(), 2);
+    }
+
+    // ---- batch / atomic append (upstream `batch.js` / `atomic.js`) ----
+
+    fn blk(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn batch_stages_without_touching_log() {
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(20), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let head_before = core.head().unwrap().clone();
+
+        let mut b = core.batch();
+        core.stage(&mut b, &blk("de"));
+        core.stage(&mut b, &blk("fg"));
+
+        // The log itself is untouched while the batch is open.
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.head().unwrap(), &head_before);
+        assert_eq!(core.get(3).unwrap(), None);
+
+        // The batch presents a length of 5 and reads both committed and staged.
+        assert_eq!(b.base(), 3);
+        assert_eq!(b.staged(), 2);
+        assert_eq!(b.length(), 5);
+        assert_eq!(core.batch_get(&b, 0).unwrap(), Some(blk("a"))); // committed
+        assert_eq!(core.batch_get(&b, 2).unwrap(), Some(blk("c"))); // committed
+        assert_eq!(core.batch_get(&b, 3).unwrap(), Some(blk("de"))); // staged
+        assert_eq!(core.batch_get(&b, 4).unwrap(), Some(blk("fg"))); // staged
+        assert_eq!(core.batch_get(&b, 5).unwrap(), None); // past the batch
+
+        // Committing advances the log to the batch length.
+        assert_eq!(core.commit(b).unwrap(), Some(5));
+        assert_eq!(core.len(), 5);
+        assert_eq!(core.get(3).unwrap(), Some(blk("de")));
+        assert_eq!(core.get(4).unwrap(), Some(blk("fg")));
+    }
+
+    #[test]
+    fn commit_equals_sequential_appends() {
+        // Same author + same blocks: one committed batch == N single appends,
+        // down to the signed head (root, length, signature).
+        let all = ["a", "b", "c", "d", "e"];
+
+        let mut seq = Hypercore::<Vec<u8>, _, _>::new(author(21), Bytes, MemoryStore::new());
+        for s in all {
+            seq.append(&blk(s)).unwrap();
+        }
+
+        let mut bat = Hypercore::<Vec<u8>, _, _>::new(author(21), Bytes, MemoryStore::new());
+        for s in &all[..3] {
+            bat.append(&blk(s)).unwrap();
+        }
+        let mut b = bat.batch();
+        for s in &all[3..] {
+            bat.stage(&mut b, &blk(s));
+        }
+        assert_eq!(bat.commit(b).unwrap(), Some(5));
+
+        assert_eq!(bat.head().unwrap(), seq.head().unwrap(), "single head identical");
+        for i in 0..5 {
+            assert_eq!(bat.get(i).unwrap(), seq.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn committed_batch_blocks_verify_and_replicate() {
+        // A batch is invisible to verifiers: every block proves against the one
+        // signed head, and a replica rebuilds the core byte-identically.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(22), Bytes, MemoryStore::new());
+        core.append(&blk("g0")).unwrap();
+        let mut b = core.batch();
+        for s in ["g1", "g2", "g3"] {
+            core.stage(&mut b, &blk(s));
+        }
+        core.commit(b).unwrap();
+
+        let head = core.head().unwrap().clone();
+        let pk = core.public_key();
+        for i in 0..core.len() {
+            let enc = core.block(i).unwrap().unwrap();
+            let proof = core.proof(i).unwrap();
+            assert!(verify_block(&pk, &head, i, &enc, &proof));
+        }
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..core.len() {
+            let enc = core.block(i).unwrap().unwrap();
+            let proof = core.proof(i).unwrap();
+            assert!(rep.add_block(&head, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.root_hash(), head.root);
+        assert_eq!(rep.len(), core.len());
+    }
+
+    #[test]
+    fn stale_base_batch_is_rejected() {
+        // Open a batch, then append to the log directly: the batch's base is now
+        // stale, so commit is refused and the direct append stands.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(23), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let mut b = core.batch(); // base = 3
+        core.stage(&mut b, &blk("from-batch"));
+
+        core.append(&blk("from-core")).unwrap(); // log now length 4
+        let head_after_core = core.head().unwrap().clone();
+
+        assert_eq!(core.commit(b).unwrap(), None, "stale-base batch rejected");
+        assert_eq!(core.len(), 4, "log unchanged by the rejected commit");
+        assert_eq!(core.get(3).unwrap(), Some(blk("from-core")));
+        assert_eq!(core.head().unwrap(), &head_after_core);
+    }
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let mut core = Hypercore::<u64, _, _>::new(author(24), U64, MemoryStore::new());
+        core.append(&1).unwrap();
+        let head_before = core.head().unwrap().clone();
+        let b = core.batch();
+        assert!(b.is_empty());
+        assert_eq!(core.commit(b).unwrap(), Some(1));
+        assert_eq!(core.len(), 1);
+        assert_eq!(core.head().unwrap(), &head_before);
+    }
+
+    #[test]
+    fn dropped_batch_leaves_log_unchanged() {
+        let mut core = Hypercore::<u64, _, _>::new(author(25), U64, MemoryStore::new());
+        core.append(&10).unwrap();
+        let head_before = core.head().unwrap().clone();
+        {
+            let mut b = core.batch();
+            core.stage(&mut b, &20);
+            core.stage(&mut b, &30);
+            // b is dropped here without commit
+        }
+        assert_eq!(core.len(), 1);
+        assert_eq!(core.head().unwrap(), &head_before);
+    }
+
+    /// A store that injects a failure on the `put` at a chosen key, to prove
+    /// commit atomicity. Otherwise an in-memory map.
+    #[derive(Default)]
+    struct FaultyStore {
+        inner: MemoryStore,
+        fail_at: Option<u64>,
+    }
+    impl Store for FaultyStore {
+        type Error = &'static str;
+        fn put(&mut self, key: u64, value: &[u8]) -> Result<(), &'static str> {
+            if self.fail_at == Some(key) {
+                return Err("injected put failure");
+            }
+            self.inner.put(key, value).unwrap();
+            Ok(())
+        }
+        fn get(&self, key: u64) -> Result<Option<Vec<u8>>, &'static str> {
+            Ok(self.inner.get(key).unwrap())
+        }
+        fn delete(&mut self, key: u64) -> Result<(), &'static str> {
+            self.inner.delete(key).unwrap();
+            Ok(())
+        }
+        fn len(&self) -> Result<u64, &'static str> {
+            Ok(self.inner.len().unwrap())
+        }
+    }
+
+    #[test]
+    fn failed_commit_is_atomic() {
+        // Append a, b, c cleanly, then arm a storage failure at index 4 (the 2nd
+        // staged block of a 3-block batch). The commit must fail, roll back its
+        // partial write at index 3, and leave the log's logical state untouched.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(26), Bytes, FaultyStore::default());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let head_before = core.head().unwrap().clone();
+        core.store.fail_at = Some(4);
+
+        let mut b = core.batch(); // base = 3, blocks at 3,4,5
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b, &blk(s));
+        }
+        assert_eq!(core.commit(b), Err(Error::Storage("injected put failure")));
+
+        // Logical state unchanged: length, head, and reads all intact; the
+        // rolled-back partial write at index 3 is gone.
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.head().unwrap(), &head_before);
+        assert_eq!(core.get(3).unwrap(), None);
+        assert_eq!(core.store.get(3).unwrap(), None, "partial write rolled back");
+        assert_eq!(core.store.len().unwrap(), 3, "no orphan blocks left behind");
+
+        // Recovery: clear the fault and the batch commits cleanly to the right state.
+        core.store.fail_at = None;
+        let mut b2 = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b2, &blk(s));
+        }
+        assert_eq!(core.commit(b2).unwrap(), Some(6));
+        assert_eq!(core.get(5).unwrap(), Some(blk("f")));
     }
 }

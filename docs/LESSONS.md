@@ -74,3 +74,17 @@ personal data** (this repo is public; use repo-relative paths).
   the range reaches with a node recomputed from the data, so tampering that root's supplied copy has no
   effect (by design — its integrity comes from the leaves). Tamper-rejection tests must therefore mutate an
   **untouched** root (or a block, or a boundary node) — mutating a substituted root tests nothing.
+- **Atomic multi-step commit over a fallible store: fallible writes first, mutate state last.** To make an
+  N-block commit all-or-nothing, write every block to storage *before* touching the in-memory source of
+  truth (the Merkle tree + signed head), and roll back the writes already made if any fails. Then a partial
+  storage failure can never advance the log's logical state. Test it with a **fault-injecting store**
+  wrapper that fails the `put` at a chosen key — assert length/head/reads are untouched, no orphan blocks
+  remain, *and* a fault-free retry recovers. A happy-path-only test never exercises the rollback branch.
+- **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
+  writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
+  sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which
+  needs only `b4a.compare` + `nanoassert` and synthetic node objects (`writer.core.key`, `length`,
+  `dependencies`/`dependents`, `index`; `optimistic`/`yielded` false) — no clock/consensus. Inject the two
+  trivial deps via Node's `Module._compile` over the reference source (no npm, no network), feed nodes to
+  `Topolist.add` in causal order, and compare `.tip` to our `order()`. Precondition the JS reference can't
+  remove: a **started** container runtime (`container system start`) — the sandbox only does `container run`.

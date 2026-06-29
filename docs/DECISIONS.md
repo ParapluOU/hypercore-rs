@@ -175,3 +175,24 @@ tracked on the `merkle-tree.js` / `merkle-tree-recovery.js` rows in `docs/UPSTRE
 `[~]`/`[ ]`). A single-block range carries exactly the single-block proof's sibling set, so the two APIs
 coincide on `end = start + 1`. Soundness rests on recompute-the-path + force-climb-to-a-real-root, so a
 prover cannot pair real roots with disconnected forged data.
+
+## ADR-0018 — Batch / atomic append is a staged buffer + atomic commit, not a session/atom overlay
+**Context:** Upstream hypercore (`reference/js/hypercore/test/batch.js`, `atomic.js`) builds batching on
+**sessions**: `core.session({ name })` returns a batch session you append to (its `length` grows while
+`core.length` stays), `core.commit(session)` flushes it atomically (and returns `null` if the core moved
+underneath); atomicity is a storage-layer **`atom`** (`storage.createAtom()` + `atom.flush()`) shared
+across sessions, emitting `append`/`truncate` events. Sessions and the storage-overlay/`atom` machinery
+are out of scope per the relevance filter (`docs/UPSTREAM_TEST_MAP.md`: "sessions / preload / mutex").
+**Decision:** Reimplement the **L1 behaviour-under-test**, not the session/atom layer. A `Batch<T>` is a
+staged buffer that records the log length it was opened against (`base`) and holds encoded blocks;
+`Hypercore::stage` buffers without touching the log; `batch_get` reads through the batch (committed region
+from the log, staged region from the buffer); `commit` applies all staged blocks under a **single** signed
+head. Commit is **all-or-nothing**: storage writes happen first and roll back on failure, and the Merkle
+tree + signed head (the log's source of truth) are mutated only after every write succeeds — so a partial
+failure never advances the log. Commit returns `Ok(None)` (log unchanged) on a **stale base** (the log
+advanced past `base`), mirroring upstream's "`commit` returns `null` when the core moved".
+**Consequence:** Commit-equivalence holds — a committed batch yields a head identical to N single appends
+(ed25519 is deterministic), so batching is invisible to verifiers/replicas. We **defer** upstream's
+multi-session interactions, `byteLength`, `truncate`/`append` events, and the `atom.flush()` storage
+overlay; `batch.js`/`atomic.js` stay `[~]`. Atomic rollback is honestly tested with a fault-injecting
+store (`FaultyStore`), not just the happy path.
