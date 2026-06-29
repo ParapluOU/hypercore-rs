@@ -168,3 +168,18 @@ personal data** (this repo is public; use repo-relative paths).
   blocks from storage — they're unreachable (`get`/`block` gate on the length) and overwritten on
   re-append, so a pure in-memory tree+head mutation keeps truncate atomic and infallible (physical
   reclamation is a separate `clear`/`purge` capability).
+- **The lowest common ancestor of two trees is a binary search over prefix root hashes — no payload
+  peek, no node-by-node descent.** Upstream's `ReorgBatch` narrows the divergence top-down (find the
+  topmost differing root, then descend) because the wire protocol forces it to fetch nodes one round at
+  a time. With both full trees in memory you don't need that: two trees agree on blocks `[0, a)` **iff**
+  their root-hash-at-length-`a` are equal (the head at a length is a pure function of the first `length`
+  blocks — the same property truncate and fork-detection rest on), and prefix agreement is **monotone**
+  (agree at `a` ⟹ agree at every `a' < a`), so the LCA is just the largest `a ≤ min(len)` where the
+  prefix root hashes match — a clean binary search comparing only authenticated hashes. `reorg` then =
+  `truncate(lca)` (keep the shared prefix — it's preserved, not re-derived, since the surviving nodes
+  already equal the other tree's prefix) + adopt the other's suffix nodes, ending byte-identical. Keep
+  it **fork-agnostic** (it reorganizes tree nodes); *which* tree to follow — the signed head + fork
+  counter — is the hypercore layer's job, the cross-fork analogue of wiring `UpgradeProof` into
+  `Replica::verify_upgrade`. Test gotcha: reorg always makes the local follow the remote (up **or** down
+  to the remote's length), so the post-reorg target is always the remote — don't branch on "which is
+  longer".

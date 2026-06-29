@@ -55,8 +55,12 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       ADR-0022) + **node recovery** (repair mode + data-free `NodeProof` authenticating any tree node against
       the signed root + atomic `recover_node`, ADR-0023) + **truncate** (pure in-memory rewind to a
       prefix — node-for-node identical to a fresh prefix, so `root_hash` is the prefix root — plus
-      `byte_length`, ADR-0024); upstream `additionalNodes`/seek-`padding`/reorg-by-proof +
-      replication-driven repair tracked separately on `merkle-tree.js`/`merkle-tree-recovery.js`
+      `byte_length`, ADR-0024) + **reorg / lowest-common-ancestor** (`lowest_common_ancestor` = the
+      content-blind shared-prefix length via a monotone binary search over prefix root hashes;
+      `reorg` keeps the LCA prefix and adopts the other tree's divergent suffix, byte-identically;
+      fork-agnostic — the secure replica-level gate is deferred, ADR-0025); upstream
+      `additionalNodes`/seek-`padding`/reorg-by-proof + replication-driven repair tracked separately
+      on `merkle-tree.js`/`merkle-tree-recovery.js`
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend

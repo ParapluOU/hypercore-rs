@@ -360,3 +360,38 @@ defer reorg-by-proof (accepting a remote truncation/reorg over the wire) and `ad
 wire-compatible anyway, ADR-0001) — every signing/verifying site routes through `head_message`, so the
 change is centralized. `core.js` advances (truncate behaviour ported); `conflicts.js` gains the
 same-fork equivocation refinement.
+
+## ADR-0025 — Reorg is a local LCA + adopt-suffix on the tree; the secure replica gate is deferred
+**Context:** Upstream hypercore (`reference/js/hypercore/lib/merkle-tree.js`'s `ReorgBatch` +
+`MerkleTree.reorg`/`_updateDiffRoot`/`_update`, exercised by `merkle-tree.js`'s "lowest common
+ancestor" tests) reorganizes a local tree onto a peer's divergent/rewritten history: it verifies the
+peer's signed **upgrade proof**, finds the topmost differing **root** (the `diff`), then narrows the
+divergence down to a block via a **multi-round `want`/`update` node-request protocol** (each round
+fetches a `hash` proof for a specific index), yielding `ancestors` = the shared-prefix length, and
+adopts the peer's roots from there. The narrowing rounds are replication (peer requests over the wire);
+the *behaviour under test* in `merkle-tree.js` is itself host-safe (a local `reorg(clone, core)` helper
+over two in-memory trees, no swarm).
+**Decision:** Reimplement the **L1 behaviour-under-test**, not the request protocol:
+- `MerkleTree::lowest_common_ancestor(&other)` is the content-blind divergence finder. Because the head
+  at a length is a pure function of the first `length` blocks (the property truncate/fork-detection rest
+  on), two trees agree on `[0, a)` iff their `prefix_root_hash(a)` are equal; prefix agreement is
+  **monotone**, so the LCA is a **binary search** over `0..=min(len)` comparing only authenticated prefix
+  root hashes — never payload bytes (unlike upstream's incremental top-down root descent, which the
+  multi-round wire protocol forces; with both full trees in memory the binary search computes the same
+  `ancestors` in one shot). Both trees must be intact; a gap reads conservatively as disagreement.
+- `MerkleTree::reorg(&other)` keeps the shared LCA prefix (it `truncate`s to it — the surviving nodes
+  already equal `other`'s prefix, so the prefix is preserved, not re-derived) and adopts `other`'s nodes
+  for the divergent suffix, leaving the tree byte-identical to `other`. It is **fork-agnostic** (it
+  reorganizes tree nodes), the content-following counterpart of `truncate` (ADR-0024): truncate is the
+  author rewinding its own log; reorg is a holder following the author onto a rewritten history (readers
+  follow the highest fork).
+**Consequence:** The `merkle-tree.js` "lowest common ancestor" tests (small/bigger gap, remote shorter,
+simple fork, long fork) are ported and host-safe under `just verify`. We **defer** the *secure
+replica-level* reorg — authenticating *which* `other` to follow via the signed head + fork counter, and
+the `want`/`update` proof-narrowing exchange that delivers a peer's divergent nodes — to the hypercore
+layer; it is networking-driven (peer requests/events, ADR-0003), the cross-fork analogue of how iter 14
+(ADR-0021) wired the data-free `UpgradeProof` into `Replica::verify_upgrade` for the length-extension
+case. We also still defer `additionalNodes` (which, with standalone proofs per ADR-0020, adds no L1
+capability our `upgrade_proof(old, any_new)` lacks). `merkle-tree.js` stays `[~]` (LCA/reorg added; the
+bundled-wire seek + `additionalNodes` remain). Soundness rests on the same prefix-root collision-
+resistance the scheme already assumes.

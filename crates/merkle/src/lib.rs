@@ -230,6 +230,78 @@ impl MerkleTree {
         self.roots().iter().map(|r| r.size).sum()
     }
 
+    /// The root hash the tree *would* have if truncated to its first `len`
+    /// blocks, or `None` if any node that prefix needs is missing (repair mode).
+    /// `len == 0` yields the empty-tree hash. Used by
+    /// [`lowest_common_ancestor`](MerkleTree::lowest_common_ancestor): because
+    /// the head at a length is a pure function of the first `length` blocks, two
+    /// trees agree on blocks `[0, len)` iff this hash is equal in both.
+    fn prefix_root_hash(&self, len: u64) -> Option<Hash> {
+        let roots: Option<Vec<Node>> = flat::full_roots(len * 2)
+            .into_iter()
+            .map(|i| self.nodes.get(&i).copied())
+            .collect();
+        Some(tree_hash(&roots?))
+    }
+
+    /// The **lowest common ancestor** of `self` and `other`: the length `a` of
+    /// the longest block prefix `[0, a)` on which the two trees agree
+    /// block-for-block (`0 <= a <= min(self.len(), other.len())`). This is the
+    /// content-blind divergence finder behind upstream `merkle-tree.js`'s
+    /// "lowest common ancestor" tests and the basis of a reorg.
+    ///
+    /// It compares only authenticated [`prefix_root_hash`](MerkleTree::prefix_root_hash)
+    /// values, never payload bytes. Prefix agreement is **monotone** — agreeing
+    /// on `[0, a)` implies agreeing on every shorter prefix — so the LCA is found
+    /// by binary search over `0..=min(len)`. Both trees must be intact (no missing
+    /// nodes), as a reorg's inputs are; a gap conservatively reads as disagreement.
+    pub fn lowest_common_ancestor(&self, other: &MerkleTree) -> u64 {
+        let agree = |a: u64| {
+            a == 0
+                || matches!(
+                    (self.prefix_root_hash(a), other.prefix_root_hash(a)),
+                    (Some(x), Some(y)) if x == y
+                )
+        };
+        // Largest `a` in `0..=max` with `agree(a)`; `agree(0)` is always true.
+        let max = self.length.min(other.length);
+        let (mut lo, mut hi) = (0u64, max);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if agree(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    /// Reorganize `self` to follow `other`: keep the shared
+    /// [`lowest_common_ancestor`](MerkleTree::lowest_common_ancestor) prefix and
+    /// adopt `other`'s divergent suffix, leaving `self` byte-identical to `other`.
+    /// Returns the ancestor length kept. The local-tree mechanism behind upstream
+    /// `merkle-tree.js`'s reorg (`MerkleTree.reorg` + `ReorgBatch`), and the
+    /// content-following counterpart of [`truncate`](MerkleTree::truncate): where
+    /// truncate is the author rewinding its own log, reorg is a holder following
+    /// the author onto a rewritten history (readers follow the highest fork).
+    ///
+    /// The shared prefix is never re-derived — `self` truncates to the ancestor
+    /// (the surviving nodes already equal `other`'s prefix, since the head at a
+    /// length is a pure function of the first `length` blocks) and then takes on
+    /// `other`'s nodes for the rest. Fork-agnostic: it reorganizes tree nodes, so
+    /// authenticating *which* `other` to follow (the signed head + fork counter)
+    /// belongs to the hypercore layer.
+    pub fn reorg(&mut self, other: &MerkleTree) -> u64 {
+        let ancestors = self.lowest_common_ancestor(other);
+        self.truncate(ancestors); // keep the shared prefix (no-op if a == len)
+        for (&idx, &node) in &other.nodes {
+            self.nodes.insert(idx, node); // adopt the divergent suffix
+        }
+        self.length = other.length;
+        ancestors
+    }
+
     /// The current root nodes (one per complete power-of-two subtree).
     pub fn roots(&self) -> Vec<Node> {
         if self.length == 0 {
@@ -1828,5 +1900,148 @@ mod tests {
         fresh.append(b"new-4");
         assert_eq!(t.root_hash(), fresh.root_hash(), "re-append after truncate is clean");
         assert!(t.is_intact());
+    }
+
+    // After a reorg, `local` must be byte-identical to `remote`: same length,
+    // same roots, same root hash, intact, and every block proves.
+    fn assert_followed(local: &MerkleTree, remote: &MerkleTree, blocks: &[Vec<u8>]) {
+        assert_eq!(local.len(), remote.len(), "reorg adopts remote's length");
+        assert_eq!(local.roots(), remote.roots(), "reorg adopts remote's roots");
+        assert_eq!(local.root_hash(), remote.root_hash(), "byte-identical after reorg");
+        assert_eq!(local.byte_length(), remote.byte_length(), "byte_length follows remote");
+        assert!(local.is_intact(), "reorged tree is intact");
+        let root = remote.root_hash();
+        for b in 0..remote.len() {
+            let p = local.proof(b).expect("every adopted block proves");
+            assert!(p.verify(&blocks[b as usize], &root), "block {b} proves after reorg");
+        }
+    }
+
+    // Two trees built from identical content where one is a strict prefix of the
+    // other: LCA is the shorter length, and the shorter reorgs up to the longer
+    // (and vice versa) byte-identically. Ports merkle-tree.js "lowest common
+    // ancestor - small gap / bigger gap / remote is shorter than local".
+    #[test]
+    fn lca_prefix_gaps() {
+        for &(remote_n, local_n, expect) in &[(10u64, 8u64, 8u64), (20, 1, 1), (5, 10, 5)] {
+            let (remote, rblocks) = tree(remote_n as usize);
+            let (mut local, _) = tree(local_n as usize);
+            assert_eq!(
+                local.lowest_common_ancestor(&remote),
+                expect,
+                "LCA(remote={remote_n}, local={local_n})"
+            );
+            // Reorg always makes `local` follow `remote` (up or down to its length).
+            let ancestors = local.reorg(&remote);
+            assert_eq!(ancestors, expect, "reorg returns the LCA");
+            assert_followed(&local, &remote, &rblocks);
+        }
+    }
+
+    // Both trees share a prefix then diverge at one block. LCA is the shared
+    // length; the local follows the remote onto its fork. Ports merkle-tree.js
+    // "lowest common ancestor - simple fork".
+    #[test]
+    fn lca_simple_fork() {
+        let shared: Vec<Vec<u8>> = (0..5).map(|i| format!("block-{i}").into_bytes()).collect();
+        let mut remote = tree_from(&shared);
+        remote.append(b"fork #1");
+        let mut local = tree_from(&shared);
+        local.append(b"fork #2");
+
+        assert_eq!(local.lowest_common_ancestor(&remote), 5, "diverge at block 5");
+        let mut rblocks = shared.clone();
+        rblocks.push(b"fork #1".to_vec());
+
+        let ancestors = local.reorg(&remote);
+        assert_eq!(ancestors, 5);
+        assert_followed(&local, &remote, &rblocks);
+    }
+
+    // Diverge at block 5, then each side appends 100 more blocks (a long fork).
+    // LCA is still the shared prefix; the local fully adopts the remote's fork.
+    // Ports merkle-tree.js "lowest common ancestor - long fork".
+    #[test]
+    fn lca_long_fork() {
+        let shared: Vec<Vec<u8>> = (0..5).map(|i| format!("block-{i}").into_bytes()).collect();
+        let mut rblocks = shared.clone();
+        rblocks.push(b"fork #1".to_vec());
+        let mut lblocks = shared.clone();
+        lblocks.push(b"fork #2".to_vec());
+        for i in 0..100u64 {
+            rblocks.push(format!("r#{i}").into_bytes());
+            lblocks.push(format!("l#{i}").into_bytes());
+        }
+        let remote = tree_from(&rblocks);
+        let mut local = tree_from(&lblocks);
+
+        assert_eq!(local.lowest_common_ancestor(&remote), 5, "LCA is the shared prefix");
+        let ancestors = local.reorg(&remote);
+        assert_eq!(ancestors, 5);
+        assert_followed(&local, &remote, &rblocks);
+    }
+
+    // Property: for every shared-prefix length `k` and every divergence shape,
+    // the LCA is exactly `k`. Covers prefix-only (no divergence ⇒ LCA = min len),
+    // divergence at `k`, and identical trees (LCA = full length, reorg is a no-op).
+    #[test]
+    fn lca_all_divergence_points() {
+        for total in 1..=16u64 {
+            for k in 0..=total {
+                // Two trees agreeing on `[0, k)`, then differing from block `k`.
+                let mut ablocks: Vec<Vec<u8>> = Vec::new();
+                let mut bblocks: Vec<Vec<u8>> = Vec::new();
+                for i in 0..total {
+                    let shared = format!("s-{i}").into_bytes();
+                    if i < k {
+                        ablocks.push(shared.clone());
+                        bblocks.push(shared);
+                    } else {
+                        ablocks.push(format!("a-{i}").into_bytes());
+                        bblocks.push(format!("b-{i}").into_bytes());
+                    }
+                }
+                let a = tree_from(&ablocks);
+                let mut b = tree_from(&bblocks);
+                // When k == total the trees are identical ⇒ LCA = total.
+                assert_eq!(b.lowest_common_ancestor(&a), k, "LCA(total={total}, k={k})");
+                assert_eq!(a.lowest_common_ancestor(&b), k, "LCA is symmetric");
+
+                let was_noop = b.root_hash() == a.root_hash();
+                b.reorg(&a);
+                assert_followed(&b, &a, &ablocks);
+                if was_noop {
+                    // Identical trees: reorg changes nothing.
+                    assert_eq!(b.len(), total);
+                }
+            }
+        }
+    }
+
+    // Reorg keeps the shared prefix rather than rebuilding it: the surviving
+    // prefix nodes are exactly the ones the common ancestor already held (same
+    // hashes), so a block in `[0, ancestors)` proves under the *pre-reorg* root
+    // too — the prefix was never rewritten.
+    #[test]
+    fn reorg_preserves_shared_prefix() {
+        let shared: Vec<Vec<u8>> = (0..6).map(|i| format!("block-{i}").into_bytes()).collect();
+        let mut remote = tree_from(&shared);
+        remote.append(b"R");
+        let mut local = tree_from(&shared);
+        local.append(b"L");
+
+        // The shared prefix's root hash before the reorg.
+        let prefix_root = {
+            let mut p = local.clone();
+            p.truncate(6);
+            p.root_hash()
+        };
+        let ancestors = local.reorg(&remote);
+        assert_eq!(ancestors, 6);
+        // After the reorg, truncating back to the ancestor reproduces the very
+        // same prefix root — the common prefix was preserved, not re-derived.
+        let mut back = local.clone();
+        back.truncate(ancestors);
+        assert_eq!(back.root_hash(), prefix_root, "shared prefix preserved across reorg");
     }
 }

@@ -736,3 +736,70 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg-by-proof/`additionalNodes` (the last
   `merkle-tree.js`/`merkle-tree-recovery.js` pieces); `autobase` `topolist.js` ordering; and the
   view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 18: `merkle` reorg / lowest common ancestor
+
+**Did**
+- Added **reorg / lowest-common-ancestor** to `crates/merkle` — the L1 behaviour behind upstream
+  `merkle-tree.js`'s five "lowest common ancestor" tests (themselves host-safe: a local
+  `reorg(clone, core)` over two in-memory trees, no swarm), the content-following counterpart of
+  iter 17's `truncate`:
+  - `MerkleTree::lowest_common_ancestor(&other) -> u64` — the **content-blind** divergence finder. Two
+    trees agree on blocks `[0, a)` iff their (private) `prefix_root_hash(a)` are equal — the head at a
+    length is a pure function of the first `length` blocks (the property truncate/fork-detection rest
+    on) — and prefix agreement is **monotone**, so the LCA is a **binary search** over `0..=min(len)`
+    comparing only authenticated prefix root hashes. Never peeks at payloads; requires both trees
+    intact (a gap reads conservatively as disagreement).
+  - `MerkleTree::reorg(&other) -> u64` — keeps the shared LCA prefix (`truncate`s to it: the surviving
+    nodes already equal `other`'s prefix, so it's **preserved, not re-derived**) and adopts `other`'s
+    nodes for the divergent suffix, leaving the tree **byte-identical** to `other`. Returns the
+    `ancestors` length. **Fork-agnostic** — it reorganizes tree nodes; *which* `other` to follow (the
+    signed head + fork counter) is the hypercore layer's job.
+- 5 asserting tests (merkle 33→38): the upstream prefix-gap cases (remote=10/local=8 ⇒ LCA 8;
+  remote=20/local=1 ⇒ 1; remote=5/local=10 ⇒ 5) with a byte-identical follow each way; simple fork
+  (share 5, diverge at block 5 ⇒ LCA 5); long fork (diverge at 5, each appends 100 ⇒ LCA 5, full
+  adopt); a **property** test asserting LCA == `k` for every shared-prefix length `k` over sizes
+  1..=16 (incl. identical trees ⇒ LCA = full length, reorg a no-op) and **symmetry** of the LCA; and
+  reorg **preserves the shared prefix** (truncating the reorged tree back to `ancestors` reproduces
+  the very prefix root that existed before the reorg). A shared `assert_followed` helper checks
+  length / roots / root hash / byte_length / intactness and that every adopted block proves.
+- `just verify` green: 94 native tests + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0025: reorg is a **local LCA (binary search over prefix root hashes) + adopt-suffix** on the
+  tree, not upstream's `ReorgBatch` `want`/`update` multi-round node-request narrowing (that top-down
+  root descent is forced by the wire protocol; with both full trees in memory the binary search
+  computes the same `ancestors` in one shot). We **defer** the *secure replica-level* reorg —
+  authenticating which `other` to follow via the signed head + fork counter, plus the proof-narrowing
+  exchange — to the hypercore layer; it is networking-driven (ADR-0003), the cross-fork analogue of how
+  iter 14 (ADR-0021) wired `UpgradeProof` into `Replica::verify_upgrade`. `additionalNodes` adds no L1
+  capability our standalone `upgrade_proof(old, any_new)` lacks (ADR-0020). `merkle-tree.js` stays
+  `[~]` (LCA/reorg added; bundled-wire seek + `additionalNodes` remain).
+- The **JS oracle (gate #4) is still environment-blocked** (iters 11–17): the Apple `container`
+  binary is on PATH but `container system status`/`system start` is outside the loop's scoped
+  allowlist (needs approval the headless driver can't give), and the image pull needs network — so a
+  green oracle run isn't reachable here. Likewise the **wasm runtime gate (#2)** needs headless Chrome.
+  Both stay deferred; I picked the next self-contained, natively-testable red item instead.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- The LCA of two trees is a **binary search over prefix root hashes** — no payload peek, no node-by-node
+  descent (that's a wire-protocol artifact). `agree(a)` = equal root-hash-at-length-`a`, monotone, so the
+  LCA is the largest `a ≤ min(len)` with agreement. `reorg` = `truncate(lca)` (keep the preserved prefix)
+  + adopt the other's suffix, ending byte-identical; keep it fork-agnostic. Test gotcha: reorg always
+  makes the local follow the remote (up **or** down to the remote's length), so the follow target is
+  always the remote — don't branch on "which is longer" (I hit exactly that and fixed it).
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not startable under the loop's allowlist + image pull needs network; see
+  iters 11–17). When a container runtime is *started*, build `tools/oracle/` driving the reference
+  `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the **secure replica-level reorg** (hypercore): a `Replica` follows the source's
+  truncate-and-rewrite (higher fork) — verify the new signed head against trusted state, then
+  reorg-to-LCA + re-fetch the suffix (the cross-fork analogue of `verify_upgrade`, closing the iter 17
+  truncate loop). Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg-by-proof/`additionalNodes`;
+  `autobase` `topolist.js` ordering; and the view/apply layer (`apply.js`/`anchors.js`) the
+  `linearizer.js`/`dags.js` view-length assertions need.
