@@ -20,7 +20,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `core.js` | [~] | `hypercore` core append/get/verify + proof-based replication ported |
 | `batch.js` | [~] | `hypercore` batch append — stage-without-touching / single-head commit / stale-base reject ported (ADR-0018); multi-session interactions out of scope (sessions excluded) |
 | `atomic.js` | [~] | `hypercore` atomic append — all-or-nothing commit (storage-fault rollback leaves tree+head untouched) ported (ADR-0018); `atom.flush()` storage-overlay + truncate/append events deferred |
-| `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper **and contiguous-range proofs** ported, ADR-0017; byte-offset seeks + length-extension `upgrade`/`additionalNodes` + reorg still later) |
+| `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper, contiguous-range proofs (ADR-0017) **and length-extension `upgrade` proofs** — data-free consistency/anti-fork-across-lengths, ADR-0020 — ported; byte-offset seeks + `upgrade.additionalNodes` + reorg still later) |
 | `merkle-tree-recovery.js` | [ ] | `merkle` recovery |
 | `encodings.js` | [~] | `codec` (varint/framing/tagged/tolerance concepts ported; upstream-specific encodings are clean-room) |
 | `conflicts.js` | [~] | `hypercore` fork detection — L1 behaviour ported (ADR-0019): `conflicting_heads` (same-length, different-root signed heads) + per-index `ForkProof::verify`; the replication-time `'conflict'` event + session teardown are networking/sessions (out of scope, return with Iroh) |

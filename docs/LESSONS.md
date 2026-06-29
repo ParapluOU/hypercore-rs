@@ -93,6 +93,20 @@ personal data** (this repo is public; use repo-relative paths).
   leaf 8 = a root), so to exercise a "tampered sibling" case pick a fork index whose inclusion proof is
   interior (diverge at index 1 of a ≥4-block log), not the last block.
 
+- **A Merkle length-extension proof is a data-free consistency proof — and its soundness is "supplied
+  nodes must be fully new".** To prove tree-at-`new` is an append-only extension of tree-at-`old` (the
+  cross-length anti-fork check), you don't need block data: supply only the **fully-new** subtree nodes
+  (every covered block `>= old`) and have the verifier fold them into *its own trusted old roots* to
+  rebuild the new roots, then check `tree_hash(new_roots) == new_head_hash`. The whole guarantee hinges
+  on the verifier **rejecting any supplied node that isn't fully new** (a straddling or fully-old node).
+  If you let the prover supply a straddling node (e.g. a new *root* that also covers old blocks) directly,
+  it bypasses the fold from the trusted old prefix and a rewritten-old-block fork sails through — the
+  verifier never re-derives that root from old material. Generate the proof with the *same* descent the
+  verifier climbs (walk down from each new root, stop at old roots, emit the largest fully-new subtrees),
+  exactly as with range proofs, so the two agree on the node set by construction. Require `old >= 1`: an
+  `old = 0` "upgrade" has no trusted anchor and proves nothing. Test the anti-fork arm explicitly — a
+  verifier holding the *honest* prefix must **reject** a forked longer head even though that proof is
+  internally consistent against the *forked* old roots.
 - **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
   writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
   sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which

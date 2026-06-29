@@ -223,3 +223,29 @@ over our existing signed head + Merkle inclusion proof + identity, with no netwo
 `'conflict'` event, session close) — it returns with networking (Iroh, ADR-0003). `conflicts.js` stays
 `[~]`: the L1 detection behaviour is ported; the replication/session mechanism is out of scope.
 Different-length *honest* extensions and different-author logs are correctly **not** flagged.
+
+## ADR-0020 — Merkle upgrade proof is a data-free consistency proof, not upstream's block+upgrade bundle
+**Context:** Upstream hypercore (`reference/js/hypercore/test/merkle-tree.js`, "proof with upgrade*")
+bundles a length-extension into the *same* proof object as the block/seek proof:
+`upgrade: { start, length }` yields `upgrade.nodes` (to reach the requested length) **plus**
+`upgrade.additionalNodes` (to reach the tree's *actual* larger length), and the bundling lets the block
+proof's leaf double as an upgrade node (e.g. block 1's leaf 2 is omitted from `upgrade.nodes`). This is
+an optimization for the replication wire, where one round-trip carries block + seek + upgrade together.
+**Decision:** Implement the length-extension as a **standalone, data-free consistency proof**
+`MerkleTree::upgrade_proof(old, new) -> UpgradeProof { old_len, new_len, nodes }`, the cross-length
+analogue of `conflicting_heads` (ADR-0019). It proves the signed tree at length `new` is an
+**append-only extension** of the tree at length `old` (the first `old` blocks were not rewritten) by
+supplying only the **fully-new** subtree nodes (every covered block `>= old`) needed to fold the
+verifier's *own trusted old roots* up into the new roots; `verify(old_roots, new_root_hash)` rejects any
+supplied node that is not fully-new, so prover data can never sit on or stand in for an old block, and
+the new roots are necessarily rebuilt from the trusted old prefix. Generator and verifier share one
+descent/climb (like `range_proof`, ADR-0017): the generator walks down from each new root, stopping at
+old roots and emitting the largest fully-new subtrees; the verifier seeds its frontier with the old
+roots, folds the supplied nodes, climbs sibling pairs, and checks `tree_hash(new_roots) == new_root_hash`.
+**Consequence:** Length-extension / anti-fork-across-lengths is ported and composes cleanly with
+`range_proof` (confirm the honest append, then verify the new blocks). We **keep proofs separate** (no
+block+seek+upgrade bundle) and require `1 <= old < new <= len` (an `old = 0` "upgrade" has no trusted
+anchor, so it is meaningless and refused). We still **defer** upstream's `additionalNodes` (proving past
+the requested length), byte-offset **seek**, and **reorg/recovery** — `merkle-tree.js` stays `[~]` and
+`merkle-tree-recovery.js` `[ ]`. Soundness rests on the same leaf/parent collision-resistance the scheme
+already assumes.

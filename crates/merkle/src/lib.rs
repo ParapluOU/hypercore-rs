@@ -76,6 +76,16 @@ pub mod flat {
         Some((index(d - 1, off), index(d - 1, off + 1)))
     }
 
+    /// The half-open block range `[first, end)` that node `i` covers. A leaf
+    /// (`i == 2k`) covers exactly block `k`; a node at depth `d` covers `2^d`
+    /// contiguous blocks.
+    pub fn block_range(i: u64) -> (u64, u64) {
+        let d = depth(i);
+        let count = 1u64 << d;
+        let first = offset(i) * count;
+        (first, first + count)
+    }
+
     /// Root indices covering a fully-rooted tree of `idx` (= `2 * block_count`)
     /// tree-index units. Returns one index per complete power-of-two subtree.
     pub fn full_roots(idx: u64) -> Vec<u64> {
@@ -282,6 +292,70 @@ impl MerkleTree {
             roots,
         })
     }
+
+    /// A length-extension (consistency) proof that the signed tree at length
+    /// `new` is a genuine **append-only extension** of the tree at length `old`
+    /// — i.e. the first `old` blocks were not rewritten (the cross-length
+    /// anti-fork check). Returns `None` unless `1 <= old < new <= len`.
+    ///
+    /// The proof carries **no block data**: it supplies only the fully-new
+    /// subtree nodes (covering blocks `>= old`) needed to fold the verifier's
+    /// trusted *old roots* up into the *new roots*. A verifier holding the old
+    /// prefix recomputes the new roots from its own (trusted) old roots plus
+    /// these nodes and checks them against the new signed head's hash — so a
+    /// rewrite of any old block makes the fold diverge and the proof fail.
+    ///
+    /// Composes with [`MerkleTree::range_proof`]: the upgrade proof confirms the
+    /// extension is honest, then a range proof over `[old, new)` verifies the
+    /// new blocks themselves against the same new head hash.
+    pub fn upgrade_proof(&self, old: u64, new: u64) -> Option<UpgradeProof> {
+        if old == 0 || old >= new || new > self.length {
+            return None;
+        }
+        let old_root_set: BTreeSet<u64> = flat::full_roots(old * 2).into_iter().collect();
+        // Walk down from each new root, stopping at old roots (the verifier has
+        // them) and emitting the largest fully-new subtrees (it needs them).
+        let mut out: BTreeMap<u64, Node> = BTreeMap::new();
+        for r in flat::full_roots(new * 2) {
+            self.collect_upgrade(r, old, &old_root_set, &mut out);
+        }
+        Some(UpgradeProof {
+            old_len: old,
+            new_len: new,
+            nodes: out.into_values().collect(),
+        })
+    }
+
+    fn collect_upgrade(
+        &self,
+        index: u64,
+        old: u64,
+        old_root_set: &BTreeSet<u64>,
+        out: &mut BTreeMap<u64, Node>,
+    ) {
+        let (first, end) = flat::block_range(index);
+        if end <= old {
+            // Fully within the trusted old prefix. The recursion only ever
+            // reaches an *old root* here (straddle-splitting stops exactly at the
+            // old-root boundary), so the verifier already has it — supply nothing.
+            if !old_root_set.contains(&index) {
+                if let Some((l, r)) = flat::children(index) {
+                    self.collect_upgrade(l, old, old_root_set, out);
+                    self.collect_upgrade(r, old, old_root_set, out);
+                }
+            }
+            return;
+        }
+        if first >= old {
+            // Largest fully-new subtree: the verifier can't derive it, so supply it.
+            out.insert(index, self.nodes[&index]);
+            return;
+        }
+        // Straddles the old/new boundary (≥ 2 blocks ⇒ a parent): split.
+        let (l, r) = flat::children(index).expect("a straddling node is not a leaf");
+        self.collect_upgrade(l, old, old_root_set, out);
+        self.collect_upgrade(r, old, old_root_set, out);
+    }
 }
 
 /// A self-contained inclusion proof: the sibling hashes from a block's leaf up
@@ -473,6 +547,101 @@ impl RangeProof {
     }
 }
 
+/// A length-extension (consistency) proof: the fully-new subtree nodes needed to
+/// fold a verifier's trusted *old roots* (at `old_len`) up into the *new roots*
+/// (at `new_len`), proving the new tree is an append-only extension of the old.
+/// Carries no block data. The multi-length analogue of fork detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradeProof {
+    pub old_len: u64,
+    pub new_len: u64,
+    /// Fully-new subtree nodes (every node covers only blocks `>= old_len`),
+    /// sorted by index. Combined with the trusted old roots they climb to the
+    /// new roots.
+    pub nodes: Vec<Node>,
+}
+
+impl UpgradeProof {
+    /// Verify that this proof extends the trusted `old_roots` (the verifier's own
+    /// roots at `old_len`) to a tree whose root hash is `new_root_hash` (the new
+    /// signed head). Returns `false` on any tampering or inconsistency.
+    ///
+    /// Soundness / anti-fork: the verifier seeds its frontier with **its own**
+    /// trusted old roots and folds in the proof's nodes, which are accepted only
+    /// if **fully new** (every covered block `>= old_len`) — so prover-supplied
+    /// data can never sit on, or stand in for, an old block. The new roots are
+    /// therefore recomputed from the trusted old prefix; if the prover rewrote any
+    /// old block, the recomputed new roots diverge from `new_root_hash` and this
+    /// returns `false`.
+    pub fn verify(&self, old_roots: &[Node], new_root_hash: &Hash) -> bool {
+        if self.old_len == 0 || self.old_len >= self.new_len {
+            return false;
+        }
+        // The caller's old roots must match the shape claimed by the proof, so a
+        // mismatched old state can't be silently accepted.
+        let expected_old = flat::full_roots(self.old_len * 2);
+        if old_roots.len() != expected_old.len()
+            || old_roots.iter().zip(&expected_old).any(|(r, &i)| r.index != i)
+        {
+            return false;
+        }
+
+        // Seed the frontier with the trusted old roots, then fold in the proof's
+        // nodes — each accepted only if it is a *fully-new* subtree and lies
+        // within `[0, new)`. (Rejecting straddling/old nodes is what forces the
+        // new roots to be rebuilt from the trusted old prefix.)
+        let mut known: BTreeMap<u64, Node> = old_roots.iter().map(|n| (n.index, *n)).collect();
+        for n in &self.nodes {
+            let (first, end) = flat::block_range(n.index);
+            if first < self.old_len || end > self.new_len {
+                return false; // not a fully-new in-range subtree
+            }
+            if known.insert(n.index, *n).is_some() {
+                return false; // duplicate / collides with an old root
+            }
+        }
+
+        // Climb: combine any two known siblings into their parent until stable.
+        let mut changed = true;
+        let mut guard = 0u32;
+        while changed {
+            changed = false;
+            guard += 1;
+            if guard > 4096 {
+                return false; // malformed: not converging
+            }
+            for c in known.keys().copied().collect::<Vec<_>>() {
+                let sib = flat::sibling(c);
+                let p = flat::parent(c);
+                if !known.contains_key(&sib) || known.contains_key(&p) {
+                    continue;
+                }
+                let (cn, sn) = (known[&c], known[&sib]);
+                let (left, right) = if sib < c { (sn, cn) } else { (cn, sn) };
+                known.insert(
+                    p,
+                    Node {
+                        index: p,
+                        hash: parent_hash(&left, &right),
+                        size: left.size + right.size,
+                    },
+                );
+                changed = true;
+            }
+        }
+
+        // Every new root must now be derived; their tree hash must match the head.
+        let mut new_roots = Vec::new();
+        for idx in flat::full_roots(self.new_len * 2) {
+            match known.get(&idx) {
+                Some(n) => new_roots.push(*n),
+                None => return false,
+            }
+        }
+        &tree_hash(&new_roots) == new_root_hash
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +655,14 @@ mod tests {
             blocks.push(b);
         }
         (t, blocks)
+    }
+
+    fn tree_from(blocks: &[Vec<u8>]) -> MerkleTree {
+        let mut t = MerkleTree::new();
+        for b in blocks {
+            t.append(b);
+        }
+        t
     }
 
     // flat-tree shape — ports "get roots" structure from merkle-tree.js.
@@ -692,5 +869,162 @@ mod tests {
         let mut missing = rp.clone();
         missing.nodes.pop();
         assert!(!missing.verify(&span, &root), "missing boundary node rejects");
+    }
+
+    // Every (old < new) length pair produces an upgrade proof that an honest
+    // verifier (holding the genuine old roots) accepts — the length-extension
+    // round-trip across the whole shape space.
+    #[test]
+    fn upgrade_proof_roundtrip_all_sizes() {
+        for new in 1..=20u64 {
+            let (t, blocks) = tree(new as usize);
+            let new_root = t.root_hash();
+            for old in 1..new {
+                let old_roots = tree_from(&blocks[..old as usize]).roots();
+                let up = t
+                    .upgrade_proof(old, new)
+                    .expect("1 <= old < new <= len has a proof");
+                assert!(
+                    up.verify(&old_roots, &new_root),
+                    "honest upgrade must verify (old={old}, new={new})"
+                );
+            }
+        }
+    }
+
+    // Extend by exactly one block — the smallest, most common upgrade.
+    #[test]
+    fn upgrade_proof_single_step() {
+        for new in 2..=18u64 {
+            let (t, blocks) = tree(new as usize);
+            let old = new - 1;
+            let old_roots = tree_from(&blocks[..old as usize]).roots();
+            let up = t.upgrade_proof(old, new).unwrap();
+            assert!(up.verify(&old_roots, &t.root_hash()), "single-step upgrade (new={new})");
+        }
+    }
+
+    // The proof carries only *fully-new* subtree nodes (every covered block is
+    // `>= old`); it never ships old data. This is what the anti-fork soundness
+    // argument rests on.
+    #[test]
+    fn upgrade_proof_supplies_only_fully_new_nodes() {
+        for new in 1..=20u64 {
+            let (t, _) = tree(new as usize);
+            for old in 1..new {
+                let up = t.upgrade_proof(old, new).unwrap();
+                for n in &up.nodes {
+                    let (first, end) = flat::block_range(n.index);
+                    assert!(
+                        first >= old,
+                        "supplied node {} covers old data [{first},{end}) (old={old}, new={new})",
+                        n.index
+                    );
+                    assert!(end <= new, "supplied node must stay within the new tree");
+                }
+            }
+        }
+    }
+
+    // Anti-fork across lengths: a verifier holding the *honest* prefix rejects a
+    // longer head that rewrote an old block — even though the proof is internally
+    // well-formed for the forked tree.
+    #[test]
+    fn upgrade_proof_detects_old_rewrite() {
+        let (honest, blocks) = tree(8);
+        let old = 5u64;
+        let honest_old_roots = tree_from(&blocks[..old as usize]).roots();
+
+        // Sanity: the honest extension verifies under the honest old roots.
+        let honest_up = honest.upgrade_proof(old, 8).unwrap();
+        assert!(honest_up.verify(&honest_old_roots, &honest.root_hash()));
+
+        // Fork: identical except block 2 (which is < old) is rewritten.
+        let mut forked_blocks = blocks.clone();
+        forked_blocks[2] = b"rewritten".to_vec();
+        let forked = tree_from(&forked_blocks);
+        assert_ne!(forked.root_hash(), honest.root_hash());
+
+        let forked_up = forked.upgrade_proof(old, 8).unwrap();
+        // The forked proof is self-consistent against the *forked* old roots...
+        let forked_old_roots = tree_from(&forked_blocks[..old as usize]).roots();
+        assert!(forked_up.verify(&forked_old_roots, &forked.root_hash()));
+        // ...but a verifier trusting the honest prefix must reject it.
+        assert!(
+            !forked_up.verify(&honest_old_roots, &forked.root_hash()),
+            "honest old prefix must reject a forked extension"
+        );
+    }
+
+    // Tamper-rejection across every input the verifier trusts.
+    #[test]
+    fn upgrade_proof_rejects_tampering() {
+        let (t, blocks) = tree(13);
+        let new_root = t.root_hash();
+        let old = 6u64;
+        let old_roots = tree_from(&blocks[..old as usize]).roots();
+        let up = t.upgrade_proof(old, 13).unwrap();
+        assert!(!up.nodes.is_empty(), "this upgrade needs new nodes");
+        assert!(up.verify(&old_roots, &new_root)); // honest baseline
+
+        // tampered supplied node
+        let mut bad_node = up.clone();
+        bad_node.nodes[0].hash[0] ^= 0xff;
+        assert!(!bad_node.verify(&old_roots, &new_root), "tampered new node rejects");
+
+        // wrong expected new head
+        let mut wrong = new_root;
+        wrong[0] ^= 0xff;
+        assert!(!up.verify(&old_roots, &wrong), "wrong new head rejects");
+
+        // dropping a needed node makes the proof insufficient
+        let mut missing = up.clone();
+        missing.nodes.pop();
+        assert!(!missing.verify(&old_roots, &new_root), "missing node rejects");
+
+        // tampered old root (the verifier's own trusted state, mutated)
+        let mut bad_old = old_roots.clone();
+        bad_old[0].hash[0] ^= 0xff;
+        assert!(!up.verify(&bad_old, &new_root), "tampered old root rejects");
+
+        // old roots of the wrong length (shape mismatch with the proof's old_len)
+        let wrong_len_old = tree_from(&blocks[..(old as usize - 1)]).roots();
+        assert!(!up.verify(&wrong_len_old, &new_root), "mismatched old shape rejects");
+
+        // injecting a fully-old node (a fork attempt: stand in for the verifier's
+        // own old data) is refused — supplied nodes must be fully new. Leaf 0 =
+        // block 0, which lies in the trusted old prefix.
+        let mut injected = up.clone();
+        injected.nodes.insert(
+            0,
+            Node { index: 0, hash: leaf_hash(&blocks[0]), size: blocks[0].len() as u64 },
+        );
+        assert!(!injected.verify(&old_roots, &new_root), "injected old-region node rejects");
+    }
+
+    // Out-of-range / degenerate requests produce no proof.
+    #[test]
+    fn upgrade_proof_out_of_range() {
+        let (t, _) = tree(8);
+        assert!(t.upgrade_proof(0, 8).is_none(), "old=0 has no anchor");
+        assert!(t.upgrade_proof(8, 8).is_none(), "old==new is not an extension");
+        assert!(t.upgrade_proof(5, 3).is_none(), "old>new inverted");
+        assert!(t.upgrade_proof(3, 9).is_none(), "new past length");
+    }
+
+    // The upgrade proof and a range proof compose: confirm the extension is an
+    // honest append, then verify the new blocks themselves against the same head.
+    #[test]
+    fn upgrade_proof_composes_with_range_proof() {
+        let (t, blocks) = tree(14);
+        let new_root = t.root_hash();
+        let old = 5u64;
+        let old_roots = tree_from(&blocks[..old as usize]).roots();
+
+        // 1. append-only / anti-fork across lengths (no data)
+        assert!(t.upgrade_proof(old, 14).unwrap().verify(&old_roots, &new_root));
+        // 2. the new blocks [old, 14) verify against the same (now trusted) head
+        let rp = t.range_proof(old, 14).unwrap();
+        assert!(rp.verify(&blocks[old as usize..], &new_root));
     }
 }
