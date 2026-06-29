@@ -64,6 +64,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend
+- [x] `storage` — **sparse bitfield** (`Bitfield`: get / set / set_range / count(start,**length**,val) /
+      find_first / find_last over an unbounded, sparse, paged local presence map; clean-room of
+      `bitfield.js`'s L1 data structure — `find_first(false,..)` always `Some` (infinite-zero tail),
+      a missing page is an all-`false` page never materialized on clear; persistence `open`/`flush` and
+      replication `want` chunking out of scope, ADR-0030) — the foundation for `clear`/`purge`/sparse cores
 - [ ] `storage` — IndexedDB backend (wasm)
 - [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +

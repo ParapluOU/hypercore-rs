@@ -1302,3 +1302,63 @@ Repo-relative paths only — no private or personal data (this repo is public).
     upstream's earlier-confirming cases (`dags - simple 2`, `linearizer - compete`/`count
     ordering`) and needs the apply/view layer (`apply.js`/`anchors.js`);
   - `merkle` reorg-by-proof / `additionalNodes` (the last `merkle-tree.js` pieces); `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 27: `storage` sparse bitfield (`bitfield.js`)
+
+**Did**
+- Picked the next natively-testable, in-scope red item. The deferred **fork/merge consensus**
+  (ADR-0015, the `[~]` autobase row) is the other non-env-blocked candidate, but LESSONS.md
+  explicitly says to defer the 2-degree-lead caveat *to the iteration that has the JS oracle to check
+  against* — and gate #4 is still env-blocked — so attempting that subtle clean-room algorithm now,
+  with no oracle, would go against the project's own recorded guidance. Instead ported the
+  foundational **sparse bitfield** (`reference/js/hypercore/test/bitfield.js`), the local presence map
+  `clear`/`purge`/sparse cores will build on.
+- Added `crates/storage/src/bitfield.rs` — `storage::Bitfield`, a clean-room (ADR-0001), dependency-
+  free, wasm-safe **unbounded sparse bitfield**: `get` / `set` / `set_range(start,end,val)` (end
+  exclusive) / `count(start,length,val)` (2nd arg is a **length**, matching upstream) / `find_first` /
+  `find_last` (+ `first/last_set/unset`). Storage is a `BTreeMap<page, Box<[u64;512]>>` at upstream's
+  `2^15`-bit page granularity (so page/segment **boundary** offsets behave like upstream) but with no
+  segment/`BigSparseArray` layer; a **missing page is an all-`false` page** and is never materialized
+  just to clear bits (mirrors upstream's `if (!p && val)`). Word-level masks/popcount/`trailing_zeros`/
+  `leading_zeros` do the per-page work; `find_first`/`find_last` walk pages via `BTreeMap` ranges.
+- 15 asserting tests (storage 2→17): every `bitfield.js` case ported — set/get incl. huge sparse
+  index (`8e15`, no panic); `count` (set 8 / unset 10 over the worked example; the length-not-end
+  semantics); `find_first`/`find_last` over all-zeroes and all-ones (`set_range(0, 2^24, true)`) at
+  page (`2^15±1`, `2^16±1`) and segment (`2^21±1`, `2^22±1`) boundaries; `last_unset` around a page
+  boundary (32766/32769); `set_range` on a page boundary; **clear a range on a not-yet-existing page
+  allocates nothing**; last-bits-in-segment → `find_first`; `set_range` over multiple pages — plus a
+  deterministic (seeded SplitMix64 + reference `HashSet`) random set/get and two brute-force
+  cross-checks (`count` and `find_*` vs a naive scan over a sparse mix).
+- `just verify` green: **133 native tests** (autobase 24 across files + codec 8 + hypercore 36 +
+  identity 4 + merkle 44 + **storage 17**) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0030: implement only the **L1 data structure** of `bitfield.js`, clean-room (own paged layout,
+  not byte/disk/wire compatible). **Defer** persistence (`open`/`flush`/`BitInterlude`, `bit-interlude.js`
+  — storage backend & disk format, returns with the IndexedDB/native `storage` work) and `want` chunking
+  (replication wire framing, networking — ADR-0003) as out of scope per the relevance filter; GC marking
+  (`mark-bitfield.js`/`mark-n-sweep.js`) is not yet built. The bitfield row stays `[~]` (structure ported;
+  persistence/want/mark deferred).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A sparse bitfield is an *unbounded, infinite-zero* field; separate the data structure from
+  persistence/replication. Store it sparse + paged (one page per touched region, not per index), treat a
+  missing page as all-`false` never materialized on clear, and mind the asymmetric `find` semantics:
+  `count`'s 2nd arg is a **length**, `find_first(false,..)` **always** finds (infinite-zero tail) while
+  `find_first(true,..)`/`find_last(..)` can be absent. Keep the page granularity so boundary offsets
+  match upstream; cross-check `count`/`find_*` against a brute-force scan and seed the random test.
+
+**Next**
+- All feature iterations from here remain environment-blocked or are larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable
+    under the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend
+    `[ ]` would also wire the bitfield's deferred `open`/`flush` persistence;
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view
+    layer (`apply.js`/`anchors.js`);
+  - `hypercore` **`clear`** (sparse range-clear over the new `Bitfield`) + `purge`; `merkle`
+    reorg-by-proof / `additionalNodes`; `hyperbee`.

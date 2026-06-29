@@ -510,3 +510,29 @@ must never rest solely on collision-resistance.
 sibling-index guard (now consistent with `NodeProof`); regression tests pin both. A deeper fix —
 binding child indices into `parent_hash` — would make these structural by construction but rewrites
 every hash (a permanent ABI change), so it is deferred as a decision, not a quick fix.
+
+## ADR-0030 — Sparse bitfield is the pure L1 data structure; persistence & replication chunking deferred
+**Context:** Upstream hypercore (`reference/js/hypercore/lib/bitfield.js`, exercised by
+`test/bitfield.js`) tracks which blocks a holder has as a paged bitfield. Its surface mixes three
+concerns: (1) the **data structure** — `get`/`set`/`setRange`/`count`/`findFirst`/`findLast`
+(+`first/lastSet/Unset`) over an unbounded, sparse field; (2) **persistence** — `static open(storage,
+length)` rehydrates pages from a storage stream and `flush(tx)` writes dirty pages through a storage
+transaction (with `BitInterlude` staging a batch of bit changes, `bit-interlude.js`); (3)
+**replication framing** — `*want(start, length)` chunks 32-bit-aligned segments to send to a peer.
+Internally upstream uses a `BigSparseArray` of fixed pages grouped into segments, with `findFirst`/
+`findLast` recursing page→segment→field.
+**Decision:** Reimplement only the **L1 data structure** (`crates/storage/src/bitfield.rs`,
+`storage::Bitfield`), clean-room (ADR-0001) — not byte/disk/wire compatible. We keep the page
+granularity (`2^15` bits) so the page/segment **boundary behaviours** the tests pin line up, but store
+pages in a plain `BTreeMap<u64, Box<[u64; 512]>>` (no segment layer / `BigSparseArray`); a **missing
+page is semantically an all-`false` page** and is never materialized just to clear bits in it (mirrors
+upstream's `if (!p && val)`). Query semantics match upstream exactly: `count(start, length, val)` takes
+a **length** (not an end); `find_first(false, ..)` always returns `Some` (infinite-zero tail) while
+`find_first(true, ..)`/`find_last(..)` return `None`/`Option` when absent (upstream's `-1`).
+**Consequence:** The pure-structure behaviour of `bitfield.js` is ported and host-safe under
+`just verify`; it is the local presence map `clear`/`purge`/sparse cores will build on. We **defer** as
+out of scope per the relevance filter: persistence (`open`/`flush`/`BitInterlude` — storage backend &
+disk format, returns with the `storage` IndexedDB/native work) and `want` (replication wire framing,
+networking, ADR-0003). The bitfield row (`bitfield.js` + `bit-interlude.js`/`mark-bitfield.js`/
+`mark-n-sweep.js`) stays `[~]`: the core structure is ported; staged-tx changes and GC marking
+(`mark-*`/`*-sweep`) are not yet built.

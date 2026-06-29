@@ -300,6 +300,22 @@ personal data** (this repo is public; use repo-relative paths).
   node set). Gate non-vacuity (degrees 0/1/≥2 all occur, a double quorum forms) so the fuzz isn't
   hollow. Keep indexer sets ≥ 2: a lone indexer ⇒ majority 1 ⇒ the production degree loop (author
   self-vote alone always ≥ majority) never terminates — a latent degenerate to avoid, not exercise.
+- **A sparse bitfield is an *unbounded, infinite-zero* field — separate the data structure from
+  persistence/replication, and watch the asymmetric `find` semantics.** Upstream's `bitfield.js` bundles
+  three concerns; only the **data structure** is L1 (get/set/`set_range`/`count`/`find_first`/`find_last`)
+  — `open`/`flush`/`BitInterlude` is storage persistence and `*want` is replication wire framing, both
+  out of scope. Implement it sparse + paged (a `BTreeMap<page, [u64; words]>`; a single bit at index 8e15
+  must cost one page, not a petabyte), and treat a **missing page as an all-`false` page you never
+  materialize on clear** (mirror upstream's `if (!p && val)`: setting `false` allocates nothing, so
+  "clear a range on a page that doesn't exist" is a no-op, not a throw). Three semantic traps the upstream
+  tests pin: (1) `count(start, length, val)`'s second arg is a **length, not an end** (`count(3, 18, ..)`
+  is over `[3, 21)`); (2) because the field is infinite zeros beyond the last set bit, `find_first(false,
+  ..)` **always** returns a hit (the search terminates at the first missing or partial page — present
+  fully-set pages are finite), while `find_first(true, ..)` and both `find_last` directions return
+  "absent" (`None`/`-1`); (3) keep the page granularity (`2^15`) so page/segment **boundary** offsets
+  (`2^15±1`, `2^21±1`, last-bit-in-page) behave like upstream even though the internal layout is
+  clean-room (no segment/`BigSparseArray` layer). Verify `count`/`find_*` against a brute-force scan over a
+  sparse mix and seed the "random set/get" test (SplitMix64 + a reference `HashSet`) so it reproduces.
 - **The LCA binary search is sound even when corruption violates its monotonicity precondition**
   (audit follow-up). `lowest_common_ancestor` assumes prefix agreement is monotone (true for two
   *intact* trees), but a missing node makes `agree(a)` false where the prefix it needs is gone — which

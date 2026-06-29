@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt::Debug;
 
+pub mod bitfield;
+pub use bitfield::Bitfield;
+
 /// A `u64`-keyed byte store.
 pub trait Store {
     type Error: Debug;
