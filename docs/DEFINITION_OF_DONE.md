@@ -58,7 +58,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [ ] `storage` — IndexedDB backend (wasm)
 - [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +
-      **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019)
+      **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019) +
+      **verified length-extension replication** (`Replica::verify_upgrade` — accept a longer signed head only
+      as an append-only extension of the replica's own roots *before* fetching the new blocks; ADR-0021)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)

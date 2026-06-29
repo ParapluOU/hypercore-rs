@@ -107,6 +107,15 @@ personal data** (this repo is public; use repo-relative paths).
   `old = 0` "upgrade" has no trusted anchor and proves nothing. Test the anti-fork arm explicitly — a
   verifier holding the *honest* prefix must **reject** a forked longer head even though that proof is
   internally consistent against the *forked* old roots.
+- **An inclusion proof ties a block to *a* head, not to the replica's history — a longer head needs a
+  separate consistency gate.** When a replica fetches a longer head's blocks, each block's inclusion proof
+  verifies against *that head's* root — so a forking writer's self-consistent longer head has every block
+  verify, and the replica would silently adopt a forked history it had already contradicted. Tie the new
+  head back to trusted state **before downloading**: fold a data-free `UpgradeProof`'s fully-new nodes into
+  the replica's *own* roots and require it to rebuild the new head's root (`Replica::verify_upgrade`). It's
+  cheap (no block data) and catches the fork before a single new block is fetched — the cross-length
+  analogue of `conflicting_heads`/`ForkProof`. The empty replica (length 0) has no anchor, so it has no
+  upgrade gate; it replicates from scratch against the head directly.
 - **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
   writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
   sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which

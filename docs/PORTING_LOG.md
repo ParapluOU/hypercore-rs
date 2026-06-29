@@ -503,3 +503,57 @@ Repo-relative paths only — no private or personal data (this repo is public).
   into `hypercore`/`Replica` (accept a longer signed head as a verified extension before fetching the new
   blocks); merkle **seek** + `merkle-tree-recovery.js` reorg; `autobase` `topolist.js` ordering; and the
   view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 14: `hypercore` verified length-extension replication
+
+**Did**
+- Wired iter 13's data-free merkle `upgrade_proof` (ADR-0020) into `crates/hypercore` as the
+  replication anti-fork gate behind upstream `core.js`'s "apply a longer remote head" flow (L1, no
+  networking):
+  - `Replica::verify_upgrade(new_head, proof)` — the gate a replica applies **before** fetching a
+    longer head's blocks. Accepts a longer signed head only if (a) the author signed it, (b) the proof
+    bridges *exactly* from the replica's current verified length to the new head's length
+    (`old_len == len()`, `new_len == new_head.length > len()`), and (c) folding the proof's fully-new
+    nodes into the replica's **own** trusted roots reconstructs `new_head.root`. Pure check — no
+    mutation; the new blocks `[old, new)` are then fetched with the existing `add_block`.
+  - `Hypercore::upgrade_proof(old, new)` — exposes the merkle generator on the source side (mirrors
+    `proof`).
+  The point: an inclusion proof ties a block to *the head it came with*, so a forking writer's
+  self-consistent longer head would have every block verify and the replica would silently adopt a
+  forked history it had already contradicted — `verify_upgrade` ties the new head back to trusted state
+  first, so the fork is caught before a single new block is downloaded.
+- 3 asserting tests (hypercore 19→22): a replica replicates a length-5 log, accepts a verified
+  extension to length 9 (proof supplies new subtree nodes; no block data), fetches only `[5,9)`, and
+  ends **byte-identical** at the new signed head; a forking writer (same author, block 2 rewritten,
+  extended to 9) is **rejected** by `verify_upgrade` against the honest prefix even though its head is
+  validly self-signed, and the replica is left untouched at length 5; and a malformed/tampered battery
+  (tampered new-head root ⇒ bad signature; tampered proof node; wrong `old_len` ≠ replica length; proof
+  `new_len` ≠ head length; a length-7 head signed by a *different* author). `just verify` green
+  (70 native tests + wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0021: the upgrade proof is wired as a **standalone pre-fetch gate** verifying a longer head
+  against the replica's *own* roots, not upstream's bundled block+upgrade wire object applied inside
+  the replication protocol. We keep proofs separate (composes with `add_block`), the gate purely
+  verifying, and **defer** signed-length fast-forward / `additionalNodes` / wire framing (networking,
+  ADR-0003; `fast-forward.js` row). The empty-replica case (`old = 0`) has no anchor ⇒ no upgrade gate,
+  replicating from scratch. `core.js` advances toward verified incremental replication.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- An inclusion proof ties a block to *a* head, not to the replica's history, so a longer head needs a
+  separate consistency gate: fold a data-free `UpgradeProof` into the replica's own roots and require it
+  to rebuild the new head's root, *before* downloading — the cross-length analogue of
+  `conflicting_heads`/`ForkProof`. The empty replica (length 0) has no anchor, so it replicates from
+  scratch against the head directly.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not started — needs an XPC service outside the loop's allowlist — and the image
+  pull needs network; see iters 11–13). When a container runtime is *started*, build `tools/oracle/`
+  driving the reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2); merkle **seek** + `merkle-tree-recovery.js` reorg;
+  `autobase` `topolist.js` ordering; and the view/apply layer (`apply.js`/`anchors.js`) the
+  `linearizer.js`/`dags.js` view-length assertions need.

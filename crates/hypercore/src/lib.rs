@@ -14,7 +14,7 @@ use std::marker::PhantomData;
 
 use codec::Codec;
 use identity::{PublicKey, SecretKey, Sig};
-use merkle::{Hash, MerkleTree, Proof};
+use merkle::{Hash, MerkleTree, Proof, UpgradeProof};
 use storage::Store;
 
 /// Domain tag for the head-signable message (separates it from any other thing
@@ -248,6 +248,16 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         self.tree.proof(index)
     }
 
+    /// A length-extension (consistency) proof bridging length `old` to `new` for
+    /// this log. Pair it with the *new* [`Self::head`]: a replica that has
+    /// already verified up to `old` can confirm the longer head is an honest
+    /// append-only extension (the first `old` blocks weren't rewritten) **before**
+    /// fetching the new blocks (see [`Replica::verify_upgrade`]). `None` unless
+    /// `1 <= old < new <= len`.
+    pub fn upgrade_proof(&self, old: u64, new: u64) -> Option<UpgradeProof> {
+        self.tree.upgrade_proof(old, new)
+    }
+
     /// Internal-consistency + signature check of our own head.
     pub fn verify_head(&self) -> bool {
         match &self.head {
@@ -388,6 +398,35 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
             self.head = Some(head.clone());
         }
         Ok(true)
+    }
+
+    /// Verify that `new_head` is a genuine **append-only extension** of this
+    /// replica's current verified state, using a length-extension
+    /// [`UpgradeProof`] — the gate a replica applies *before* fetching a longer
+    /// head's blocks.
+    ///
+    /// [`Self::add_block`] verifies each block against the head it came with, but
+    /// an inclusion proof only ties a block to *that* head's root. A writer that
+    /// forked/rewrote old history produces a self-consistent longer head whose
+    /// blocks all verify against its own (forked) root — so without this check a
+    /// replica could be lured onto a forked history that contradicts what it
+    /// already verified. `verify_upgrade` ties the longer head back to what we
+    /// already trust: it folds the proof's fully-new nodes into our **own** roots
+    /// and must rebuild `new_head.root`. A forked/rewritten prefix fails the fold.
+    ///
+    /// Returns `true` only if the author signed `new_head`, the proof bridges
+    /// exactly from our current length (`old_len == len()`) to the new head
+    /// (`new_len == new_head.length > len()`), and the fold from our trusted roots
+    /// reconstructs `new_head.root`. It does **not** mutate the replica — apply
+    /// the new blocks with [`Self::add_block`] (against `new_head`) afterward.
+    pub fn verify_upgrade(&self, new_head: &SignedHead, proof: &UpgradeProof) -> bool {
+        proof.old_len == self.tree.len()
+            && proof.new_len == new_head.length
+            && new_head.length > self.tree.len()
+            && self
+                .public
+                .verify(&head_message(new_head.length, &new_head.root), &new_head.sig)
+            && proof.verify(&self.tree.roots(), &new_head.root)
     }
 
     /// Decode the value at `index`, or `None`.
@@ -535,6 +574,155 @@ mod tests {
         assert!(rep.add_block(&head, 0, &e0, &p0).unwrap());
         assert!(rep.add_block(&head, 1, &e1, &p1).unwrap());
         assert_eq!(rep.len(), 2);
+    }
+
+    // ---- verified length-extension replication (merkle upgrade proof, ADR-0020) ----
+
+    #[test]
+    fn replica_upgrades_to_longer_head() {
+        // A replica fully replicates a length-5 log, then accepts a *verified*
+        // append-only extension to length 9 and fetches only the new blocks.
+        let mut src = Hypercore::<Vec<u8>, _, _>::new(author(30), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d", "e"] {
+            src.append(&blk(s)).unwrap();
+        }
+        let head5 = src.head().unwrap().clone();
+        let pk = src.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.verified_head(), Some(&head5));
+
+        // The source extends the log.
+        for s in ["f", "g", "h", "i"] {
+            src.append(&blk(s)).unwrap();
+        }
+        let head9 = src.head().unwrap().clone();
+
+        // Before fetching, the replica verifies the longer head is an honest
+        // extension of what it already trusts — no block data needed.
+        let up = src.upgrade_proof(5, 9).unwrap();
+        assert!(!up.nodes.is_empty(), "extension supplies new subtree nodes");
+        assert!(rep.verify_upgrade(&head9, &up), "honest extension accepted");
+
+        // Then it fetches only the new blocks [5, 9) against the new head and
+        // ends byte-identical to the source at length 9.
+        for i in 5..9u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head9, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.len(), 9);
+        assert_eq!(rep.root_hash(), head9.root, "replica root == new signed root");
+        assert_eq!(rep.verified_head(), Some(&head9));
+        for i in 0..9u64 {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap(), "decoded values match");
+        }
+    }
+
+    #[test]
+    fn replica_rejects_forked_upgrade() {
+        // A replica trusting the honest length-5 prefix must reject a longer head
+        // from a forking writer (same author) that rewrote an old block: the
+        // upgrade proof's new nodes can't fold into the honest roots to reach the
+        // forked root. This is the anti-fork guarantee at the replication level.
+        let mut honest = Hypercore::<Vec<u8>, _, _>::new(author(31), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d", "e"] {
+            honest.append(&blk(s)).unwrap();
+        }
+        let head5 = honest.head().unwrap().clone();
+        let pk = honest.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = honest.block(i).unwrap().unwrap();
+            let proof = honest.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+
+        // Forking writer: same author seed, but block 2 ('c' -> 'Z') is rewritten,
+        // then the log is extended to length 9.
+        let mut forked = Hypercore::<Vec<u8>, _, _>::new(author(31), Bytes, MemoryStore::new());
+        for s in ["a", "b", "Z", "d", "e", "f", "g", "h", "i"] {
+            forked.append(&blk(s)).unwrap();
+        }
+        let forked_head9 = forked.head().unwrap().clone();
+        let forked_up = forked.upgrade_proof(5, 9).unwrap();
+
+        // The forked head *is* signed by the same author (signature alone passes)...
+        assert!(pk.verify(
+            &head_message(forked_head9.length, &forked_head9.root),
+            &forked_head9.sig
+        ));
+        // ...but the replica's honest roots can't fold the forked extension up to
+        // the forked root, so the upgrade is refused and the replica is untouched.
+        assert!(
+            !rep.verify_upgrade(&forked_head9, &forked_up),
+            "forked extension rejected against the honest prefix"
+        );
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.verified_head(), Some(&head5));
+    }
+
+    #[test]
+    fn verify_upgrade_rejects_malformed_or_tampered() {
+        let mut src = Hypercore::<Vec<u8>, _, _>::new(author(32), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d", "e", "f", "g"] {
+            src.append(&blk(s)).unwrap();
+        }
+        let pk = src.public_key();
+
+        // The replica replicates only the first 4 blocks (under the length-4 head).
+        let mut early = Hypercore::<Vec<u8>, _, _>::new(author(32), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d"] {
+            early.append(&blk(s)).unwrap();
+        }
+        let head4 = early.head().unwrap().clone();
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..4u64 {
+            let enc = early.block(i).unwrap().unwrap();
+            let proof = early.proof(i).unwrap();
+            assert!(rep.add_block(&head4, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.len(), 4);
+
+        let head7 = src.head().unwrap().clone();
+        let up = src.upgrade_proof(4, 7).unwrap();
+        assert!(!up.nodes.is_empty());
+        assert!(rep.verify_upgrade(&head7, &up), "honest baseline accepted");
+
+        // Tampered new-head root: the head signature no longer verifies.
+        let mut bad_head = head7.clone();
+        bad_head.root[0] ^= 0xff;
+        assert!(!rep.verify_upgrade(&bad_head, &up));
+
+        // Tampered proof node: the fold no longer reaches the new root.
+        let mut bad_up = up.clone();
+        bad_up.nodes[0].hash[0] ^= 0xff;
+        assert!(!rep.verify_upgrade(&head7, &bad_up));
+
+        // Proof bridging from the wrong old length (not the replica's length).
+        let up_wrong_old = src.upgrade_proof(3, 7).unwrap();
+        assert!(!rep.verify_upgrade(&head7, &up_wrong_old), "old_len must equal replica length");
+
+        // Proof whose new_len disagrees with the head's length.
+        let up_wrong_new = src.upgrade_proof(4, 6).unwrap();
+        assert!(!rep.verify_upgrade(&head7, &up_wrong_new), "new_len must equal head length");
+
+        // A length-7 head signed by a *different* author is refused.
+        let other_head = {
+            let mut o = Hypercore::<Vec<u8>, _, _>::new(author(33), Bytes, MemoryStore::new());
+            for s in ["a", "b", "c", "d", "e", "f", "g"] {
+                o.append(&blk(s)).unwrap();
+            }
+            o.head().unwrap().clone()
+        };
+        assert!(!rep.verify_upgrade(&other_head, &up), "head signed by another author refused");
     }
 
     // ---- batch / atomic append (upstream `batch.js` / `atomic.js`) ----

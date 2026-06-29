@@ -17,7 +17,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | File | Status | Maps to |
 |------|--------|---------|
 | `basic.js` | [~] | `hypercore` append/get + signed-head verify ported; sparse/session bits later |
-| `core.js` | [~] | `hypercore` core append/get/verify + proof-based replication ported |
+| `core.js` | [~] | `hypercore` core append/get/verify + proof-based replication ported; **verified length-extension replication** (`Replica::verify_upgrade` — a longer signed head accepted only as an append-only extension of the replica's own roots before fetching, ADR-0021); signed-length fast-forward / wire framing still networking (out of scope) |
 | `batch.js` | [~] | `hypercore` batch append — stage-without-touching / single-head commit / stale-base reject ported (ADR-0018); multi-session interactions out of scope (sessions excluded) |
 | `atomic.js` | [~] | `hypercore` atomic append — all-or-nothing commit (storage-fault rollback leaves tree+head untouched) ported (ADR-0018); `atom.flush()` storage-overlay + truncate/append events deferred |
 | `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper, contiguous-range proofs (ADR-0017) **and length-extension `upgrade` proofs** — data-free consistency/anti-fork-across-lengths, ADR-0020 — ported; byte-offset seeks + `upgrade.additionalNodes` + reorg still later) |

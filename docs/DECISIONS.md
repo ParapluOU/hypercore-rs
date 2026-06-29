@@ -249,3 +249,24 @@ anchor, so it is meaningless and refused). We still **defer** upstream's `additi
 the requested length), byte-offset **seek**, and **reorg/recovery** — `merkle-tree.js` stays `[~]` and
 `merkle-tree-recovery.js` `[ ]`. Soundness rests on the same leaf/parent collision-resistance the scheme
 already assumes.
+
+## ADR-0021 — Replica verifies a longer head against its own roots before fetching (upgrade gate)
+**Context:** Upstream hypercore applies a longer remote head inside the replication protocol's proof
+exchange: a peer sends a proof carrying `upgrade.nodes`/`additionalNodes`, the receiver verifies and
+applies it (`core.verify` / `_verifyAndApplyUpgrade`), advancing its local signed length, then fetches
+the blocks. The upgrade is part of the wire proof object (ADR-0020: upstream bundles block+seek+upgrade).
+**Decision:** Wire the standalone, data-free `UpgradeProof` (ADR-0020) into `Replica` as a pure
+**pre-fetch gate** `verify_upgrade(new_head, proof)`. It accepts a longer signed head only if (a) the
+author signed it, (b) the proof bridges *exactly* from the replica's current verified length to the new
+head's length (`old_len == len()`, `new_len == new_head.length > len()`), and (c) folding the proof's
+fully-new nodes into the replica's **own** trusted roots reconstructs `new_head.root`. It does **not**
+mutate the replica; the new blocks `[old, new)` are then fetched with the existing `add_block` against the
+verified head. `Hypercore::upgrade_proof(old, new)` exposes the generator on the source side.
+**Consequence:** A replica can no longer be lured onto a forked history by a self-consistent longer head —
+the fork is caught **before any new block is downloaded** (anti-fork at the replication level; the
+cross-length analogue of `conflicting_heads`/`ForkProof`, ADR-0019). We keep proofs separate (no bundled
+block+upgrade object) and the gate purely verifying. We **defer** signed-length fast-forward,
+`additionalNodes` (proving past the requested length), and the wire framing that delivers these inputs in a
+live system — they return with networking (ADR-0003) and the `fast-forward.js` row. The empty-replica case
+(`old = 0`) has no trusted anchor, so it has no upgrade gate and replicates from scratch against the head
+directly. `core.js` moves toward verified incremental replication.
