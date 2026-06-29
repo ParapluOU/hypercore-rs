@@ -131,6 +131,20 @@ personal data** (this repo is public; use repo-relative paths).
   into a *different* block's interval. And the local tree-accelerated seek (descend by subtree `size`) must be
   asserted equal to a naive linear scan for **every** offset — that equivalence is the whole point of the
   O(log n) descent. Keep `padding`/framing out of L1: it's application byte-layout, not log structure.
+- **Tree-node recovery is an inclusion proof that starts from an *arbitrary node*, not a leaf.** Upstream
+  surfaces a tree with deleted nodes via `_repairMode` + replication-driven repair (peer requests,
+  `repairing`/`repaired` events), but the *provable* L1 fact is content-blind and needs no network: a peer
+  that trusts the signed root can recover any missing node from a `NodeProof` — the node itself + its sibling
+  path to the containing root + the roots — by climbing it to the root with `parent_hash` (binds hash **and**
+  size) and requiring `tree_hash(roots) == expected_root`. It's the arbitrary-node generalization of the
+  block `Proof` (which starts from a leaf recomputed from data); soundness is the same leaf/parent
+  collision-resistance. Two gotchas: (1) **repair mode is derivable, not a flag** — a node is implied by the
+  length iff its whole block range is within `[0, len)`, so `missing_nodes`/`is_intact`/the append guard all
+  fall out of the length with no stored bit to keep in sync; make `root_hash`/`roots` panic-free
+  counterparts (`try_*` → `None`) so a gap degrades gracefully instead of indexing into a missing key. (2)
+  **recovery must be verify-then-store** so a mangled proof leaves storage untouched (atomic) — and the
+  corrupt *source* can't prove the node it lost (`node_proof` needs the node present), so proofs always flow
+  from a healthy holder into the gap.
 - **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
   writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
   sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which

@@ -427,6 +427,192 @@ impl MerkleTree {
             roots,
         })
     }
+
+    /// Whether the node at flat-tree `index` is currently stored.
+    pub fn has_node(&self, index: u64) -> bool {
+        self.nodes.contains_key(&index)
+    }
+
+    /// Remove a stored tree node — a corruption / partial-state injector, the
+    /// clean-room analogue of upstream `deleteTreeNode`. Returns whether a node
+    /// was present at `index`. After removal the tree may be in **repair mode**
+    /// (see [`MerkleTree::is_intact`]); a missing node is restorable from a remote
+    /// [`NodeProof`] via [`MerkleTree::recover_node`].
+    pub fn remove_node(&mut self, index: u64) -> bool {
+        self.nodes.remove(&index).is_some()
+    }
+
+    /// The flat-tree indices of every node a fully-built tree of this length
+    /// *would* store but which is currently **missing** (deleted, or never
+    /// fetched). Empty iff the tree is intact. A node at `index` is implied by the
+    /// length exactly when its whole block range lies within `[0, len)`.
+    pub fn missing_nodes(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        if self.length == 0 {
+            return out;
+        }
+        // Every implied node has index < 2*len (its block range end <= len), so
+        // this bound is complete.
+        for i in 0..(2 * self.length) {
+            let (_, end) = flat::block_range(i);
+            if end <= self.length && !self.nodes.contains_key(&i) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    /// Whether every tree node implied by the current length is present. A tree
+    /// that is **not** intact is in *repair mode*: it still reports its
+    /// [`len`](MerkleTree::len) and serves the nodes it holds, but it refuses to
+    /// be extended ([`try_append`](MerkleTree::try_append)) and may be unable to
+    /// produce a root hash until the missing nodes are recovered.
+    pub fn is_intact(&self) -> bool {
+        self.missing_nodes().is_empty()
+    }
+
+    /// The root nodes, or `None` if any root is currently missing (repair mode).
+    /// Unlike [`roots`](MerkleTree::roots) this never panics on a gap.
+    pub fn try_roots(&self) -> Option<Vec<Node>> {
+        if self.length == 0 {
+            return Some(Vec::new());
+        }
+        flat::full_roots(self.length * 2)
+            .into_iter()
+            .map(|i| self.nodes.get(&i).copied())
+            .collect()
+    }
+
+    /// The signable root hash, or `None` if a root is missing (repair mode). The
+    /// graceful counterpart of [`root_hash`](MerkleTree::root_hash).
+    pub fn try_root_hash(&self) -> Option<Hash> {
+        Some(tree_hash(&self.try_roots()?))
+    }
+
+    /// Append a block, **refusing while the tree is in repair mode** (missing
+    /// nodes). Extending a corrupt tree could silently bake an inconsistent root
+    /// into the log, so recovery must complete first (ports
+    /// `merkle-tree-recovery.js`'s "fail appends … when in repair mode"). Returns
+    /// the new block number on success.
+    pub fn try_append(&mut self, data: &[u8]) -> Result<u64, InRepairMode> {
+        if !self.is_intact() {
+            return Err(InRepairMode);
+        }
+        Ok(self.append(data))
+    }
+
+    /// An authenticated proof of the tree node at flat-tree `index` (leaf,
+    /// interior node, or root) against the current signed root — the clean-room
+    /// analogue of upstream `generateRemoteProofForTreeNode`. A peer that trusts
+    /// the signed root but is missing this node can verify and re-store it with
+    /// [`MerkleTree::recover_node`].
+    ///
+    /// Returns `None` if `index` is not a complete subtree within the tree, or if
+    /// the node, any sibling on its path, or any root is missing locally (a
+    /// corrupt *source* cannot prove the node it lost — it must receive a proof).
+    pub fn node_proof(&self, index: u64) -> Option<NodeProof> {
+        let (_, end) = flat::block_range(index);
+        if self.length == 0 || end > self.length {
+            return None;
+        }
+        let node = *self.nodes.get(&index)?;
+        let roots = self.try_roots()?;
+        let root_set: BTreeSet<u64> = roots.iter().map(|n| n.index).collect();
+        let mut cur = index;
+        let mut siblings = Vec::new();
+        while !root_set.contains(&cur) {
+            siblings.push(*self.nodes.get(&flat::sibling(cur))?);
+            cur = flat::parent(cur);
+        }
+        Some(NodeProof { node, siblings, roots })
+    }
+
+    /// Recover a missing tree node from a remote [`NodeProof`], verified against
+    /// the trusted `expected_root` (the signed head). On success stores the
+    /// authenticated node and returns `true`; on any tampering / inconsistency it
+    /// returns `false` and leaves the tree **unchanged** — the recovery is atomic
+    /// (ports `merkle-tree-recovery.js`'s "atomically updates storage": a mangled
+    /// proof fails and the node stays missing).
+    pub fn recover_node(&mut self, proof: &NodeProof, expected_root: &Hash) -> bool {
+        match proof.verify(expected_root) {
+            Some(node) => {
+                self.nodes.insert(node.index, node);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Returned when a mutation is refused because the tree is in repair mode
+/// (missing tree nodes). See [`MerkleTree::try_append`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InRepairMode;
+
+impl std::fmt::Display for InRepairMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("merkle tree is in repair mode (missing tree nodes)")
+    }
+}
+
+impl std::error::Error for InRepairMode {}
+
+/// An authenticated proof of a single tree node (leaf, interior, or root)
+/// against the signed root: the node itself, the sibling nodes from it up to its
+/// containing root, and every root. Used to **recover** a missing node from an
+/// untrusted peer — the climb to the trusted root authenticates the node's hash
+/// and size. The arbitrary-node generalization of [`Proof`] (which always starts
+/// from a leaf recomputed from block data).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeProof {
+    /// The node being proven (its `index` may be any complete subtree).
+    pub node: Node,
+    /// Sibling nodes, bottom-up, from `node` to its containing root.
+    pub siblings: Vec<Node>,
+    /// All roots of the tree at proof time.
+    pub roots: Vec<Node>,
+}
+
+impl NodeProof {
+    /// Verify against the trusted `expected_root`; on success return the
+    /// authenticated node (safe to store), else `None`.
+    ///
+    /// Soundness: the proven node climbs to its containing root via
+    /// [`parent_hash`] (which binds each child's hash **and** size), the
+    /// recomputed root is substituted into the roots, and [`tree_hash`] must equal
+    /// `expected_root`. Tampering with the node, any sibling, or any root makes
+    /// the recomputed hash diverge (collision-resistance), so a peer cannot foist
+    /// a wrong node — the same assumption every other proof here rests on. A
+    /// dropped sibling leaves the climb short of any root, so the substitution
+    /// fails and this returns `None`.
+    pub fn verify(&self, expected_root: &Hash) -> Option<Node> {
+        let mut node = self.node;
+        for sib in &self.siblings {
+            if sib.index != flat::sibling(node.index) {
+                return None; // not the path node's actual sibling
+            }
+            let p = flat::parent(node.index);
+            let (left, right) = if sib.index < node.index {
+                (*sib, node)
+            } else {
+                (node, *sib)
+            };
+            node = Node {
+                index: p,
+                hash: parent_hash(&left, &right),
+                size: left.size + right.size,
+            };
+        }
+        let mut roots = self.roots.clone();
+        match roots.iter_mut().find(|r| r.index == node.index) {
+            Some(slot) => *slot = node,
+            None => return None,
+        }
+        if &tree_hash(&roots) != expected_root {
+            return None;
+        }
+        Some(self.node)
+    }
 }
 
 /// A self-contained inclusion proof: the sibling hashes from a block's leaf up
@@ -1356,6 +1542,189 @@ mod tests {
         let total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
         for bytes in 0..total {
             assert_eq!(t.seek_proof(bytes).unwrap().verify(&root), Some(t.seek(bytes)));
+        }
+    }
+
+    // recovery: a tree with its tree nodes deleted still reports its length and
+    // does not panic — ports `merkle-tree-recovery.js` "core can still ready" +
+    // "still has length".
+    #[test]
+    fn recovery_corrupt_tree_keeps_length() {
+        let (mut t, _) = tree(30); // 4 roots
+        let roots: Vec<u64> = t.roots().iter().map(|n| n.index).collect();
+        assert!(roots.len() > 1, "30 blocks has multiple roots");
+
+        for r in &roots {
+            assert!(t.remove_node(*r), "deleting a present root");
+        }
+
+        // Length survives; no panic querying it.
+        assert_eq!(t.len(), 30);
+        assert!(!t.is_intact(), "missing roots => repair mode");
+        assert_eq!(t.try_root_hash(), None, "cannot build a root hash with roots gone");
+
+        // The missing set is exactly the deleted roots — nothing else was touched.
+        let mut missing = t.missing_nodes();
+        missing.sort_unstable();
+        let mut expect = roots.clone();
+        expect.sort_unstable();
+        assert_eq!(missing, expect);
+    }
+
+    // recovery: a deleted *root* is restored from a remote proof verified against
+    // the signed root — ports "fix via fully remote proof".
+    #[test]
+    fn recovery_root_via_remote_proof() {
+        let (healthy, _) = tree(30);
+        let root_hash = healthy.root_hash();
+        let root_index = healthy.roots()[0].index; // first root, covers [0,16)
+        let proof = healthy.node_proof(root_index).expect("healthy can prove its root");
+
+        let mut corrupt = healthy.clone();
+        assert!(corrupt.remove_node(root_index));
+        assert_eq!(corrupt.len(), 30, "length survives corruption");
+        assert!(!corrupt.is_intact());
+        assert_eq!(corrupt.try_root_hash(), None, "cannot create tree hash with a root gone");
+        assert!(corrupt.node_proof(root_index).is_none(), "corrupt source cannot prove the lost node");
+
+        assert!(corrupt.recover_node(&proof, &root_hash), "honest remote proof recovers the node");
+        assert!(corrupt.has_node(root_index));
+        assert!(corrupt.is_intact(), "recovered tree is whole again");
+        assert_eq!(corrupt.try_root_hash(), Some(root_hash), "root hash reconstructed exactly");
+    }
+
+    // recovery: a deleted *interior sub-root* is restored from a remote proof; the
+    // (still-present) root hash is unaffected by the gap, but the node itself is
+    // gone until recovered — ports "fix via fully remote proof" for a sub root.
+    #[test]
+    fn recovery_subroot_via_remote_proof() {
+        let (healthy, _) = tree(64); // single root 63
+        let root_hash = healthy.root_hash();
+        let subroot = 15u64; // covers blocks [0,16): root 63 -> 31 -> 15
+        assert!(healthy.has_node(subroot));
+        let proof = healthy.node_proof(subroot).expect("prove the sub-root");
+        let original = proof.node;
+
+        let mut corrupt = healthy.clone();
+        assert!(corrupt.remove_node(subroot));
+        assert!(!corrupt.is_intact(), "a missing sub-root is repair mode");
+        // A sub-root gap does not prevent the still-present root hash...
+        assert_eq!(corrupt.try_root_hash(), Some(root_hash));
+        // ...but the node itself is gone and cannot be re-proven locally.
+        assert!(corrupt.node_proof(subroot).is_none());
+
+        assert!(corrupt.recover_node(&proof, &root_hash));
+        assert!(corrupt.is_intact());
+        // The recovered node is exactly the original (hash + size reconstructed),
+        // and it is provable again against the signed root.
+        let reproof = corrupt.node_proof(subroot).expect("provable again");
+        assert_eq!(reproof.node, original);
+        assert_eq!(reproof.verify(&root_hash), Some(original));
+    }
+
+    // recovery security/atomicity: a mangled remote proof is rejected and the tree
+    // is left unchanged (node stays missing) — ports "atomically updates storage".
+    #[test]
+    fn recovery_rejects_tampered_proof_atomically() {
+        let (healthy, _) = tree(64); // single root 63
+        let root_hash = healthy.root_hash();
+        let target = 15u64; // interior node: its proof carries siblings [47, 95]
+        let proof = healthy.node_proof(target).unwrap();
+        assert!(!proof.siblings.is_empty(), "interior node needs siblings");
+
+        let assert_untouched = |c: &MerkleTree| {
+            assert!(!c.has_node(target), "tampered recovery must not store the node");
+            assert!(!c.is_intact(), "still in repair mode");
+        };
+
+        // mangled node size (upstream mangles the proven node's size)
+        let mut bad = proof.clone();
+        bad.node.size += 1;
+        let mut corrupt = healthy.clone();
+        corrupt.remove_node(target);
+        assert!(!corrupt.recover_node(&bad, &root_hash), "mangled size rejected");
+        assert_untouched(&corrupt);
+
+        // mangled node hash
+        let mut bad = proof.clone();
+        bad.node.hash[0] ^= 0xff;
+        let mut corrupt = healthy.clone();
+        corrupt.remove_node(target);
+        assert!(!corrupt.recover_node(&bad, &root_hash), "mangled hash rejected");
+        assert_untouched(&corrupt);
+
+        // tampered sibling
+        let mut bad = proof.clone();
+        bad.siblings[0].hash[0] ^= 0xff;
+        let mut corrupt = healthy.clone();
+        corrupt.remove_node(target);
+        assert!(!corrupt.recover_node(&bad, &root_hash), "tampered sibling rejected");
+        assert_untouched(&corrupt);
+
+        // dropped sibling -> climb cannot reach a real root
+        let mut bad = proof.clone();
+        bad.siblings.pop();
+        let mut corrupt = healthy.clone();
+        corrupt.remove_node(target);
+        assert!(!corrupt.recover_node(&bad, &root_hash), "dropped sibling rejected");
+        assert_untouched(&corrupt);
+
+        // honest proof, wrong expected root
+        let mut wrong = root_hash;
+        wrong[0] ^= 0xff;
+        let mut corrupt = healthy.clone();
+        corrupt.remove_node(target);
+        assert!(!corrupt.recover_node(&proof, &wrong), "wrong expected root rejected");
+        assert_untouched(&corrupt);
+
+        // finally, the honest proof recovers cleanly after the failed attempts
+        assert!(corrupt.recover_node(&proof, &root_hash));
+        assert!(corrupt.is_intact());
+    }
+
+    // recovery: appends are refused while in repair mode, and resume after the
+    // missing node is recovered — ports "fail appends … when in repair mode".
+    #[test]
+    fn recovery_append_refused_in_repair_mode() {
+        let (mut t, _) = tree(30);
+        let root_hash = t.root_hash();
+        let root_index = t.roots()[0].index;
+        let proof = t.node_proof(root_index).unwrap(); // capture while healthy
+
+        assert!(t.remove_node(root_index));
+        assert!(!t.is_intact());
+        assert_eq!(t.try_append(b"nope"), Err(InRepairMode), "cannot extend in repair mode");
+        assert_eq!(t.len(), 30, "the refused append did not change the length");
+
+        // Recover, then appending works again and the tree grows.
+        assert!(t.recover_node(&proof, &root_hash));
+        assert!(t.is_intact());
+        assert_eq!(t.try_append(b"now ok").expect("append after recovery"), 30);
+        assert_eq!(t.len(), 31);
+    }
+
+    // recovery round-trip: every stored node (leaf, interior, root) over a range
+    // of tree sizes proves & verifies against the signed root, and recovers a copy
+    // that had exactly that node deleted back to intact.
+    #[test]
+    fn node_proof_roundtrip_all_nodes() {
+        for n in 1..=16u64 {
+            let (t, _) = tree(n as usize);
+            let root = t.root_hash();
+            for i in 0..(2 * n) {
+                let (_, end) = flat::block_range(i);
+                if end > n {
+                    continue; // not a complete subtree of this tree
+                }
+                let proof = t.node_proof(i).expect("every stored node is provable");
+                assert_eq!(proof.verify(&root), Some(proof.node), "node proof must verify (n={n}, i={i})");
+
+                let mut corrupt = t.clone();
+                assert!(corrupt.remove_node(i), "node {i} was present");
+                assert!(!corrupt.is_intact(), "deleting node {i} => repair mode (n={n})");
+                assert!(corrupt.recover_node(&proof, &root), "honest proof recovers node {i} (n={n})");
+                assert!(corrupt.is_intact(), "recovered tree intact (n={n}, i={i})");
+            }
         }
     }
 }

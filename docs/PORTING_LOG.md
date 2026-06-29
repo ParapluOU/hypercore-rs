@@ -614,3 +614,62 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then the wasm runtime / IndexedDB gate (#2); merkle **recovery/reorg** (`merkle-tree-recovery.js`) +
   `upgrade.additionalNodes`; `autobase` `topolist.js` ordering; and the view/apply layer
   (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 16: `merkle` node recovery (`merkle-tree-recovery.js`)
+
+**Did**
+- Added **tree-node recovery + repair mode** to `crates/merkle` — the L1 behaviour behind upstream
+  `merkle-tree-recovery.js` (networking/storage/sessions stripped): a tree whose stored nodes are the
+  source of truth can lose one and securely recover it from a peer that holds only the signed root.
+  - `remove_node(index)` (corruption injector, the analogue of upstream `deleteTreeNode`) +
+    `has_node`; `missing_nodes()`/`is_intact()` derive **repair mode** (every node implied by the
+    length — `block_range(i).end <= len` — must be present); `try_roots()`/`try_root_hash()` are the
+    panic-free counterparts that return `None` over a gap; `try_append` **refuses while in repair
+    mode** (extending a corrupt tree could bake in an inconsistent root).
+  - `node_proof(index) -> Option<NodeProof>` (analogue of `generateRemoteProofForTreeNode`) — an
+    authenticated proof of **any** tree node (leaf / interior / root), not just a leaf-from-data:
+    the node + its sibling path to the containing root + all roots. `NodeProof::verify(expected_root)
+    -> Option<Node>` climbs the node to its root via `parent_hash` (binds hash **and** size),
+    substitutes the recomputed root, checks `tree_hash == expected_root`, and returns the
+    authenticated node. `recover_node(&proof, expected_root)` is **atomic**: verify first, store only
+    on success, leave the tree untouched on any tamper.
+- 6 asserting tests (merkle 24→30): a corrupt tree (all roots deleted) still reports its length and
+  refuses a root hash ("can still ready" / "still has length"); a deleted **root** recovers from a
+  remote proof and `try_root_hash` is restored exactly ("fix via fully remote proof"); a deleted
+  **interior sub-root** recovers (root hash unaffected by the gap; node provable again, equal to the
+  original) ("fix … sub root"); **atomicity** — mangled size / mangled hash / tampered sibling /
+  dropped sibling / wrong expected-root each rejected with the node left missing, then the honest
+  proof recovers cleanly ("atomically updates storage"); appends **refused in repair mode** and
+  resume after recovery ("fail appends … when in repair mode"); and a round-trip over every stored
+  node of sizes 1..=16 (prove → delete a copy → recover → intact). `just verify` green (82 native
+  tests + wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0023: node recovery is **storage robustness + a standalone, data-free `NodeProof`** verified
+  against the trusted signed root (the arbitrary-node generalization of `Proof`), plus a derived
+  repair-mode that refuses appends — not upstream's replication-driven repair (`_repairMode`,
+  `recoverTreeNodeFromPeers`, `repairing`/`repaired`/`repair-failed` events, range-request auto-repair).
+  Those are networking/sessions (out of scope; return with Iroh). `merkle-tree-recovery.js` moves
+  `[ ]`→`[~]`. We still **defer** reorg/`additionalNodes` (`merkle-tree-recovery.js`'s sibling concern
+  remains, plus `merkle-tree.js`'s `additionalNodes`).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Tree-node recovery is just an inclusion proof that **starts from an arbitrary node** (not a leaf
+  recomputed from data): authenticate the node by climbing it to the trusted signed root and require
+  `tree_hash == expected_root`, then it is safe to store. "Repair mode" is derivable, not a flag — a
+  node is implied by the length iff its whole block range is within `[0, len)`, so the missing set
+  (and the append guard) fall out of the length. Recovery must be **verify-then-store** so a mangled
+  proof leaves storage untouched (atomic). The corrupt *source* cannot prove the node it lost
+  (`node_proof` needs the node present) — proofs flow from a healthy holder to the gap.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not started — needs an XPC service outside the loop's allowlist — and the image
+  pull needs network; see iters 11–15). When a container runtime is *started*, build `tools/oracle/`
+  driving the reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg/`additionalNodes` (the last
+  `merkle-tree.js`/`merkle-tree-recovery.js` pieces); `autobase` `topolist.js` ordering; and the
+  view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.

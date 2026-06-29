@@ -297,3 +297,34 @@ seek node), and reorg/recovery — `merkle-tree.js` stays `[~]`, `merkle-tree-re
 on the same hash/size binding (`parent_hash` over child sizes, `tree_hash` over root sizes) the scheme already
 assumes, plus the disjoint-contiguous-interval argument: exactly one block's authenticated byte interval brackets
 `bytes`, so a prover cannot pass off a different block.
+
+## ADR-0023 — Node recovery is storage robustness + a data-free `NodeProof`, not replication-driven repair
+**Context:** Upstream hypercore (`reference/js/hypercore/test/merkle-tree-recovery.js`) handles a tree with
+**deleted tree nodes** (e.g. a root or sub-root removed from disk): the core still `ready()`s and keeps its
+`length`, enters `_repairMode` (refusing appends/truncates: "Cannot commit while repair mode is on"), and the
+missing node is restored either from a **fully-remote proof** (`generateRemoteProofForTreeNode` →
+`recoverFromRemoteProof`) or by **replication** (a range request that auto-includes the roots, peer requests,
+`repairing`/`repaired`/`repair-failed` events). A mangled proof must fail and leave storage untouched
+("atomically updates storage"). The replication machinery (swarm, peer streams, the repair events,
+range-request auto-repair) is networking/sessions — out of scope per the relevance filter.
+**Decision:** Reimplement the **L1 behaviour-under-test** as storage robustness + a standalone, data-free
+proof, with no networking and no events:
+- The tree's nodes are the source of truth (our `BTreeMap`). `remove_node(index)` is the corruption injector
+  (analogue of `deleteTreeNode`); `missing_nodes()`/`is_intact()` **derive repair mode** from the length — a
+  node at `index` is implied iff its whole block range is within `[0, len)` — so no stale flag is needed.
+  `try_roots()`/`try_root_hash()` are panic-free over a gap (return `None`), and `try_append` refuses while
+  not intact (extending a corrupt tree could bake an inconsistent root into the log).
+- `NodeProof { node, siblings, roots }` (from `node_proof(index)`, the `generateRemoteProofForTreeNode`
+  analogue) authenticates an **arbitrary** tree node — leaf, interior, or root — by climbing it to its
+  containing root via `parent_hash` (binding hash **and** size), substituting the recomputed root, and
+  requiring `tree_hash(roots) == expected_root` (the trusted signed head); it returns the authenticated
+  `Node`. It is the arbitrary-node generalization of `Proof` (which always starts from a leaf recomputed
+  from block data). `recover_node(&proof, expected_root)` is **verify-then-store**: a tamper (mangled
+  node/sibling, dropped sibling, wrong root) is rejected and the tree is left **unchanged** (atomic).
+**Consequence:** Local recovery from a remote proof + repair-mode robustness are ported and host-safe under
+`just verify`. `merkle-tree-recovery.js` moves `[ ]`→`[~]`. We **defer** the replication-driven repair
+(range-request auto-repair, peer requests, the `repairing`/`repaired`/`repair-failed` events) — it returns
+with networking (ADR-0003) — and still defer reorg/`additionalNodes`. Soundness rests on the same leaf/parent
+collision-resistance the scheme already assumes (a peer cannot foist a wrong node without colliding the
+trusted root). A corrupt *source* cannot prove the node it lost (`node_proof` needs the node present), so
+proofs necessarily flow from a healthy holder to the gap.

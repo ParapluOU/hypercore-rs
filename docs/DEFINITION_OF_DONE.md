@@ -52,8 +52,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       depth-climb, off-path-only boundary nodes, ADR-0017) + **length-extension `upgrade` proofs**
       (data-free consistency / anti-fork-across-lengths, ADR-0020) + **byte-offset seek** (tree-accelerated
       `seek` == linear scan + standalone data-free `SeekProof` locating byte→block against the signed root,
-      ADR-0022); upstream `additionalNodes`/seek-`padding`/reorg tracked separately on
-      `merkle-tree.js`/`merkle-tree-recovery.js`
+      ADR-0022) + **node recovery** (repair mode + data-free `NodeProof` authenticating any tree node against
+      the signed root + atomic `recover_node`, ADR-0023); upstream `additionalNodes`/seek-`padding`/reorg +
+      replication-driven repair tracked separately on `merkle-tree.js`/`merkle-tree-recovery.js`
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend
