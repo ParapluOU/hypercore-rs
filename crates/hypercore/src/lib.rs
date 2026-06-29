@@ -774,6 +774,102 @@ mod tests {
         assert_eq!(rep.len(), 2);
     }
 
+    #[test]
+    fn add_block_binds_proof_to_the_specific_head() {
+        // An inclusion proof is bound to the root of the head it was generated
+        // against: it carries that tree's root nodes. An honest block+proof from
+        // one head, presented under a *different* head **from the same author**
+        // (a fork at the same length, or a longer honest head — both validly
+        // signed), must be rejected — the proof can't fold to the other head's
+        // root — and nothing is stored. Positive-path replica tests never
+        // exercise this; the audit (after iter 21) flagged the gap.
+        let core_a = core_with(70, &["a", "b", "c", "d", "e"]); // root R_a
+        let core_f = core_with(70, &["a", "b", "c", "d", "X"]); // root R_f (block 4 differs)
+        let pk = core_a.public_key();
+        assert_eq!(pk, core_f.public_key(), "same seed => same author");
+        let head_a = core_a.head().unwrap().clone();
+        let head_f = core_f.head().unwrap().clone();
+        assert_eq!(head_a.length, head_f.length);
+        assert_ne!(head_a.root, head_f.root, "same length, different root => the binding matters");
+
+        let enc0 = core_a.block(0).unwrap().unwrap();
+        let proof0_a = core_a.proof(0).unwrap();
+        assert_eq!(enc0, core_f.block(0).unwrap().unwrap(), "block 0 ('a') is shared");
+
+        // Positive control: under its own head, block 0 is accepted.
+        {
+            let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+            assert!(rep.add_block(&head_a, 0, &enc0, &proof0_a).unwrap(), "honest block accepted");
+        }
+
+        // Same-length cross-head: the honest block+proof bound to head_a is
+        // refused under the forked head_f (proof0_a carries head_a's other root,
+        // block 4 = 'e', which can't fold to head_f.root built from 'X').
+        {
+            let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+            assert!(
+                !rep.add_block(&head_f, 0, &enc0, &proof0_a).unwrap(),
+                "proof bound to head_a rejected under the forked head_f"
+            );
+            assert_eq!(rep.len(), 0, "nothing stored on a cross-head rejection");
+            assert!(rep.verified_head().is_none());
+        }
+
+        // Different-length cross-head, both directions: a length-5 proof is
+        // refused under a longer honest head, and a length-7 proof under the
+        // shorter head — the root structure differs either way.
+        let core_long = core_with(70, &["a", "b", "c", "d", "e", "f", "g"]); // length 7
+        let head_long = core_long.head().unwrap().clone();
+        assert_ne!(head_a.root, head_long.root);
+        let proof0_long = core_long.proof(0).unwrap();
+        {
+            let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+            assert!(
+                !rep.add_block(&head_long, 0, &enc0, &proof0_a).unwrap(),
+                "length-5 proof rejected under the length-7 head"
+            );
+            assert_eq!(rep.len(), 0);
+            assert!(
+                !rep.add_block(&head_a, 0, &enc0, &proof0_long).unwrap(),
+                "length-7 proof rejected under the length-5 head"
+            );
+            assert_eq!(rep.len(), 0);
+        }
+    }
+
+    #[test]
+    fn add_block_rejects_wrong_author() {
+        // A replica keyed to author A must reject a fully-valid, internally-honest
+        // log signed by a *different* author B: A's key never signed B's head, so
+        // the head-signature check in `verify_block` fails and no block is stored —
+        // even though B's own proofs verify under B's key. (Negative-path gap, audit
+        // follow-up after iter 21.)
+        let a_pub = author(71).public();
+        let b_core = core_with(72, &["a", "b", "c"]); // a DIFFERENT author (seed 72)
+        assert_ne!(a_pub, b_core.public_key(), "distinct authors");
+        let b_head = b_core.head().unwrap().clone();
+
+        // Sanity: B's log is internally honest — every block verifies under B's key.
+        for i in 0..3u64 {
+            let enc = b_core.block(i).unwrap().unwrap();
+            let proof = b_core.proof(i).unwrap();
+            assert!(verify_block(&b_core.public_key(), &b_head, i, &enc, &proof), "honest under B");
+            // ...but NOT under A's key (the head signature is B's).
+            assert!(!verify_block(&a_pub, &b_head, i, &enc, &proof), "not honest under A");
+        }
+
+        // A replica keyed to A refuses B's first block and stores nothing.
+        let mut rep = Replica::<Vec<u8>, _, _>::new(a_pub, Bytes, MemoryStore::new());
+        let enc0 = b_core.block(0).unwrap().unwrap();
+        let proof0 = b_core.proof(0).unwrap();
+        assert!(
+            !rep.add_block(&b_head, 0, &enc0, &proof0).unwrap(),
+            "block from another author refused"
+        );
+        assert_eq!(rep.len(), 0, "nothing stored");
+        assert!(rep.verified_head().is_none());
+    }
+
     // ---- verified length-extension replication (merkle upgrade proof, ADR-0020) ----
 
     #[test]

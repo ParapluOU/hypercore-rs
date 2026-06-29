@@ -98,8 +98,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 ### Audit follow-ups (after iteration 21; see ADR-0029)
 - [x] `merkle` `SeekProof::verify` rejects non-leaf targets (P0 soundness) + `Proof`/`SeekProof`
       sibling-index guards (P1) — `seek_rejects_non_leaf_target`, `proof_rejects_falsified_sibling_index`
-- [ ] `hypercore`: replica rejects a block proven under a *different* same-author head (cross-head root
-      binding) and under a wrong author key (negative-path gaps)
+- [x] `hypercore`: replica rejects a block proven under a *different* same-author head (cross-head root
+      binding) and under a wrong author key (negative-path gaps) —
+      `add_block_binds_proof_to_the_specific_head` (a proof bound to one head's root is refused under a
+      same-author fork head *and* a longer honest head, both directions; nothing stored),
+      `add_block_rejects_wrong_author` (a replica keyed to A refuses an internally-honest log signed by B)
 - [ ] `hypercore`: atomic append — first/last-block fault injection + `delete`-failure handling (only a
       mid-batch `put` fault is currently exercised)
 - [ ] `hypercore`: `verify_reorg` head-`None` branch (untested)

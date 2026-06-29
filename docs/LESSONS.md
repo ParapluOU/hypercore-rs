@@ -248,3 +248,14 @@ personal data** (this repo is public; use repo-relative paths).
   did not. Rule: when a verifier trusts a prover-supplied index, guard it structurally. Every seek test
   used honest (even-index) proofs, so the hole was invisible to "green" — **write the *forged* proof,
   not just the honest one.**
+- **An inclusion proof binds a block to *one specific head's root*, so the replica's cross-head
+  rejection is invisible to positive-path tests** (audit follow-up). `Replica::add_block` checks the
+  head signature under its *own* configured key and `proof.verify(data, &head.root)` — but a clean
+  replicate→verify test always passes a block under the head it was generated against, so neither the
+  root-binding branch nor the wrong-author branch is ever exercised. To pin them, present an *honest*
+  proof under a **different same-author head**: a fork at the **same length** is the purest (only the
+  root differs, so the proof's other root node can't fold to it), and a **longer honest head** catches
+  the different-length case (test both directions). Separately, a replica keyed to A must refuse a
+  wholly-valid log signed by B — that is the head-signature gate, not the proof. Assert nothing is
+  stored on each rejection, and keep `index == replica.len()` so the in-order guard passes and the test
+  actually reaches the binding branch (not a trivial ordering reject).

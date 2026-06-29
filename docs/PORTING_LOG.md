@@ -1014,3 +1014,54 @@ Repo-relative paths only — no private or personal data (this repo is public).
 **Next**
 - The queued audit follow-ups, then resume feature iterations (the gate-#4 JS oracle when a container
   runtime is available; wasm/IndexedDB gate; deferred fork/merge consensus; `hyperbee`).
+
+---
+
+## 2026-06-29 — Iteration 22: `hypercore` replica negative-path binding (audit follow-up)
+
+**Did**
+- Closed the next **audit follow-up** (DEFINITION_OF_DONE, after iter 21): the `Replica::add_block`
+  negative paths that the positive-path replica tests never exercised — **cross-head root binding**
+  and **wrong author key**. The behaviour already holds (`verify_block` checks the head signature
+  under `self.public` and `proof.verify(data, &head.root)`); this iteration writes the *forged* proof
+  that pins it (ADR-0029's lesson). 2 asserting tests (hypercore 30→32):
+  - `add_block_binds_proof_to_the_specific_head` — an inclusion proof carries the root nodes of the
+    head it was generated against, so an honest block+proof bound to one head is **rejected under a
+    different same-author head**: (a) a **fork at the same length** (`[a,b,c,d,e]` vs `[a,b,c,d,X]`,
+    same author, equal length, different root) — block 0's proof under head_a is refused under head_f
+    because the proof's other root (block 4 = 'e') can't fold to head_f's root (built from 'X'); and
+    (b) a **longer honest head** (length 7), both directions (length-5 proof under the length-7 head
+    and vice versa). Each rejection stores nothing (`len() == 0`, `verified_head().is_none()`), with a
+    positive control that the proof *is* accepted under its own head. Each cross-head case has
+    `index == replica.len() == 0`, so the in-order guard passes and the test genuinely reaches the
+    `verify_block` root-binding branch.
+  - `add_block_rejects_wrong_author` — a replica keyed to author **A** refuses an internally-honest
+    log signed by author **B**: B's blocks verify under B's key but *not* under A's (sanity-asserted
+    both ways), and `add_block` against A's replica stores nothing. The head-signature check, not the
+    proof, is the gate here.
+- `just verify` green: **108 native tests** (autobase 22 across files + codec 8 + hypercore 32 +
+  identity 4 + merkle 40 + storage 2) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions**
+- **No new ADR** — no divergence from upstream: this is a test-only iteration closing a negative-path
+  *coverage* gap on already-decided behaviour (the proof→head root binding and the replica's
+  author-key gate). The governing decision is ADR-0029 (a verifier binds structural position / the
+  exact head, and the test must *forge* the proof, not just present the honest one). No source change.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- An inclusion proof binds a block to *one specific head's root* (it carries that tree's root nodes),
+  so the replica's cross-head rejection is only visible if you present an honest proof under a
+  *different same-author head* — a fork at the same length (purest: only the root differs) or a longer
+  honest head (both directions). And a replica keyed to A must refuse a wholly-valid log from B (the
+  head-signature gate, not the proof). Positive-path replication tests pass straight through both
+  branches; write the forged/mismatched proof to exercise them, and assert nothing is stored.
+
+**Next**
+- The remaining **audit follow-ups** (DEFINITION_OF_DONE), in order: `hypercore` atomic append —
+  first/last-block fault injection + `delete`-failure handling (only a mid-batch `put` fault is
+  exercised today); `hypercore` `verify_reorg` head-`None` branch; `merkle` reorg / LCA adversarial
+  (corrupt `other`, gapped `self`, monotonicity-precondition violation; seek zero-size block);
+  `autobase` quorum-degree *value* cross-checked against an independent computation over random DAGs.
+- Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
+  startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
+  IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.
