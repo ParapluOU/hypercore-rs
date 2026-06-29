@@ -20,7 +20,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `core.js` | [ ] | `hypercore` core behaviour |
 | `batch.js` | [ ] | `hypercore` batch append |
 | `atomic.js` | [ ] | `hypercore` atomic append |
-| `merkle-tree.js` | [ ] | `merkle` |
+| `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper ported; seeks/reorg/upgrade later) |
 | `merkle-tree-recovery.js` | [ ] | `merkle` recovery |
 | `encodings.js` | [ ] | `codec` |
 | `conflicts.js` | [ ] | `hypercore`/`merkle` fork detection |

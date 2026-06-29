@@ -48,7 +48,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 ## Checklist (high level)
 
 - [x] Workspace scaffold (no data types)
-- [ ] `merkle` — tree + proofs + tamper-rejection
+- [~] `merkle` — tree + inclusion proofs + tamper-rejection (range proofs pending)
 - [ ] `codec` — round-trip + versioned/tolerant decode
 - [ ] `identity` — sign/verify + forgery-rejection
 - [ ] `storage` — trait + in-memory backend
