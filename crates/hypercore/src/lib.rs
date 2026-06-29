@@ -1163,12 +1163,13 @@ mod tests {
         assert_eq!(core.head().unwrap(), &head_before);
     }
 
-    /// A store that injects a failure on the `put` at a chosen key, to prove
-    /// commit atomicity. Otherwise an in-memory map.
+    /// A store that injects a failure on the `put` (and optionally the `delete`)
+    /// at a chosen key, to prove commit atomicity. Otherwise an in-memory map.
     #[derive(Default)]
     struct FaultyStore {
         inner: MemoryStore,
         fail_at: Option<u64>,
+        fail_delete_at: Option<u64>,
     }
     impl Store for FaultyStore {
         type Error = &'static str;
@@ -1183,12 +1184,26 @@ mod tests {
             Ok(self.inner.get(key).unwrap())
         }
         fn delete(&mut self, key: u64) -> Result<(), &'static str> {
+            if self.fail_delete_at == Some(key) {
+                return Err("injected delete failure");
+            }
             self.inner.delete(key).unwrap();
             Ok(())
         }
         fn len(&self) -> Result<u64, &'static str> {
             Ok(self.inner.len().unwrap())
         }
+    }
+
+    /// The signed head of a freshly-built log of `blocks` under author `seed` —
+    /// the canonical state a fault-then-recover commit path must land on
+    /// (ed25519 is deterministic, so head equality is exact).
+    fn head_of(seed: u8, blocks: &[&str]) -> SignedHead {
+        let mut c = Hypercore::<Vec<u8>, _, _>::new(author(seed), Bytes, MemoryStore::new());
+        for b in blocks {
+            c.append(&blk(b)).unwrap();
+        }
+        c.head().unwrap().clone()
     }
 
     #[test]
@@ -1225,6 +1240,134 @@ mod tests {
         }
         assert_eq!(core.commit(b2).unwrap(), Some(6));
         assert_eq!(core.get(5).unwrap(), Some(blk("f")));
+    }
+
+    #[test]
+    fn commit_fault_on_first_staged_block_is_atomic() {
+        // Fault on the *first* staged block (index 3 of a 3-block batch): the
+        // commit aborts before any write succeeds, so there is nothing to roll
+        // back — storage is left pristine, not just logically unchanged.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(50), Bytes, FaultyStore::default());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let head_before = core.head().unwrap().clone();
+        core.store.fail_at = Some(3); // the first staged index
+
+        let mut b = core.batch(); // base = 3, blocks at 3,4,5
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b, &blk(s));
+        }
+        assert_eq!(core.commit(b), Err(Error::Storage("injected put failure")));
+
+        // Nothing was written, nothing to roll back: logical state and storage
+        // are both exactly as before the batch.
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.head().unwrap(), &head_before);
+        assert_eq!(core.get(3).unwrap(), None);
+        assert_eq!(core.store.get(3).unwrap(), None, "no partial write at all");
+        assert_eq!(core.store.len().unwrap(), 3, "storage untouched");
+
+        // Recovery lands on the canonical six-block head (byte-identical).
+        core.store.fail_at = None;
+        let mut b2 = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b2, &blk(s));
+        }
+        assert_eq!(core.commit(b2).unwrap(), Some(6));
+        assert_eq!(core.get(5).unwrap(), Some(blk("f")));
+        assert_eq!(core.head().unwrap(), &head_of(50, &["a", "b", "c", "d", "e", "f"]));
+    }
+
+    #[test]
+    fn commit_fault_on_last_staged_block_rolls_back_all() {
+        // Fault on the *last* staged block (index 5): the two earlier successful
+        // writes (3, 4) must both be rolled back, leaving no orphans.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(51), Bytes, FaultyStore::default());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let head_before = core.head().unwrap().clone();
+        core.store.fail_at = Some(5); // the last staged index
+
+        let mut b = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b, &blk(s));
+        }
+        assert_eq!(core.commit(b), Err(Error::Storage("injected put failure")));
+
+        // Both successful partial writes (3, 4) were rolled back.
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.head().unwrap(), &head_before);
+        assert_eq!(core.get(3).unwrap(), None);
+        assert_eq!(core.store.get(3).unwrap(), None, "first partial write rolled back");
+        assert_eq!(core.store.get(4).unwrap(), None, "second partial write rolled back");
+        assert_eq!(core.store.len().unwrap(), 3, "no orphan blocks left behind");
+
+        // Recovery lands on the canonical six-block head (byte-identical).
+        core.store.fail_at = None;
+        let mut b2 = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b2, &blk(s));
+        }
+        assert_eq!(core.commit(b2).unwrap(), Some(6));
+        assert_eq!(core.get(5).unwrap(), Some(blk("f")));
+        assert_eq!(core.head().unwrap(), &head_of(51, &["a", "b", "c", "d", "e", "f"]));
+    }
+
+    #[test]
+    fn commit_rollback_tolerates_delete_failure() {
+        // Fault the last `put` (index 5) *and* the rollback `delete` of the first
+        // written block (index 3). The rollback's delete error is swallowed
+        // (`let _ = store.delete(..)`), so the commit still reports the original
+        // *put* failure — and, critically, the log's *logical* state never advances
+        // even though one orphan block is physically left behind. A later commit
+        // overwrites it.
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(52), Bytes, FaultyStore::default());
+        for s in ["a", "b", "c"] {
+            core.append(&blk(s)).unwrap();
+        }
+        let head_before = core.head().unwrap().clone();
+        core.store.fail_at = Some(5); // last staged put fails
+        core.store.fail_delete_at = Some(3); // rollback of index 3 also fails
+
+        let mut b = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b, &blk(s));
+        }
+        // The *put* error surfaces, not the secondary delete error.
+        assert_eq!(core.commit(b), Err(Error::Storage("injected put failure")));
+
+        // Logical state is still atomic: length, head, and reads are untouched.
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.head().unwrap(), &head_before);
+        assert_eq!(core.get(3).unwrap(), None);
+
+        // Physical reality: index 4's rollback succeeded, but index 3's delete
+        // failed, so exactly one unreachable orphan remains — the *encoded* block
+        // (codec adds a varint length prefix), never exposed by the length-gated
+        // read API.
+        assert_eq!(
+            core.store.get(3).unwrap(),
+            Some(Bytes.encode(&blk("d"))),
+            "orphan survives the failed delete"
+        );
+        assert_eq!(core.store.get(4).unwrap(), None, "index 4 rolled back cleanly");
+        assert_eq!(core.store.len().unwrap(), 4, "exactly one orphan left behind");
+
+        // Recovery: clear both faults; the commit overwrites the orphan and lands
+        // byte-identically on the canonical six-block head — no stray keys remain.
+        core.store.fail_at = None;
+        core.store.fail_delete_at = None;
+        let mut b2 = core.batch();
+        for s in ["d", "e", "f"] {
+            core.stage(&mut b2, &blk(s));
+        }
+        assert_eq!(core.commit(b2).unwrap(), Some(6));
+        assert_eq!(core.get(3).unwrap(), Some(blk("d")));
+        assert_eq!(core.get(5).unwrap(), Some(blk("f")));
+        assert_eq!(core.head().unwrap(), &head_of(52, &["a", "b", "c", "d", "e", "f"]));
+        assert_eq!(core.store.len().unwrap(), 6, "orphan overwritten; no stray keys");
     }
 
     // ---- fork detection (upstream `conflicts.js`, L1) ----

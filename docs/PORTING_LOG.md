@@ -1065,3 +1065,63 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
   startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
   IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.
+
+---
+
+## 2026-06-29 — Iteration 23: `hypercore` atomic-commit fault coverage (audit follow-up)
+
+**Did**
+- Closed the next **audit follow-up** (DEFINITION_OF_DONE, after iter 21): the `Hypercore::commit`
+  atomicity paths the single iter-11 test (`failed_commit_is_atomic`) never exercised — a fault on
+  the **first** vs the **last** staged block, and a **`delete` failure during rollback**. The
+  behaviour already holds (writes-first / mutate-tree+head-last / roll back on any `put` error,
+  ADR-0018); this iteration is test-only — it pins the boundary and the swallowed-rollback-delete
+  branch. Extended the test-only `FaultyStore` with a `fail_delete_at` injector and added a `head_of`
+  helper (the canonical fresh-prefix head a recover path must land on; ed25519 is deterministic so
+  head equality is exact). 3 asserting tests (hypercore 32→35):
+  - `commit_fault_on_first_staged_block_is_atomic` — `put` fails at the first staged index, so the
+    commit aborts before any write succeeds: `written` is empty, there is nothing to roll back, and
+    storage is left **pristine** (len 3, no key at 3), not merely logically unchanged. The `for w in
+    &written` rollback loop is correctly a no-op.
+  - `commit_fault_on_last_staged_block_rolls_back_all` — `put` fails at the last staged index, so both
+    earlier successful writes (3, 4) are deleted: storage is back to len 3 with **no orphans**, head
+    and reads untouched.
+  - `commit_rollback_tolerates_delete_failure` — `put` fails at the last index **and** the rollback
+    `delete` of index 3 also fails. The commit still returns the original *`put`* error (the secondary
+    delete error is swallowed by `let _ = store.delete(..)`), and the log's **logical** state stays
+    atomic (len 3, head unchanged, `get(3) == None`) even though one **unreachable orphan** — the
+    *encoded* block `[1, b'd']` (codec varint length prefix) — physically survives at storage index 3
+    (`store.len() == 4`). A later fault-free commit overwrites the orphan and lands byte-identically on
+    the canonical six-block head with no stray keys (`store.len() == 6`).
+  Each test asserts the recovered head equals `head_of(seed, ["a".."f"])`, so the whole
+  fault→rollback→recover path provably lands on the canonical state.
+- `just verify` green: **111 native tests** (autobase 22 across files + codec 8 + hypercore 35 +
+  identity 4 + merkle 40 + storage 2) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions**
+- **No new ADR** — no divergence from upstream: a test-only iteration closing a negative-path
+  *coverage* gap on already-decided behaviour (ADR-0018's all-or-nothing commit). The governing
+  decision is unchanged; no source change beyond the test-only `FaultyStore` injector. The design
+  point the delete-failure test documents — a swallowed rollback `delete` reports the *root-cause*
+  `put` error and preserves *logical* atomicity while leaving an unreachable, later-overwritten orphan
+  — is the same "physical reclamation is a separate concern; logical state is the invariant" stance as
+  ADR-0024's truncate (no eager block deletion).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Atomic-commit fault coverage needs the **boundaries and the rollback's own failure**, not just one
+  mid-batch fault: a first-block fault leaves `written` empty (the rollback loop must no-op), a
+  last-block fault must delete *all* prior writes, and a `delete` that itself fails must still report
+  the original `put` error and keep *logical* state atomic — physical cleanup is best-effort, so an
+  unreachable orphan (the *encoded* block, length-gated out of reads) can remain and is overwritten on
+  the next commit. Assert the recovered head equals a freshly-built prefix head (ed25519 determinism)
+  to prove the path lands on the canonical state; assert against the **encoded** orphan bytes, not the
+  raw payload (the codec adds a varint length prefix).
+
+**Next**
+- The remaining **audit follow-ups** (DEFINITION_OF_DONE), in order: `hypercore` `verify_reorg`
+  head-`None` branch (untested); `merkle` reorg / LCA adversarial (corrupt `other`, gapped `self`,
+  monotonicity-precondition violation; seek zero-size block); `autobase` quorum-degree *value*
+  cross-checked against an independent computation over random DAGs.
+- Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
+  startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
+  IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.

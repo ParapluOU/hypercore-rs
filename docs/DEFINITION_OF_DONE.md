@@ -103,8 +103,12 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `add_block_binds_proof_to_the_specific_head` (a proof bound to one head's root is refused under a
       same-author fork head *and* a longer honest head, both directions; nothing stored),
       `add_block_rejects_wrong_author` (a replica keyed to A refuses an internally-honest log signed by B)
-- [ ] `hypercore`: atomic append — first/last-block fault injection + `delete`-failure handling (only a
-      mid-batch `put` fault is currently exercised)
+- [x] `hypercore`: atomic append — first/last-block fault injection + `delete`-failure handling
+      (`commit_fault_on_first_staged_block_is_atomic` — abort before any write, storage pristine;
+      `commit_fault_on_last_staged_block_rolls_back_all` — both earlier writes rolled back, no orphans;
+      `commit_rollback_tolerates_delete_failure` — a swallowed rollback `delete` still surfaces the
+      original `put` error and keeps logical state atomic, leaving one unreachable orphan that a later
+      commit overwrites; all three recover byte-identically to the canonical six-block head)
 - [ ] `hypercore`: `verify_reorg` head-`None` branch (untested)
 - [ ] `merkle`: reorg / `lowest_common_ancestor` adversarial — corrupt `other`, gapped `self`,
       monotonicity-precondition violation; seek zero-size block

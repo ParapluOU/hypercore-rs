@@ -248,6 +248,20 @@ personal data** (this repo is public; use repo-relative paths).
   did not. Rule: when a verifier trusts a prover-supplied index, guard it structurally. Every seek test
   used honest (even-index) proofs, so the hole was invisible to "green" — **write the *forged* proof,
   not just the honest one.**
+- **Atomic-commit fault coverage needs the *boundaries* and the rollback's *own* failure, not one
+  mid-batch fault** (audit follow-up). A single "fault the 2nd of 3 blocks" test leaves three branches
+  unexercised: (1) a **first-block** fault aborts before any write, so the rollback list is empty and
+  the `for w in &written` loop must correctly no-op (storage stays *pristine*, not just logically
+  unchanged); (2) a **last-block** fault must roll back *all* prior writes (no orphans); (3) the
+  rollback `delete` can *itself* fail — and because it is swallowed (`let _ = store.delete(..)`), the
+  commit must still surface the **original `put`** error (the root cause, not the secondary delete
+  error) and keep the log's *logical* state atomic (length/head/reads untouched) even though one
+  **unreachable orphan** physically remains, to be overwritten by the next commit. Two test gotchas:
+  the orphan is the **codec-encoded** block (varint length prefix — assert against `codec.encode(v)`,
+  not the raw payload `v`), and asserting the recovered head equals a freshly-built prefix head
+  (ed25519 is deterministic) proves the whole fault→rollback→recover path lands on the canonical state.
+  This mirrors ADR-0024's truncate stance: physical reclamation is best-effort; the logical state is
+  the invariant.
 - **An inclusion proof binds a block to *one specific head's root*, so the replica's cross-head
   rejection is invisible to positive-path tests** (audit follow-up). `Replica::add_block` checks the
   head signature under its *own* configured key and `proof.verify(data, &head.root)` — but a clean
