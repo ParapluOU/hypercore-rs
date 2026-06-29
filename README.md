@@ -39,8 +39,8 @@ implementation entanglement.
 
 Unlike upstream — where `hypercore`, `autobase`, `hyperbee`, `corestore`, `hypercore-crypto`, etc.
 are each a **separate npm package and repo** — this is a single **Cargo workspace** of related
-crates. The shared pieces (codec, Merkle/verified storage, identity) are factored into their own
-crates instead of being copy-pasted across repos.
+crates. The shared pieces (codec, Merkle/verified storage, identity, byte storage) are factored
+into their own crates instead of being copy-pasted across repos.
 
 ```
 hypercore-rs/                  # Cargo workspace (monorepo)
@@ -51,7 +51,8 @@ hypercore-rs/                  # Cargo workspace (monorepo)
 │   ├── hyperbee/              # ordered index / materialized view (maybe — see below)
 │   ├── merkle/                # shared: BLAKE3 tree, range/inclusion proofs
 │   ├── codec/                 # shared: typed-payload <-> bytes, versioned & tolerant
-│   └── identity/              # shared: ed25519 author keys, signing/verification
+│   ├── identity/              # shared: ed25519 author keys, signing/verification
+│   └── storage/               # shared: pluggable byte storage (memory / disk / IndexedDB)
 └── reference/                 # read-only upstream sources (git submodules, study only)
     ├── rust/datrs-hypercore
     └── js/{hypercore, autobase, hyperbee}
@@ -106,6 +107,13 @@ An append-only B-tree over a hypercore: ordered keys, range queries — the mate
 layer. An application may use this directly, or subsume it into its own view/index layer. Included
 in the plan; priority TBD.
 
+### `storage` — pluggable byte storage
+
+A random-access storage abstraction for the log's bytes, with swappable backends: in-memory,
+native disk, and **browser (`localStorage` / IndexedDB)**. The browser backend is what lets the
+wasm build persist a user's hypercores locally, with no server required. Content-blind — it stores
+opaque bytes, never the typed payload.
+
 ---
 
 ## Explicitly out of scope (for now)
@@ -131,11 +139,17 @@ in the plan; priority TBD.
 2. **Content-blind ordering & verification** — the L1 layer never reads payload internals.
 3. **Signed identity** — author = ed25519 key (maps cleanly onto an Iroh `NodeId`); every entry
    signed. No forgeable plaintext agent ids.
-4. **Storage/transport-abstract** — pluggable backends, no hard network dependency, and
-   **WASM-friendly** (must build for `wasm32-unknown-unknown`).
-5. **Monorepo with shared internals** — one workspace; codec, Merkle, and identity factored out
-   rather than duplicated.
-6. **Maximally useful for Parture, not faithful to upstream.**
+4. **WASM-first** — `hypercore`, `autobase`, and the storage abstraction must compile to
+   `wasm32-unknown-unknown` and run inside a browser host app. A hard requirement, not a
+   nice-to-have.
+5. **Pluggable storage with browser backends** — a storage abstraction over the log's bytes, with
+   backends including in-memory, native disk, and **`localStorage` / IndexedDB**, so a user's
+   hypercores persist locally in the browser with no server required.
+6. **No hard network dependency** — cores build against storage/transport abstractions; the Iroh
+   layer slots in underneath later.
+7. **Monorepo with shared internals** — one workspace; codec, Merkle, identity, and storage
+   factored out rather than duplicated.
+8. **Maximally useful for Parture, not faithful to upstream.**
 
 ---
 
@@ -160,14 +174,17 @@ git submodule update --init --recursive
 
 ## Status / roadmap
 
-- [ ] Workspace scaffold (`Cargo.toml` + `crates/*`)
+- [x] Workspace scaffold (`Cargo.toml` + `crates/*`, no data types yet)
 - [ ] `codec`: versioned, tolerant typed-payload ⇄ bytes
 - [ ] `merkle`: BLAKE3 tree + range/inclusion proofs (study datrs + iroh-blobs)
 - [ ] `identity`: ed25519 author keys + entry signing/verification
+- [ ] `storage`: byte-storage abstraction + in-memory backend
+- [ ] `storage`: browser backend (`localStorage` / IndexedDB)
 - [ ] `hypercore`: typed single-writer append-only log over the above
 - [ ] `autobase`: causal DAG order + deterministic tiebreak
 - [ ] `autobase`: indexer/quorum finalization
 - [ ] `hyperbee`: ordered index (if needed)
+- [ ] verify `wasm32-unknown-unknown` build of `hypercore` + `autobase` + `storage`
 - [ ] Iroh-backed networking layer (later)
 - [ ] integrate an application op-based CRDT as the L2 consumer
 

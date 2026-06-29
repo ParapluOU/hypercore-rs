@@ -1,0 +1,11 @@
+[package]
+name = "hypercore"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+codec = { path = "../codec" }
+merkle = { path = "../merkle" }
+identity = { path = "../identity" }
+storage = { path = "../storage" }

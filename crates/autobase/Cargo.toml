@@ -1,0 +1,9 @@
+[package]
+name = "autobase"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+hypercore = { path = "../hypercore" }
+identity = { path = "../identity" }

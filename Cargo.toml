@@ -1,0 +1,20 @@
+# hypercore-rs — Cargo workspace (monorepo)
+#
+# Rust distillations of the Holepunch data structures (Hypercore / Autobase /
+# Hyperbee) as a secure, distributed, append-only log substrate. See README.md.
+#
+# Scaffold only: crates are empty (no data types yet). The intended dependency
+# edges are wired so the architecture is visible:
+#
+#   hypercore  ->  codec, merkle, identity, storage
+#   autobase   ->  hypercore, identity
+#   hyperbee   ->  hypercore
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+repository = "https://github.com/ParapluOU/hypercore-rs"
