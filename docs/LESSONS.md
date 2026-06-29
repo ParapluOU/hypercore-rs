@@ -285,3 +285,17 @@ personal data** (this repo is public; use repo-relative paths).
   wholly-valid log signed by B — that is the head-signature gate, not the proof. Assert nothing is
   stored on each rejection, and keep `index == replica.len()` so the in-order guard passes and the test
   actually reaches the binding branch (not a trivial ordering reject).
+- **The LCA binary search is sound even when corruption violates its monotonicity precondition**
+  (audit follow-up). `lowest_common_ancestor` assumes prefix agreement is monotone (true for two
+  *intact* trees), but a missing node makes `agree(a)` false where the prefix it needs is gone — which
+  can be non-monotone. It stays sound regardless because the search keeps the invariant **`agree(lo)`
+  is always true**, and `agree(a)` is true only when *both* trees produce equal prefix-root-hashes at
+  `a` (a present, collision-resistant match) — so the returned length is always a length where the two
+  trees genuinely share `[0, a)`. A gap therefore only ever **shrinks** the LCA to a real, shorter
+  ancestor; it can never over-claim. Consequences for `reorg`, which adopts `other`'s entire node set:
+  an **intact `other` heals a gapped `self`** (the full set overwrites the gap → intact, byte-identical
+  follow), but a **corrupt `other` is copied verbatim** (its gaps land in `self`), so intact-other is
+  the precondition for a clean follow — not a guard to add, just a contract to pin. And **byte seek
+  skips zero-size blocks for free**: `seek`/`seek_proof` use the same `>` comparison as a linear scan,
+  so an empty block's empty byte interval is never a seek target and an all-empty tree has no locatable
+  byte — test it explicitly, because varied-size fixtures (`(i % 5) + 1`) never hit size 0.

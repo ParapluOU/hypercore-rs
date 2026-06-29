@@ -1173,3 +1173,65 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
   startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
   IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.
+
+---
+
+## 2026-06-29 — Iteration 25: `merkle` reorg / LCA adversarial + seek zero-size (audit follow-up)
+
+**Did**
+- Closed the next **audit follow-up** (DEFINITION_OF_DONE, after iter 21): the `merkle`
+  reorg / `lowest_common_ancestor` adversarial paths (corrupt `other`, gapped `self`,
+  monotonicity-precondition violation) and `seek` over **zero-size blocks** — none exercised today
+  (`varied_tree` sizes are always `1..=5`; the LCA/reorg tests all use intact trees). I audited the
+  code first and found **no bug**: the LCA binary search is sound under corruption (its invariant —
+  `agree(lo)` always true, and `agree(a)` true only when *both* trees produce equal prefix-root-hashes
+  at `a` — means a gap can only shrink the result, never over-claim), `reorg` faithfully adopts
+  `other`'s node set (intact-other is a documented precondition), and `seek` uses the same `>`
+  comparison as a linear scan (so empty blocks are skipped as targets). So this is **test-only**,
+  pinning the already-correct behaviour. 4 asserting tests (merkle 40→44):
+  - `lca_conservative_under_corruption` — for two trees sharing `[0,6)` of length 8 (intact LCA 6):
+    removing `other`'s node 9 (length-6 prefix root of `[4,6)`) shrinks the LCA to a genuine shorter
+    shared prefix; removing node 8 (block-4 leaf) makes `agree` **non-monotone** (false at length 5,
+    true at length 6) yet the search still returns a length where the prefixes genuinely match; and a
+    gap in `self` (symmetric) is equally conservative. Every case asserts `lca <= intact` and that
+    `self`/`other` prefix-root-hashes are equal *at the returned length* (a real ancestor, never forged).
+  - `lca_intact_agreement_is_monotone` — the binary-search precondition: for two intact trees the
+    `agree` vector is monotone (no agreement reappears after the first disagreement), the boundary sits
+    exactly at the divergence (`agree[6] && !agree[7]`), and the search is exact (LCA 6).
+  - `reorg_precondition_on_intact_other` — `reorg` adopts every node `other` holds: following a
+    **corrupt** `other` (suffix node 12 removed) copies the gap verbatim, leaving `self` non-intact
+    (intact-other is the precondition); conversely an **intact** `other` **heals** a gapped `self`
+    (shared-region node 3 removed) by overwriting the gap with the complete node set — `self` ends
+    intact, byte-identical, and every block proves.
+  - `seek_handles_zero_size_blocks` — a tree with leading/interior/consecutive/trailing empty blocks
+    (`sizes [0,2,0,0,3,1,0]`): `seek` == linear scan for every byte offset, the located block is never
+    an empty one (no byte lands in an empty interval), seek proofs authenticate the same mapping, the
+    byte at `total` is past the end (no proof), and an **all-empty** tree has no locatable byte.
+- `just verify` green: **116 native tests** (autobase 22 across files + codec 8 + hypercore 36 +
+  identity 4 + merkle 44 + storage 2) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions**
+- **No new ADR** — no divergence from upstream: a test-only iteration closing an adversarial-coverage
+  gap on already-decided behaviour. The governing decisions are unchanged — ADR-0025 (local LCA =
+  binary search over prefix root hashes; both inputs intact) and ADR-0022 (byte seek). No source change.
+  The honest result the corruption tests pin is itself the soundness property: the LCA never
+  over-claims because the search only ever returns a length where *both* prefixes are present and
+  equal — so a corrupt input degrades to a conservative (shorter, still-genuine) ancestor, not a wrong one.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- The LCA binary search is sound even when its monotonicity precondition is violated by corruption: it
+  keeps the invariant that the returned length always satisfies `agree` (both prefix-root-hashes
+  present and equal), so a gap can only *shrink* the LCA, never over-claim — a real shorter ancestor,
+  never a forged one. `reorg` then heals a gapped `self` from an intact `other` (it overwrites with the
+  full node set) but copies a corrupt `other`'s gaps verbatim (intact-other is the precondition). And
+  byte seek skips zero-size blocks for free (the `>` comparison matches a linear scan), so an empty
+  block is never a seek target and an all-empty tree has no locatable byte — test it explicitly, since
+  varied-size fixtures never hit size 0.
+
+**Next**
+- The last **audit follow-up** (DEFINITION_OF_DONE): `autobase` quorum-degree *value* cross-checked
+  against an independent computation over random DAGs (today only convergence + monotonicity are
+  fuzzed, not the degree value).
+- Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
+  startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
+  IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.

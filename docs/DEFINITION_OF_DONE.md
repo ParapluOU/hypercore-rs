@@ -115,7 +115,14 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       refuses even an `ancestors == 0` from-scratch offer, and a replica *mid-reorg* (shared prefix
       kept, `head == None` while the suffix refetch is pending) refuses a second higher-fork reorg yet
       still completes its original refetch byte-identically
-- [ ] `merkle`: reorg / `lowest_common_ancestor` adversarial — corrupt `other`, gapped `self`,
+- [x] `merkle`: reorg / `lowest_common_ancestor` adversarial — corrupt `other`, gapped `self`,
       monotonicity-precondition violation; seek zero-size block
+      (`lca_conservative_under_corruption` — a gap reads as disagreement, so corruption can only
+      *shrink* the LCA, never over-claim; the returned length is always a genuine shared prefix even
+      when the `agree` predicate is non-monotone; `lca_intact_agreement_is_monotone` — the
+      binary-search precondition holds for intact inputs; `reorg_precondition_on_intact_other` —
+      reorg copies `other`'s gaps verbatim (intact-other required) yet an intact `other` heals a
+      gapped `self`; `seek_handles_zero_size_blocks` — empty blocks are skipped as seek targets,
+      `seek` == linear scan, seek proofs authenticate, all-empty tree has no locatable byte)
 - [ ] `autobase`: quorum-degree *value* cross-checked against an independent computation over random
       DAGs (today only convergence + monotonicity are fuzzed, not the degree value)

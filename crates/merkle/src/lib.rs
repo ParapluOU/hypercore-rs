@@ -2118,4 +2118,183 @@ mod tests {
             "a sibling at the wrong index must be rejected structurally"
         );
     }
+
+    // --- audit follow-up: reorg / LCA adversarial + seek zero-size (iter 25) ---
+
+    // Two length-`len` trees sharing blocks `[0, share)` then diverging.
+    fn forked_pair(share: u64, len: u64) -> (MerkleTree, MerkleTree, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut ablocks: Vec<Vec<u8>> = Vec::new();
+        let mut bblocks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..len {
+            if i < share {
+                let s = format!("s-{i}").into_bytes();
+                ablocks.push(s.clone());
+                bblocks.push(s);
+            } else {
+                ablocks.push(format!("a-{i}").into_bytes());
+                bblocks.push(format!("b-{i}").into_bytes());
+            }
+        }
+        (tree_from(&ablocks), tree_from(&bblocks), ablocks, bblocks)
+    }
+
+    // `lowest_common_ancestor` is content-blind and depends on both trees being
+    // intact; a missing node reads conservatively as disagreement. The invariant
+    // the binary search keeps — `agree(lo)` is always true, and `agree(a)` is true
+    // only when *both* trees produce equal prefix-root-hashes at `a` — means a
+    // corrupt input can only *shrink* the LCA, never over-claim. Whatever it
+    // returns is a genuine shared prefix (a real ancestor), with no panic.
+    #[test]
+    fn lca_conservative_under_corruption() {
+        // self = a (intact); other = b. They genuinely share [0, 6) of length 8.
+        let (a, b, _ablocks, _bblocks) = forked_pair(6, 8);
+        let intact = a.lowest_common_ancestor(&b);
+        assert_eq!(intact, 6, "intact LCA is the true shared prefix");
+
+        // --- corrupt `other`: remove node 9 (root of blocks [4,6)), which the
+        // length-6 prefix needs. The gap reads as disagreement, so the LCA falls
+        // back to a genuine shorter shared prefix — never larger than the intact LCA.
+        let mut b_corrupt = b.clone();
+        assert!(b_corrupt.remove_node(9));
+        assert_eq!(b_corrupt.prefix_root_hash(6), None, "length-6 prefix now unavailable");
+        let lca = a.lowest_common_ancestor(&b_corrupt);
+        assert!(lca <= intact, "corruption can only shrink the LCA, never grow it");
+        assert!(b_corrupt.prefix_root_hash(lca).is_some(), "returned LCA is computable");
+        assert_eq!(
+            a.prefix_root_hash(lca),
+            b_corrupt.prefix_root_hash(lca),
+            "the returned LCA is a genuine shared prefix, not a forged one"
+        );
+
+        // --- monotonicity-precondition violation: removing node 8 (block-4 leaf)
+        // makes the `agree` predicate FALSE at length 5 (node 8 gone) yet TRUE at
+        // length 6 (nodes 3, 9 present, content shared) — non-monotone. The binary
+        // search must still land on a length where the prefixes genuinely match.
+        let mut b_holey = b.clone();
+        assert!(b_holey.remove_node(8));
+        assert_eq!(b_holey.prefix_root_hash(5), None, "length-5 prefix unavailable (node 8 gone)");
+        assert_eq!(
+            b_holey.prefix_root_hash(6),
+            a.prefix_root_hash(6),
+            "yet length-6 prefix is intact and matches — agreement is non-monotone"
+        );
+        let lca = a.lowest_common_ancestor(&b_holey);
+        assert!(lca <= intact && lca > 0, "still a conservative, non-empty ancestor");
+        assert_eq!(
+            a.prefix_root_hash(lca),
+            b_holey.prefix_root_hash(lca),
+            "non-monotone agreement still yields a genuine ancestor"
+        );
+
+        // --- gapped `self`: corruption is symmetric and equally conservative.
+        let mut a_corrupt = a.clone();
+        assert!(a_corrupt.remove_node(9));
+        let lca = a_corrupt.lowest_common_ancestor(&b);
+        assert!(lca <= intact, "a gap in self also only shrinks the LCA");
+        assert_eq!(
+            a_corrupt.prefix_root_hash(lca),
+            b.prefix_root_hash(lca),
+            "gapped self still returns a genuine shared prefix"
+        );
+    }
+
+    // The precondition the LCA binary search relies on: for two INTACT trees,
+    // prefix agreement is monotone — agreeing on `[0, a)` implies agreeing on every
+    // shorter prefix — so the search is exact (no over- or under-shoot).
+    #[test]
+    fn lca_intact_agreement_is_monotone() {
+        let (a, b, _, _) = forked_pair(6, 9);
+        let max = a.len().min(b.len());
+        let agree: Vec<bool> = (0..=max)
+            .map(|k| a.prefix_root_hash(k) == b.prefix_root_hash(k))
+            .collect();
+        // No agreement reappears after the first disagreement.
+        if let Some(f) = agree.iter().position(|&x| !x) {
+            assert!(agree[f..].iter().all(|&x| !x), "intact agreement is monotone");
+        }
+        // Diverging at block 6, [0,6) is shared so length-6 prefix agrees; length 7
+        // (which covers block 6) does not.
+        assert!(agree[6] && !agree[7], "boundary is exactly at the divergence");
+        assert_eq!(a.lowest_common_ancestor(&b), 6, "binary search is exact for intact inputs");
+    }
+
+    // `reorg` adopts every node `other` holds, so an intact `other` is the
+    // precondition for a clean follow: following a CORRUPT `other` faithfully
+    // copies its gaps (self ends non-intact), while an intact `other` HEALS a
+    // gapped `self` by overwriting the gap with the complete node set.
+    #[test]
+    fn reorg_precondition_on_intact_other() {
+        // Corrupt `other`: removing a suffix node (block-6 leaf = index 12) is
+        // copied into `self`, leaving it in repair mode.
+        let (a, mut b, _ablocks, _bblocks) = forked_pair(4, 8);
+        let mut a_corrupt = a.clone();
+        assert!(a_corrupt.remove_node(12));
+        let _ = b.reorg(&a_corrupt);
+        assert_eq!(b.len(), 8, "reorg adopts other's length");
+        assert!(!b.has_node(12), "the gap in other is copied verbatim");
+        assert!(!b.is_intact(), "reorg copies other's corruption — intact-other is required");
+
+        // Intact `other` heals a gapped `self`: remove a shared-region node
+        // (node 3 = root of [0,4)) from self, then follow the intact other. Adopting
+        // other's full node set overwrites the gap, so self ends intact + identical.
+        let (a2, b2, ablocks2, _) = forked_pair(4, 8);
+        let mut b2_holey = b2.clone();
+        assert!(b2_holey.remove_node(3));
+        assert!(!b2_holey.is_intact(), "self starts gapped");
+        b2_holey.reorg(&a2);
+        assert!(b2_holey.is_intact(), "intact other heals self's gap");
+        assert_eq!(b2_holey.root_hash(), a2.root_hash(), "byte-identical follow");
+        let root = a2.root_hash();
+        for blk in 0..a2.len() {
+            let p = b2_holey.proof(blk).expect("every adopted block proves");
+            assert!(p.verify(&ablocks2[blk as usize], &root), "block {blk} proves after reorg");
+        }
+    }
+
+    // Zero-size (empty) blocks are legitimate L1 payloads. A zero-size block
+    // occupies an empty byte interval, so no byte offset lands in it — the seek
+    // skips it to the next non-empty block — and the tree seek still agrees with a
+    // linear scan, with seek proofs authenticating the same mapping.
+    #[test]
+    fn seek_handles_zero_size_blocks() {
+        // Leading, interior, consecutive, and trailing empties.
+        let sizes = [0usize, 2, 0, 0, 3, 1, 0];
+        let mut t = MerkleTree::new();
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for (i, &s) in sizes.iter().enumerate() {
+            let b = vec![b'a' + i as u8; s];
+            t.append(&b);
+            blocks.push(b);
+        }
+        let total: u64 = sizes.iter().map(|&s| s as u64).sum();
+        assert!(total > 0, "the tree has some bytes despite the empties");
+        let root = t.root_hash();
+
+        for bytes in 0..total {
+            let located = t.seek(bytes);
+            assert_eq!(located, linear_seek(&blocks, bytes), "tree seek == linear (bytes={bytes})");
+            let (block, _off) = located;
+            assert!(
+                block < t.len() && !blocks[block as usize].is_empty(),
+                "a byte never resolves to an empty block (bytes={bytes})"
+            );
+            let sp = t.seek_proof(bytes).expect("in-range byte has a seek proof");
+            assert_eq!(
+                sp.verify(&root),
+                Some(located),
+                "seek proof authenticates the located block (bytes={bytes})"
+            );
+        }
+        // At/past the end there is no block to locate.
+        assert_eq!(t.seek(total), (t.len(), 0), "byte == total is past the last block");
+        assert!(t.seek_proof(total).is_none());
+
+        // An all-empty tree has zero bytes: every offset is past the (zero) end.
+        let mut empties = MerkleTree::new();
+        for _ in 0..4 {
+            empties.append(b"");
+        }
+        assert_eq!(empties.seek(0), (4, 0), "all-empty tree: byte 0 is past the end");
+        assert!(empties.seek_proof(0).is_none(), "no block to locate in an all-empty tree");
+    }
 }
