@@ -53,7 +53,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend
 - [ ] `storage` — IndexedDB backend (wasm)
-- [~] `hypercore` — append/get/verify done; proof-based replication pending
+- [x] `hypercore` — append/get/verify + proof-based replication
 - [ ] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [ ] `autobase` — quorum / finality-stability
 - [ ] convergence simulation (gate #3)

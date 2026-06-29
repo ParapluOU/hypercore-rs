@@ -159,6 +159,85 @@ pub fn verify_block(public: &PublicKey, head: &SignedHead, index: u64, data: &[u
         && proof.verify(data, &head.root)
 }
 
+/// A verify-only replica of a [`Hypercore`]. It holds no secret key; it accepts
+/// blocks accompanied by a proof against a signed head, verifies each, and
+/// rebuilds an **identical** log — never trusting the sender.
+pub struct Replica<T, C, S> {
+    public: PublicKey,
+    codec: C,
+    store: S,
+    tree: MerkleTree,
+    head: Option<SignedHead>,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
+    pub fn new(public: PublicKey, codec: C, store: S) -> Self {
+        Self {
+            public,
+            codec,
+            store,
+            tree: MerkleTree::new(),
+            head: None,
+            _t: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.tree.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tree.is_empty()
+    }
+
+    pub fn root_hash(&self) -> Hash {
+        self.tree.root_hash()
+    }
+
+    /// The signed head we have fully replicated up to (if any).
+    pub fn verified_head(&self) -> Option<&SignedHead> {
+        self.head.as_ref()
+    }
+
+    /// Verify the next block (`index` must equal the current length) against
+    /// `head`, then append it. Returns whether it was accepted; a rejected block
+    /// is **not** stored.
+    pub fn add_block(
+        &mut self,
+        head: &SignedHead,
+        index: u64,
+        enc: &[u8],
+        proof: &Proof,
+    ) -> Result<bool, Error<S::Error>> {
+        if index != self.tree.len() {
+            return Ok(false); // must apply in order
+        }
+        if !verify_block(&self.public, head, index, enc, proof) {
+            return Ok(false);
+        }
+        self.store.put(index, enc).map_err(Error::Storage)?;
+        self.tree.append(enc);
+        if self.tree.len() == head.length && self.tree.root_hash() == head.root {
+            self.head = Some(head.clone());
+        }
+        Ok(true)
+    }
+
+    /// Decode the value at `index`, or `None`.
+    pub fn get(&self, index: u64) -> Result<Option<T>, Error<S::Error>> {
+        if index >= self.tree.len() {
+            return Ok(None);
+        }
+        let bytes = self
+            .store
+            .get(index)
+            .map_err(Error::Storage)?
+            .ok_or(Error::Corrupt)?;
+        Ok(Some(self.codec.decode(&bytes).map_err(Error::Codec)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +320,54 @@ mod tests {
             c.head().unwrap().clone()
         };
         assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn replica_ends_byte_identical() {
+        let mut src = Hypercore::<Vec<u8>, _, _>::new(author(10), Bytes, MemoryStore::new());
+        let data: Vec<Vec<u8>> = (0..9).map(|i| format!("blk-{i}").into_bytes()).collect();
+        for d in &data {
+            src.append(d).unwrap();
+        }
+        let head = src.head().unwrap().clone();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(src.public_key(), Bytes, MemoryStore::new());
+        for i in 0..data.len() as u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head, i, &enc, &proof).unwrap(), "verified block accepted");
+        }
+        assert_eq!(rep.len(), src.len());
+        assert_eq!(rep.root_hash(), head.root, "replica root == source signed root");
+        assert!(rep.verified_head().is_some());
+        for i in 0..data.len() as u64 {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap(), "decoded values match");
+        }
+    }
+
+    #[test]
+    fn replica_rejects_bad_and_out_of_order() {
+        let mut src = Hypercore::<u64, _, _>::new(author(11), U64, MemoryStore::new());
+        for v in [1u64, 2, 3] {
+            src.append(&v).unwrap();
+        }
+        let head = src.head().unwrap().clone();
+        let mut rep = Replica::<u64, _, _>::new(src.public_key(), U64, MemoryStore::new());
+
+        let p1 = src.proof(1).unwrap();
+        let e1 = src.block(1).unwrap().unwrap();
+        // out of order: index 1 before 0
+        assert!(!rep.add_block(&head, 1, &e1, &p1).unwrap());
+
+        // index 0 with tampered bytes
+        let p0 = src.proof(0).unwrap();
+        assert!(!rep.add_block(&head, 0, b"garbage", &p0).unwrap());
+        assert_eq!(rep.len(), 0, "nothing stored on rejection");
+
+        // honest 0 then 1
+        let e0 = src.block(0).unwrap().unwrap();
+        assert!(rep.add_block(&head, 0, &e0, &p0).unwrap());
+        assert!(rep.add_block(&head, 1, &e1, &p1).unwrap());
+        assert_eq!(rep.len(), 2);
     }
 }

@@ -151,3 +151,25 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - `hypercore` replication: a verify-only `Replica` that, given the signed head + per-block proofs,
   accepts blocks and ends **byte-identical** to the source (the DoD replication property).
 - Then the `autobase` linearizer (causal DAG order + deterministic tiebreak).
+
+---
+
+## 2026-06-29 — Iteration 6: `hypercore` replication
+
+**Did**
+- Added `Replica<T, C, S>` (verify-only, holds no secret key): `add_block` verifies each block
+  against the signed head + Merkle proof, appends strictly in index order, and **rejects** bad or
+  out-of-order blocks without storing them. A fully-replicated replica is byte-identical to the
+  source — same root, same decoded values. 2 new tests (7 total in `hypercore`); `just verify` green.
+
+**Decisions**
+- Blocks apply in strict index order, each verified against the final signed head's root; the
+  verified head is recorded once length + root match. The sender is never trusted.
+
+**Lessons**
+- "Byte-identical replication" falls out for free once both sides hash the same encoded blocks in
+  the same order — the (proof, signed-head) pair is all the replica needs.
+
+**Next**
+- `autobase`: the causal linearizer — DAG order + deterministic tiebreak (port `linearizer.js` +
+  `dags.js` basics). Then quorum/finality and the generic convergence sim.

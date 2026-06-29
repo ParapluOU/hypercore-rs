@@ -16,8 +16,8 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 
 | File | Status | Maps to |
 |------|--------|---------|
-| `basic.js` | [ ] | `hypercore` append/get |
-| `core.js` | [ ] | `hypercore` core behaviour |
+| `basic.js` | [~] | `hypercore` append/get + signed-head verify ported; sparse/session bits later |
+| `core.js` | [~] | `hypercore` core append/get/verify + proof-based replication ported |
 | `batch.js` | [ ] | `hypercore` batch append |
 | `atomic.js` | [ ] | `hypercore` atomic append |
 | `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper ported; seeks/reorg/upgrade later) |
