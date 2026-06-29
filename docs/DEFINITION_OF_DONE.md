@@ -109,7 +109,12 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `commit_rollback_tolerates_delete_failure` — a swallowed rollback `delete` still surfaces the
       original `put` error and keeps logical state atomic, leaving one unreachable orphan that a later
       commit overwrites; all three recover byte-identically to the canonical six-block head)
-- [ ] `hypercore`: `verify_reorg` head-`None` branch (untested)
+- [x] `hypercore`: `verify_reorg` head-`None` branch — a reorg adopts a *strictly higher* fork than
+      the one we trust, so a replica with no verified head has no current fork to gate against and
+      refuses any reorg, untouched (`verify_reorg_requires_a_trusted_head`): a fresh empty replica
+      refuses even an `ancestors == 0` from-scratch offer, and a replica *mid-reorg* (shared prefix
+      kept, `head == None` while the suffix refetch is pending) refuses a second higher-fork reorg yet
+      still completes its original refetch byte-identically
 - [ ] `merkle`: reorg / `lowest_common_ancestor` adversarial — corrupt `other`, gapped `self`,
       monotonicity-precondition violation; seek zero-size block
 - [ ] `autobase`: quorum-degree *value* cross-checked against an independent computation over random

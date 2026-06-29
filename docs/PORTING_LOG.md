@@ -1125,3 +1125,51 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
   startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
   IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.
+
+---
+
+## 2026-06-29 — Iteration 24: `hypercore` `verify_reorg` head-`None` coverage (audit follow-up)
+
+**Did**
+- Closed the next **audit follow-up** (DEFINITION_OF_DONE, after iter 21): the `Replica::verify_reorg`
+  **head-`None` branch** that the positive reorg tests never reached. A reorg adopts a *strictly
+  higher* `fork` than the one we currently trust, so a replica with no verified head has no current
+  fork to gate "strictly higher" against and must refuse any reorg, untouched. The behaviour already
+  holds (`verify_reorg` returns `false` on `self.head == None` before checking anything else,
+  ADR-0026); this iteration is test-only — it pins both ways the branch is reached. 1 asserting test
+  (hypercore 35→36):
+  - `verify_reorg_requires_a_trusted_head`:
+    - **(a) fresh empty replica** (len 0, no head): a higher-fork head is refused even at
+      `ancestors == 0` (the from-scratch anchor) — a replica with nothing trusted can't know it is
+      moving to a higher fork, so from-scratch replication is `add_block` against a head, *not*
+      `reorg`; a valid `ancestors == 1` upgrade-proof offer is likewise refused; nothing is stored.
+    - **(b) mid-reorg replica**: after following one reorg (`reorg(head_r, 3, ..)` drops the divergent
+      suffix), the replica holds the shared `[0,3)` prefix but `head == None` while the suffix refetch
+      is pending. A *second*, even-higher-fork (fork 2) reorg arriving now is refused via the same
+      `None` branch — and crucially the replica is **untouched** (len 3, head still `None`) and can
+      still finish its **original** pending refetch to `head_r`, ending byte-identical (`get(3)=="X"`,
+      `get(4)=="Y"`, root == `head_r.root`). The suffix blocks/proofs are captured from the source
+      *before* it is mutated into fork 2 (the fork-2 history no longer holds the fork-1 tail).
+- `just verify` green: **112 native tests** (autobase 22 across files + codec 8 + hypercore 36 +
+  identity 4 + merkle 40 + storage 2) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions**
+- **No new ADR** — no divergence from upstream: a test-only iteration closing a negative-path
+  *coverage* gap on already-decided behaviour. The governing decision is ADR-0026 (a reorg is followed
+  only from a trusted head at a strictly higher fork; with no head there is no fork to compare, so the
+  reorg is refused). No source change.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A reorg gate keyed on "strictly higher fork than what I trust" is unreachable from a `None` head, so
+  the empty-replica and mid-reorg cases both refuse — and the mid-reorg case is the valuable one: a
+  replica that dropped its suffix (`head == None`, tree non-empty) must finish its current refetch
+  before it can adopt anything new. Capture the in-flight suffix blocks/proofs *before* mutating the
+  source onto a higher fork, or the original refetch can no longer be completed from it.
+
+**Next**
+- The remaining **audit follow-ups** (DEFINITION_OF_DONE), in order: `merkle` reorg / LCA adversarial
+  (corrupt `other`, gapped `self`, monotonicity-precondition violation; seek zero-size block);
+  `autobase` quorum-degree *value* cross-checked against an independent computation over random DAGs.
+- Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
+  startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
+  IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.

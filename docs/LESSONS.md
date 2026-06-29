@@ -262,6 +262,18 @@ personal data** (this repo is public; use repo-relative paths).
   (ed25519 is deterministic) proves the whole fault→rollback→recover path lands on the canonical state.
   This mirrors ADR-0024's truncate stance: physical reclamation is best-effort; the logical state is
   the invariant.
+- **A "strictly higher fork" reorg gate is unreachable from a `None` head — and the mid-reorg case is
+  the one worth testing** (audit follow-up). `Replica::verify_reorg` follows only a fork strictly
+  higher than the one it currently trusts, so with no verified head there is no current fork to
+  compare against and *every* reorg is refused — before any signature/proof check. Two situations
+  reach `head == None`: a **fresh empty replica** (so a reorg can never bootstrap a replica — that is
+  `add_block` against a head; even an `ancestors == 0` from-scratch reorg is refused), and a replica
+  **mid-reorg** (it dropped the divergent suffix, keeping the shared prefix, so the tree is non-empty
+  but `head == None` until the suffix is refetched). The mid-reorg case is the valuable one: a second,
+  even-higher-fork reorg arriving now is refused, the replica is left untouched, and it must still be
+  able to finish its *original* pending refetch. Test gotcha: capture the in-flight suffix
+  blocks/proofs from the source **before** mutating it onto the higher fork — once the source moves to
+  fork N+1 it no longer holds the fork-N tail, so the original refetch can't be completed from it.
 - **An inclusion proof binds a block to *one specific head's root*, so the replica's cross-head
   rejection is invisible to positive-path tests** (audit follow-up). `Replica::add_block` checks the
   head signature under its *own* configured key and `proof.verify(data, &head.root)` — but a clean

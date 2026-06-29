@@ -1871,4 +1871,95 @@ mod tests {
             assert_eq!(rep.get(i).unwrap(), honest.get(i).unwrap());
         }
     }
+
+    #[test]
+    fn verify_reorg_requires_a_trusted_head() {
+        // The head-`None` branch of `verify_reorg`: a reorg adopts a *strictly
+        // higher* fork than the one we currently trust, so a replica with no
+        // verified head has no current fork to gate against and must refuse —
+        // regardless of how legitimate the offered head is. Two situations reach
+        // `self.head == None`: a fresh empty replica, and a replica mid-reorg
+        // (the shared prefix kept, but the suffix refetch still pending).
+
+        // (a) Fresh empty replica (len 0, no head). Even an `ancestors == 0`
+        // "from scratch" reorg is refused: a replica with nothing trusted can't
+        // know it is moving to a higher fork — from-scratch replication is
+        // `add_block` against a head, not `reorg`.
+        let mut src = core_with(64, &["a", "b", "c"]); // fork 0
+        src.truncate(1);
+        src.append(&blk("X")).unwrap();
+        src.append(&blk("Y")).unwrap(); // [a,X,Y], fork 1
+        let head_r1 = src.head().unwrap().clone();
+        assert_eq!(head_r1.fork, 1);
+        let pk = src.public_key();
+        let up1 = src.upgrade_proof(1, 3).unwrap();
+
+        let mut empty = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.verified_head().is_none());
+        assert!(!empty.verify_reorg(&head_r1, 0, None), "from-scratch reorg needs a trusted head");
+        assert!(!empty.verify_reorg(&head_r1, 1, Some(&up1)), "even a valid offer is refused");
+        assert!(!empty.reorg(&head_r1, 1, Some(&up1)));
+        assert_eq!(empty.len(), 0, "empty replica untouched");
+        assert!(empty.verified_head().is_none());
+
+        // (b) Mid-reorg replica: it followed one reorg (dropping the divergent
+        // suffix), so `head == None` while the suffix refetch is pending — even
+        // though the tree holds the shared prefix. A *second*, even-higher-fork
+        // reorg arriving now must be refused (no trusted head), and the replica
+        // must be left able to finish its *current* refetch.
+        let mut src = core_with(65, &["a", "b", "c", "d", "e"]); // fork 0
+        let head5 = src.head().unwrap().clone();
+        let pk = src.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.verified_head(), Some(&head5));
+
+        // First reorg (fork 1): rewind to 3, rewrite [X, Y]; replica follows it.
+        src.truncate(3);
+        src.append(&blk("X")).unwrap();
+        src.append(&blk("Y")).unwrap();
+        let head_r = src.head().unwrap().clone();
+        assert_eq!(head_r.fork, 1);
+        let up = src.upgrade_proof(3, 5).unwrap();
+        // Capture head_r's suffix [3,5) before mutating src into a higher fork.
+        let suffix: Vec<_> = (3..5u64)
+            .map(|i| (i, src.block(i).unwrap().unwrap(), src.proof(i).unwrap()))
+            .collect();
+
+        assert!(rep.reorg(&head_r, 3, Some(&up)));
+        assert_eq!(rep.len(), 3, "shared prefix kept");
+        assert!(rep.verified_head().is_none(), "mid-reorg: no trusted head until suffix refetched");
+
+        // Second, higher reorg (fork 2) arrives while the replica is mid-reorg.
+        src.truncate(1);
+        src.append(&blk("P")).unwrap();
+        src.append(&blk("Q")).unwrap(); // [a,P,Q], fork 2
+        let head_r2 = src.head().unwrap().clone();
+        assert_eq!(head_r2.fork, 2);
+        let up2 = src.upgrade_proof(1, 3).unwrap();
+        assert!(
+            !rep.verify_reorg(&head_r2, 1, Some(&up2)),
+            "no trusted head => a second reorg is refused mid-reorg"
+        );
+        assert!(!rep.reorg(&head_r2, 1, Some(&up2)));
+        assert_eq!(rep.len(), 3, "mid-reorg replica untouched by the refused second reorg");
+        assert!(rep.verified_head().is_none());
+
+        // The refusal didn't corrupt the replica: it can still finish its
+        // *original* pending refetch to head_r, ending byte-identical to it.
+        for (i, enc, proof) in &suffix {
+            assert!(rep.add_block(&head_r, *i, enc, proof).unwrap(), "suffix block {i}");
+        }
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.root_hash(), head_r.root);
+        assert_eq!(rep.verified_head(), Some(&head_r));
+        assert_eq!(rep.get(3).unwrap(), Some(blk("X")));
+        assert_eq!(rep.get(4).unwrap(), Some(blk("Y")));
+    }
 }
