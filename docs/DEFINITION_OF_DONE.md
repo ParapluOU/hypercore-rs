@@ -124,5 +124,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       reorg copies `other`'s gaps verbatim (intact-other required) yet an intact `other` heals a
       gapped `self`; `seek_handles_zero_size_blocks` — empty blocks are skipped as seek targets,
       `seek` == linear scan, seek proofs authenticate, all-empty tree has no locatable byte)
-- [ ] `autobase`: quorum-degree *value* cross-checked against an independent computation over random
-      DAGs (today only convergence + monotonicity are fuzzed, not the degree value)
+- [x] `autobase`: quorum-degree *value* cross-checked against an independent computation over random
+      DAGs (`crates/autobase/tests/quorum.rs`) — a **fixpoint-relaxation** reference oracle derived
+      straight from the `DESIGN.md` recursion over inclusive causal closures (author self-vote
+      *emergent*, not hardcoded), distinct from production's single-pass topological DP; the oracle is
+      first validated against the `DESIGN.md` worked examples (chain 3/2/1/0, higher quorum 2/1,
+      competing 1/1), then `quorum_degree(target)` is asserted equal to it node-for-node over seeded
+      random partitioned DAGs × 3 indexer-set sizes × several causally-valid delivery orders, with
+      non-vacuity guards (degrees 0/1/≥2 all occur, a double quorum forms)

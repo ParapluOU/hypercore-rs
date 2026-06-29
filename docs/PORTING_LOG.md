@@ -1235,3 +1235,70 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then resume feature iterations: the gate-#4 JS oracle (still env-blocked — container service not
   startable under the loop's allowlist + image pull needs network; iters 11–21); the wasm runtime /
   IndexedDB gate (#2, needs headless Chrome); the deferred fork/merge consensus (ADR-0015); `hyperbee`.
+
+---
+
+## 2026-06-29 — Iteration 26: `autobase` quorum-degree value cross-check (audit follow-up)
+
+**Did**
+- Closed the **last audit follow-up** (DEFINITION_OF_DONE, after iter 21): the `autobase`
+  quorum-degree *value* was only ever pinned against a handful of hand-worked `DESIGN.md`
+  examples, and the convergence sim fuzzes only the *finalized prefix* (convergence +
+  monotonicity) — never the **degree value** itself over random graphs. Added
+  `crates/autobase/tests/quorum.rs`, a value cross-check against an **independent reference
+  oracle**:
+  - The oracle is a deliberately *different* algorithm from production. Production
+    (`Linearizer::quorum_degree`) is a single bottom-up pass over a topological order
+    carrying a per-indexer "best degree" from each node's **strict** dependencies plus a
+    hardcoded author self-vote (ADR-0015). The oracle computes every node's degree by a
+    **fixpoint relaxation** straight from the `DESIGN.md` recursion over **inclusive** causal
+    closures (its own reachability, built from the test's own edge list — never the
+    linearizer's private `deps`/`sees`), with the author's self-vote *emergent* (a node is in
+    its own closure, so it counts at exactly the levels its current degree already reaches)
+    rather than special-cased. Two structurally different routes to the same number ⇒ an
+    off-by-one in either the level indexing or the self-vote would diverge.
+  - It is **first validated against the `DESIGN.md` worked examples** (chain `a0-b0-c0-a1` ⇒
+    3/2/1/0; higher quorum `c0-b0-c1` ⇒ 2/1; competing single quorums ⇒ 1/1) so that using it
+    as a cross-check is trustworthy, each example also asserting production == oracle.
+  - It is then asserted **equal to `quorum_degree(target)` node-for-node** over seeded random
+    partitioned DAGs (the upstream `createDag` model, reusing the convergence sim's SplitMix64
+    PRNG) × 3 indexer-set sizes (majorities 2/3/3, incl. a strict subset of writers so
+    non-indexing writers are present) × creation order + several randomized-Kahn delivery
+    orders (the degree is a pure function of the node set, so all replicas must agree).
+    Non-vacuity guards assert degrees 0, 1, and ≥2 all occur and a double quorum forms — so
+    the cross-check isn't hollow.
+- 2 asserting tests (autobase 22→24 across files: 14 unit + 2 convergence + 2 **quorum** +
+  3 topolist + 3 view). `just verify` green: **118 native tests** (autobase 24 + codec 8 +
+  hypercore 36 + identity 4 + merkle 44 + storage 2) + wasm build of
+  `hypercore`/`autobase`/`storage`.
+
+**Decisions**
+- **No new ADR** — no divergence from upstream: a test-only iteration closing a coverage gap
+  on already-decided behaviour (ADR-0015's recompute-from-scratch quorum *degree*). The
+  governing decision is unchanged; no source change. The oracle is an in-test reference
+  computation (like the iter-20 in-Rust `topolist` oracle, ADR-0027), validating the existing
+  algorithm host-safely — it complements, does not replace, the env-blocked JS oracle (gate #4).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- To value-check a recursive DP like quorum-degree, write an **independent** oracle from the
+  *definition*, not a copy of the algorithm: a fixpoint relaxation over inclusive causal
+  closures reaches the same number as production's single-pass topological DP by a different
+  route, so an off-by-one in the level indexing or the self-vote is caught. Let the author's
+  self-vote be **emergent** (a node is in its own closure) rather than re-hardcoding the
+  production `+1`. Validate the oracle against the `DESIGN.md` worked examples *first*, then
+  cross-check; and gate non-vacuity (degrees 0/1/≥2 all occur, a double quorum forms) so the
+  fuzz isn't hollow. Keep indexer sets ≥ 2 (a lone indexer ⇒ majority 1 ⇒ the production
+  degree loop never terminates — a latent degenerate, out of scope here).
+
+**Next**
+- All DEFINITION_OF_DONE audit follow-ups are now ticked. Resume feature iterations, all of
+  which remain environment-blocked or are larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not
+    startable under the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome (`storage` IndexedDB
+    backend still `[ ]`);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation
+    across a resolved fork/merge, which would let `finalized()`/`indexed_view_len()` match
+    upstream's earlier-confirming cases (`dags - simple 2`, `linearizer - compete`/`count
+    ordering`) and needs the apply/view layer (`apply.js`/`anchors.js`);
+  - `merkle` reorg-by-proof / `additionalNodes` (the last `merkle-tree.js` pieces); `hyperbee`.

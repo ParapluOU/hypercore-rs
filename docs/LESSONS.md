@@ -285,6 +285,21 @@ personal data** (this repo is public; use repo-relative paths).
   wholly-valid log signed by B — that is the head-signature gate, not the proof. Assert nothing is
   stored on each rejection, and keep `index == replica.len()` so the in-order guard passes and the test
   actually reaches the binding branch (not a trivial ordering reject).
+- **Value-check a recursive DP with an *independent* oracle derived from the definition, not a
+  copy of the algorithm** (audit follow-up). Production `quorum_degree` is a single bottom-up pass
+  over a topological order carrying a per-indexer "best degree" from each node's *strict* deps plus
+  a hardcoded author self-vote. To genuinely cross-check the *value* (convergence/monotonicity
+  fuzzing never touches it), reimplement the `DESIGN.md` recursion a *different* way: a **fixpoint
+  relaxation** over **inclusive** causal closures (build your own reachability from the test's edge
+  list — don't reuse the linearizer's `sees`/`deps`), letting the author's self-vote be **emergent**
+  (a node is in its own closure, so it counts at exactly the levels its current degree already
+  reaches) instead of re-hardcoding the `+1`. Two routes to the same number ⇒ an off-by-one in the
+  level indexing or the self-vote diverges. Validate the oracle against the `DESIGN.md` worked
+  examples *first* (so it's trustworthy), then assert production == oracle node-for-node over seeded
+  random DAGs × indexer-set sizes × several delivery orders (the degree is a pure function of the
+  node set). Gate non-vacuity (degrees 0/1/≥2 all occur, a double quorum forms) so the fuzz isn't
+  hollow. Keep indexer sets ≥ 2: a lone indexer ⇒ majority 1 ⇒ the production degree loop (author
+  self-vote alone always ≥ majority) never terminates — a latent degenerate to avoid, not exercise.
 - **The LCA binary search is sound even when corruption violates its monotonicity precondition**
   (audit follow-up). `lowest_common_ancestor` assumes prefix agreement is monotone (true for two
   *intact* trees), but a missing node makes `agree(a)` false where the prefix it needs is gone — which
