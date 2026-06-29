@@ -330,3 +330,21 @@ personal data** (this repo is public; use repo-relative paths).
   skips zero-size blocks for free**: `seek`/`seek_proof` use the same `>` comparison as a linear scan,
   so an empty block's empty byte interval is never a seek target and an all-empty tree has no locatable
   byte — test it explicitly, because varied-size fixtures (`(i % 5) + 1`) never hit size 0.
+- **`clear` is *presence* reclamation, not truncation — keep block-presence and log-structure as two
+  separate axes.** Upstream's `clear(start, end)` drops a block range's *bytes* without shortening the
+  log: the Merkle tree (length, root, every node) is **untouched**, only a presence bitfield + the
+  stored bytes change. That separation is the whole point — a cleared block is still *authenticated*
+  (the signed head and its inclusion proof are unaffected), so it stays re-downloadable from a holder;
+  you can prove this host-safely (no wire) by verifying a holder-supplied block against the cleared
+  core's unchanged head. Wiring it in: set presence bits on `append`/`commit` (commit only *after* its
+  writes succeed, so a rolled-back failed commit leaves presence untouched too) and clear the tail's
+  bits on `truncate`; then `has(i)` = within-length **and** bit-set, `contiguous_length` = the first
+  absent index capped at the length (`find_first(false, 0)` is always `Some` — the infinite-zero tail —
+  so an all-present log returns `len`), and `get`/`block` read **`None`** for an absent block (a no-wait
+  read; at L1 there is no peer to wait on). Reserve the `Corrupt` error for the *genuine* inconsistency
+  — the presence bit says "here" but the bytes are gone — so the bitfield, not storage, is the source
+  of truth for presence (narrowing `get`'s old "missing ⇒ Corrupt" to "bit-set-but-missing ⇒ Corrupt"
+  breaks no existing test, since every appended block is present). Clearing absent/out-of-range blocks
+  is a harmless no-op (never touch a block you don't hold), and physical reclamation is best-effort (a
+  failed `delete` still marks the block absent — same "logical state is the invariant" stance as
+  truncate's orphans). `purge` (whole-core deletion) is a separate storage/session concern, not this.

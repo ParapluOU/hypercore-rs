@@ -80,7 +80,13 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       **secure replica-level reorg** (`Replica::verify_reorg`/`reorg` — follow only a *strictly
       higher*-fork signed head, authenticate the claimed shared-prefix length by re-anchoring an
       `UpgradeProof` on the replica's own roots at that prefix, then drop the divergent suffix and
-      refetch byte-identically; an over-claimed ancestor / forked old block is rejected; ADR-0026)
+      refetch byte-identically; an over-claimed ancestor / forked old block is rejected; ADR-0026) +
+      **sparse `clear`** (a `storage::Bitfield` presence map: `has`/`contiguous_length` ≡ upstream
+      `has`/`contiguousLength`; `clear(start,end)` drops present blocks' bytes + bits returning the
+      count cleared, leaving the Merkle tree / signed head **untouched** so a cleared block stays
+      authenticated + re-verifiable from a holder; `get`/`block` read `None` for an absent block;
+      clearing absent/out-of-range blocks is a no-op; ADR-0031) — `purge`/physical-reclamation
+      guarantees + the replication re-download that refills a cleared block tracked on `clear.js`
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks
       that priority-Kahn `order()` agrees node-for-node with it (both = the lex-minimal linear extension)

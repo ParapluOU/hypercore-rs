@@ -1362,3 +1362,69 @@ Repo-relative paths only — no private or personal data (this repo is public).
     layer (`apply.js`/`anchors.js`);
   - `hypercore` **`clear`** (sparse range-clear over the new `Bitfield`) + `purge`; `merkle`
     reorg-by-proof / `additionalNodes`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 28: `hypercore` sparse `clear` (presence map over the bitfield)
+
+**Did**
+- Picked the natively-testable, in-scope red item iter 27 set up: `hypercore` **`clear`**
+  (`reference/js/hypercore/test/clear.js`), built directly on iter 27's `storage::Bitfield`. (The
+  other non-env-blocked candidate — the deferred fork/merge consensus, ADR-0015 — LESSONS.md says to
+  defer until the JS oracle, gate #4, can cross-check it; that is still env-blocked, so attempting it
+  now would defy the project's own recorded guidance.)
+- Wired a `storage::Bitfield` **presence map** into `Hypercore` and ported the L1 behaviour of `clear`:
+  - `append`/`commit` set the new blocks' presence bits (commit only *after* its writes succeed — so a
+    rolled-back failed commit leaves presence untouched, consistent with ADR-0018); `truncate` clears
+    the discarded tail's bits.
+  - `has(index)` (≡ upstream `has`) = within length **and** bit set; `contiguous_length()` (≡
+    `contiguousLength`) = the first absent index capped at the length; `get`/`block` now read **`None`**
+    for an absent block (a no-wait read — at L1 there is no peer to wait on), reserving `Error::Corrupt`
+    for the genuine "bit set but bytes missing" inconsistency.
+  - `clear(start, end)` drops the present blocks in the range — clearing the bit (logical absence) then
+    best-effort-deleting the bytes — returning the **count cleared** (`0` ≡ upstream's `null`/no-op). It
+    **never touches the Merkle tree**, so the signed head and every block proof are unchanged: a cleared
+    block stays authenticated and re-verifiable from a holder.
+- 6 asserting tests (hypercore 36→42; workspace 133→139): clear a middle block (presence/`has`/
+  `contiguous_length`/`get`-`None`/tree-untouched — upstream `clear`); single-block clear in a 129-block
+  log (upstream `incorrect clear`); out-of-range clear is a 0-count no-op (upstream `clear blocks with
+  diff option`'s `null`); idempotent/no-side-effect clearing of unknown/absent blocks (upstream `no
+  side effect from clearing unknown nodes`); an interior-range clear leaving a hole (small-scale
+  analogue of `clear - large cores`); and a cleared block staying authenticated + re-verifiable from a
+  holder against the unchanged head (the L1 form of `clear + replication`, no wire). `just verify`
+  green: **139 native tests** (autobase 24 + codec 8 + hypercore 42 + identity 4 + merkle 44 +
+  storage 17) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0031: `clear` is **presence reclamation over the bitfield**, leaving the Merkle tree / signed head
+  untouched (block presence and log structure are two separate axes) — not upstream's storage-stream /
+  session layer. `has`/`contiguous_length`/`clear` are the L1 surface; `get`/`block` read `None` for an
+  absent block. We **defer** the replication re-download that *refills* a cleared block (networking,
+  ADR-0003), `purge` (whole-core deletion = storage backend + session lifecycle, out of scope),
+  physical-reclamation guarantees (best-effort: a failed delete still marks the block absent — same
+  "logical state is the invariant" stance as ADR-0024), and the commented-out `diff`/byte-API return
+  shape. `clear.js` moves `[ ]`→`[~]`; `purge.js` stays `[ ]`. `Replica` is left as-is (implicitly
+  fully-present; sparse-replica presence is networking).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- `clear` is *presence* reclamation, not truncation — keep block-presence and log-structure as two
+  separate axes. The tree is untouched, so a cleared block stays authenticated and re-fetchable (prove
+  it host-safely by verifying a holder-supplied block against the unchanged head). Set presence on
+  `append`/`commit` (commit *after* writes succeed) and clear it on `truncate`; `has` = within-length
+  ∧ bit-set, `contiguous_length` = first-absent capped at length, `get`/`block` = `None` for absent
+  (no-wait), `Corrupt` reserved for bit-set-but-bytes-gone (the bitfield, not storage, owns presence).
+  Clearing absent/out-of-range blocks is a no-op; physical reclamation is best-effort.
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable
+    under the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend
+    `[ ]` would also wire the bitfield's deferred `open`/`flush` persistence (and persist this presence
+    map);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view
+    layer (`apply.js`/`anchors.js`);
+  - the replication re-download that refills a cleared block + `purge` (both deferred this iter);
+    `merkle` reorg-by-proof / `additionalNodes`; `hyperbee`.

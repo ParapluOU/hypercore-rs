@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 use codec::Codec;
 use identity::{PublicKey, SecretKey, Sig};
 use merkle::{Hash, MerkleTree, Proof, UpgradeProof};
-use storage::Store;
+use storage::{Bitfield, Store};
 
 /// Domain tag for the head-signable message (separates it from any other thing
 /// the author might sign).
@@ -108,6 +108,12 @@ pub struct Hypercore<T, C, S> {
     codec: C,
     store: S,
     tree: MerkleTree,
+    /// Local **presence map**: which block indices currently have their bytes in
+    /// `store`. Separate from the Merkle tree (the authenticated *structure*): a
+    /// block can be within the log's length yet absent — dropped by
+    /// [`clear`](Hypercore::clear) to reclaim space, while the tree still
+    /// authenticates it for a later re-fetch.
+    presence: Bitfield,
     head: Option<SignedHead>,
     fork: u64,
     last_truncation: Option<Truncation>,
@@ -124,6 +130,7 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             codec,
             store,
             tree: MerkleTree::new(),
+            presence: Bitfield::new(),
             head: None,
             fork: 0,
             last_truncation: None,
@@ -179,6 +186,7 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         let index = self.tree.len();
         self.store.put(index, &bytes).map_err(Error::Storage)?;
         self.tree.append(&bytes);
+        self.presence.set(index, true);
         self.last_truncation = None;
         self.resign();
         Ok(index)
@@ -207,6 +215,7 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         if !self.tree.truncate(new_len) {
             return None; // new_len >= len: nothing to do
         }
+        self.presence.set_range(new_len, from, false); // the discarded tail is no longer present
         self.fork += 1;
         let t = Truncation { from, to: new_len };
         self.last_truncation = Some(t);
@@ -277,18 +286,27 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             written.push(idx);
         }
 
-        // All blocks stored — now fold them into the tree and sign once.
-        for enc in &batch.encoded {
+        // All blocks stored — now fold them into the tree, mark them present, and
+        // sign once. (Presence is set only after every write succeeded, so a
+        // rolled-back failed commit leaves the presence map untouched too.)
+        for (i, enc) in batch.encoded.iter().enumerate() {
             self.tree.append(enc);
+            self.presence.set(start + i as u64, true);
         }
         self.last_truncation = None;
         self.resign();
         Ok(Some(self.tree.len()))
     }
 
-    /// Decode the value at `index`, or `None` if out of range.
+    /// Decode the value at `index`, or `None` if out of range **or locally
+    /// absent** (never downloaded, or dropped by [`clear`](Self::clear)). This is
+    /// a no-wait read: at L1 there is no peer to fetch a missing block from, so an
+    /// absent block reads as `None` (upstream `get(i, { wait: false })`).
+    ///
+    /// [`Error::Corrupt`] is reserved for genuine corruption — the presence map
+    /// says block `index` is here but its bytes are missing from `store`.
     pub fn get(&self, index: u64) -> Result<Option<T>, Error<S::Error>> {
-        if index >= self.tree.len() {
+        if !self.has(index) {
             return Ok(None);
         }
         let bytes = self
@@ -302,9 +320,10 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
 
     /// The raw stored (codec-encoded) bytes of block `index` — i.e. exactly what
     /// the Merkle tree committed to. This is the unit a verifier checks a proof
-    /// against (it decodes only *after* verifying).
+    /// against (it decodes only *after* verifying). `None` if out of range or
+    /// locally absent (see [`get`](Self::get)).
     pub fn block(&self, index: u64) -> Result<Option<Vec<u8>>, Error<S::Error>> {
-        if index >= self.tree.len() {
+        if !self.has(index) {
             return Ok(None);
         }
         let bytes = self
@@ -313,6 +332,57 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             .map_err(Error::Storage)?
             .ok_or(Error::Corrupt)?;
         Ok(Some(bytes))
+    }
+
+    /// Whether block `index` is **present locally** — i.e. its bytes are in
+    /// `store` and readable via [`get`](Self::get)/[`block`](Self::block). A block
+    /// can be within the log's [`len`](Self::len) yet absent (dropped by
+    /// [`clear`](Self::clear)); `false` for out-of-range indices. Ports upstream
+    /// `core.has(index)`.
+    pub fn has(&self, index: u64) -> bool {
+        index < self.tree.len() && self.presence.get(index)
+    }
+
+    /// Length of the contiguous run of present blocks from index `0` (upstream
+    /// `contiguousLength`). Equals [`len`](Self::len) for a fully-present log; it
+    /// drops to the first hole after a [`clear`](Self::clear).
+    pub fn contiguous_length(&self) -> u64 {
+        // The first absent index is where the contiguous prefix ends; cap it at the
+        // log length (`find_first(false, ..)` is always `Some` — the field is an
+        // infinite-zero tail, so beyond a fully-present log it returns `len`).
+        self.presence.find_first(false, 0).unwrap_or(0).min(self.tree.len())
+    }
+
+    /// Drop the locally-stored bytes for the present blocks in `[start, end)`,
+    /// marking them **absent** and reclaiming their storage. Returns the number of
+    /// blocks actually cleared (`0` if the range is empty, out of range, or only
+    /// covers already-absent blocks — upstream's `null`/no-op).
+    ///
+    /// This is **presence** reclamation, *not* a [`truncate`](Self::truncate): the
+    /// Merkle tree — length, root, every node — is **unchanged**, so the log still
+    /// authenticates the cleared blocks ([`proof`](Self::proof) and the signed
+    /// [`head`](Self::head) are unaffected) and they can be re-fetched and
+    /// re-verified later. Clearing absent or out-of-range blocks has no effect (it
+    /// never touches a block it doesn't hold — upstream's "no side effect from
+    /// clearing unknown nodes").
+    ///
+    /// Physical reclamation is best-effort and decoupled from the logical state:
+    /// the presence bit is cleared first (so the block immediately reads as absent),
+    /// then the bytes are deleted; a `store` error is surfaced, having left the
+    /// block correctly marked absent.
+    pub fn clear(&mut self, start: u64, end: u64) -> Result<u64, Error<S::Error>> {
+        let end = end.min(self.tree.len());
+        let mut cleared = 0;
+        let mut i = start;
+        while i < end {
+            if self.presence.get(i) {
+                self.presence.set(i, false);
+                self.store.delete(i).map_err(Error::Storage)?;
+                cleared += 1;
+            }
+            i += 1;
+        }
+        Ok(cleared)
     }
 
     /// A Merkle inclusion proof for `index` (pair with [`Self::head`] to make it
@@ -1961,5 +2031,174 @@ mod tests {
         assert_eq!(rep.verified_head(), Some(&head_r));
         assert_eq!(rep.get(3).unwrap(), Some(blk("X")));
         assert_eq!(rep.get(4).unwrap(), Some(blk("Y")));
+    }
+
+    // ---- clear: sparse presence reclamation (upstream `clear.js`, L1) ----
+
+    #[test]
+    fn clear_marks_blocks_absent_and_updates_contiguous_length() {
+        // Ports clear.js "clear": clearing a middle block makes it absent while the
+        // surrounding blocks stay present, drops `contiguousLength` to the first
+        // hole, and leaves the authenticated tree (length, root, signed head, the
+        // cleared block's proof) completely untouched.
+        let mut a = core_with(80, &["a", "b", "c"]);
+        assert_eq!(a.contiguous_length(), 3);
+        assert!(a.has(0) && a.has(1) && a.has(2));
+        let head_before = a.head().unwrap().clone();
+
+        assert_eq!(a.clear(1, 2).unwrap(), 1, "exactly one block cleared");
+        assert_eq!(a.contiguous_length(), 1, "contig drops to the first hole");
+        assert!(a.has(0), "has 0");
+        assert!(!a.has(1), "has not 1");
+        assert!(a.has(2), "has 2");
+        assert_eq!(a.get(0).unwrap(), Some(blk("a")));
+        assert_eq!(a.get(1).unwrap(), None, "cleared block reads absent (no-wait get)");
+        assert_eq!(a.get(2).unwrap(), Some(blk("c")));
+        assert_eq!(a.block(1).unwrap(), None, "raw bytes gone too");
+
+        // Clear is presence reclamation, not truncation: the tree/head are intact.
+        assert_eq!(a.len(), 3, "length unchanged by clear");
+        assert_eq!(a.head().unwrap(), &head_before, "signed head unchanged");
+        assert!(a.proof(1).is_some(), "the tree still proves the cleared block");
+        assert!(a.verify_head());
+    }
+
+    #[test]
+    fn clear_single_block_in_a_larger_log() {
+        // Ports clear.js "incorrect clear": a 129-block log, clear just block 127.
+        // (129 crosses a Merkle root boundary, so block 128 is a fresh root — a
+        // good check that a single-block clear is exact.)
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(81), Bytes, MemoryStore::new());
+        for _ in 0..129 {
+            core.append(&blk("tick")).unwrap();
+        }
+        assert_eq!(core.contiguous_length(), 129);
+
+        assert_eq!(core.clear(127, 128).unwrap(), 1);
+        assert!(!core.has(127));
+        assert!(core.has(128));
+        assert_eq!(core.get(127).unwrap(), None);
+        assert_eq!(core.get(128).unwrap(), Some(blk("tick")));
+        assert_eq!(core.contiguous_length(), 127, "prefix ends at the hole");
+        assert_eq!(core.len(), 129, "length unchanged by clear");
+    }
+
+    #[test]
+    fn clear_out_of_range_is_noop() {
+        // Ports clear.js "clear blocks with diff option": clearing past the end
+        // clears nothing (upstream returns `null`; we return a count of 0) and the
+        // log is untouched.
+        let mut core = core_with(82, &["only"]);
+        let head_before = core.head().unwrap().clone();
+
+        assert_eq!(core.clear(1337, 1338).unwrap(), 0, "nothing in range (upstream null)");
+        assert_eq!(core.clear(5, 100).unwrap(), 0, "far-out range clears nothing");
+
+        assert_eq!(core.len(), 1);
+        assert!(core.has(0));
+        assert_eq!(core.get(0).unwrap(), Some(blk("only")));
+        assert_eq!(core.contiguous_length(), 1);
+        assert_eq!(core.head().unwrap(), &head_before);
+    }
+
+    #[test]
+    fn clear_unknown_blocks_has_no_side_effect() {
+        // Ports clear.js "clear - no side effect from clearing unknown nodes":
+        // clearing a block you don't hold is a harmless no-op (never panics, never
+        // touches a block it doesn't have), and clears are idempotent.
+        let mut core = core_with(83, &["a", "b", "c", "d"]);
+
+        // Clear three blocks once each...
+        assert_eq!(core.clear(0, 1).unwrap(), 1);
+        assert_eq!(core.clear(1, 2).unwrap(), 1);
+        assert_eq!(core.clear(2, 3).unwrap(), 1);
+        // ...and again: now already absent, so each is a no-op.
+        assert_eq!(core.clear(0, 1).unwrap(), 0);
+        assert_eq!(core.clear(1, 2).unwrap(), 0);
+        assert_eq!(core.clear(2, 3).unwrap(), 0);
+
+        // A wide range over the mostly-absent log clears only the still-present block (3).
+        assert_eq!(core.clear(0, 4).unwrap(), 1);
+        assert_eq!(core.clear(0, 4).unwrap(), 0, "a fully-cleared range is a no-op");
+
+        // Everything is absent now, but the length is intact and nothing is
+        // contiguously present from 0.
+        for i in 0..4u64 {
+            assert!(!core.has(i));
+            assert_eq!(core.get(i).unwrap(), None);
+        }
+        assert_eq!(core.contiguous_length(), 0);
+        assert_eq!(core.len(), 4);
+    }
+
+    #[test]
+    fn clear_interior_range_leaves_a_hole() {
+        // A range clear leaves an interior hole: the blocks at the range boundaries
+        // stay present, every interior block is absent, and `contiguousLength`
+        // stops at the first hole. (Small-scale analogue of clear.js "clear - large
+        // cores", which clears interior ranges; the bitfield's page-boundary
+        // behaviour is already pinned in `storage::bitfield`.)
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(84), Bytes, MemoryStore::new());
+        for i in 0..40u64 {
+            core.append(&format!("Block-{i}").into_bytes()).unwrap();
+        }
+
+        assert_eq!(core.clear(10, 20).unwrap(), 10, "ten interior blocks cleared");
+        assert_eq!(core.get(9).unwrap(), Some(b"Block-9".to_vec()), "lower boundary present");
+        assert_eq!(core.get(10).unwrap(), None);
+        assert_eq!(core.get(19).unwrap(), None);
+        assert_eq!(core.get(20).unwrap(), Some(b"Block-20".to_vec()), "upper boundary present");
+        assert_eq!(core.contiguous_length(), 10, "prefix ends at the hole");
+
+        for i in 0..40u64 {
+            let present = !(10..20).contains(&i);
+            assert_eq!(core.has(i), present, "presence of block {i}");
+        }
+
+        assert_eq!(core.clear(10, 20).unwrap(), 0, "re-clearing the hole is a no-op");
+        assert_eq!(core.len(), 40, "length unchanged");
+        assert!(core.verify_head());
+    }
+
+    #[test]
+    fn cleared_block_stays_authenticated_and_refetchable() {
+        // The L1 form of clear.js "clear + replication": a clears a block, a holder
+        // (b) still has it, and because clear leaves a's authenticated tree
+        // untouched, the block b holds re-verifies against a's signed head with a's
+        // still-valid inclusion proof — i.e. it is re-fetchable. (The wire exchange
+        // that moves the bytes back is networking, deferred.)
+        let mut a = core_with(85, &["a", "b", "c", "d", "e"]);
+        let head = a.head().unwrap().clone();
+        let pk = a.public_key();
+
+        // b fully replicates a (so b holds block 1).
+        let mut b = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = a.block(i).unwrap().unwrap();
+            let proof = a.proof(i).unwrap();
+            assert!(b.add_block(&head, i, &enc, &proof).unwrap());
+        }
+
+        // a clears block 1; b is unaffected.
+        assert_eq!(a.clear(1, 2).unwrap(), 1);
+        assert!(!a.has(1), "a cleared block 1");
+        assert_eq!(a.get(1).unwrap(), None);
+        assert_eq!(b.get(1).unwrap(), Some(blk("b")), "b not cleared");
+
+        // a's signed head and the tree are untouched, so the block re-supplied by
+        // the holder verifies against a's head with a's still-valid proof.
+        assert_eq!(a.head().unwrap(), &head, "clear left the signed head untouched");
+        let from_b = b.get(1).unwrap().unwrap();
+        let enc_from_b = Bytes.encode(&from_b); // codec is deterministic -> the committed bytes
+        let proof1 = a.proof(1).expect("a's tree still proves block 1 after clear");
+        assert!(
+            verify_block(&pk, &head, 1, &enc_from_b, &proof1),
+            "a block re-supplied by a holder verifies against a's unchanged head"
+        );
+
+        // a itself still has the hole until a refetch fills it (the refetch is the
+        // networking step we defer); the point proven here is that authentication
+        // survives the clear, so the bytes remain recoverable.
+        assert_eq!(a.contiguous_length(), 1, "a still has the hole until refetch");
     }
 }

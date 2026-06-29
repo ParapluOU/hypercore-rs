@@ -536,3 +536,38 @@ disk format, returns with the `storage` IndexedDB/native work) and `want` (repli
 networking, ADR-0003). The bitfield row (`bitfield.js` + `bit-interlude.js`/`mark-bitfield.js`/
 `mark-n-sweep.js`) stays `[~]`: the core structure is ported; staged-tx changes and GC marking
 (`mark-*`/`*-sweep`) are not yet built.
+
+## ADR-0031 — `clear` is presence reclamation over the bitfield; the tree is untouched, purge/redownload deferred
+**Context:** Upstream hypercore (`reference/js/hypercore/test/clear.js`) drops the locally-stored bytes
+for a block range without shortening the log: `core.clear(start, end)` clears the blocks' data and
+their bits in the presence bitfield, so `core.has(i)` becomes false and `core.get(i, {wait:false})`
+returns `null`, while `contiguousLength` shrinks to the first hole and the **Merkle tree / signed
+length are unchanged** — the blocks remain authenticated and re-downloadable from a peer (the
+`clear + replication` tests). `purge.js` is the orthogonal "delete the whole core + close all sessions"
+operation (file removal + session lifecycle). Most of upstream's `clear` surface is storage/disk
+(block streams, storage transactions) and replication (re-download); the *behaviour under test* — the
+presence/length separation — is pure L1.
+**Decision:** Wire iter 27's `storage::Bitfield` (ADR-0030) into `Hypercore` as a local **presence
+map**, and reimplement the **L1 behaviour-under-test** of `clear`, not the storage-stream / session
+layer. `append`/`commit` set the new blocks' presence bits (commit only *after* its writes succeed, so
+a rolled-back failed commit leaves presence untouched — consistent with ADR-0018); `truncate` clears
+the discarded tail's bits. `has(index)` = within length **and** the bit is set; `get`/`block` return
+`None` for an absent block (a no-wait read — at L1 there is no peer to wait on) and reserve
+[`Error::Corrupt`] for a genuine "bit set but bytes missing" inconsistency; `contiguous_length()` is
+the first absent index capped at the length. `clear(start, end)` clears the present blocks in the
+range — clearing the bit (logical absence) then best-effort-deleting the bytes — and returns the count
+cleared (`0` == upstream's `null`/no-op). It **never touches the Merkle tree**, so the signed head and
+every block proof are unaffected: a cleared block is still authenticated and re-verifiable from a
+holder (demonstrated host-safely without the wire by verifying a holder-supplied block against the
+unchanged head). Clearing absent or out-of-range blocks is a harmless no-op (upstream "no side effect
+from clearing unknown nodes").
+**Consequence:** The L1 presence/length separation of `clear.js` is ported and host-safe under
+`just verify` (`has`/`contiguous_length`/`get`-returns-`None`/the tree-untouched invariant). `Replica`
+is left as-is (it builds `[0, len)` strictly in order and is implicitly fully-present; sparse-replica
+presence is a networking concern). We **defer**: the replication re-download that *refills* a cleared
+block (networking, ADR-0003); `purge` (whole-core deletion is storage-backend + session lifecycle, out
+of scope per the relevance filter); physical storage reclamation guarantees (clearing is best-effort —
+a failed `delete` still marks the block absent, leaving an orphan, the same "logical state is the
+invariant" stance as ADR-0024's truncate and iter 23's rollback orphan); and the `diff`/byte-API return
+shape (commented out upstream). `clear.js` moves `[ ]`→`[~]`; `purge.js` stays `[ ]`. The `bitfield.js`
+row gains its first L1 *consumer* (`Hypercore` presence), tightening the deferred persistence story.
