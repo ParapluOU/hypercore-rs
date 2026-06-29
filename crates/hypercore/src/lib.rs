@@ -21,20 +21,38 @@ use storage::Store;
 /// the author might sign).
 const HEAD_DOMAIN: u8 = 0xC0;
 
-fn head_message(length: u64, root: &Hash) -> Vec<u8> {
-    let mut m = Vec::with_capacity(1 + 8 + 32);
+fn head_message(fork: u64, length: u64, root: &Hash) -> Vec<u8> {
+    let mut m = Vec::with_capacity(1 + 8 + 8 + 32);
     m.push(HEAD_DOMAIN);
+    m.extend_from_slice(&fork.to_le_bytes());
     m.extend_from_slice(&length.to_le_bytes());
     m.extend_from_slice(root);
     m
 }
 
 /// The author's signature over the current tree head.
+///
+/// The signed message binds a **`fork` counter** alongside the length and root.
+/// The writer bumps `fork` whenever it deliberately rewinds and rewrites history
+/// ([`Hypercore::truncate`]); a reader follows the highest fork. This makes a
+/// legitimate reorg by the author distinguishable from an *equivocation* — two
+/// contradictory histories signed at the **same** fork (see
+/// [`conflicting_heads`] / [`ForkProof`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedHead {
+    pub fork: u64,
     pub length: u64,
     pub root: Hash,
     pub sig: Sig,
+}
+
+/// Records the most recent truncation: the log shrank from `from` blocks to `to`
+/// blocks (`to < from`). Reset to `None` by the next append/commit — it reflects
+/// only the immediately preceding operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Truncation {
+    pub from: u64,
+    pub to: u64,
 }
 
 /// Errors from a [`Hypercore`], parameterised over the backend's error type.
@@ -91,6 +109,8 @@ pub struct Hypercore<T, C, S> {
     store: S,
     tree: MerkleTree,
     head: Option<SignedHead>,
+    fork: u64,
+    last_truncation: Option<Truncation>,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -105,6 +125,8 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             store,
             tree: MerkleTree::new(),
             head: None,
+            fork: 0,
+            last_truncation: None,
             _t: PhantomData,
         }
     }
@@ -125,18 +147,71 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         self.head.as_ref()
     }
 
+    /// The current fork counter (`0` for a log that was never truncated). It
+    /// increments by one on each [`truncate`](Self::truncate) and is signed into
+    /// every head.
+    pub fn fork(&self) -> u64 {
+        self.fork
+    }
+
+    /// Total byte size of the live blocks (sum of the Merkle root subtree sizes).
+    pub fn byte_length(&self) -> u64 {
+        self.tree.byte_length()
+    }
+
+    /// The truncation performed by the immediately preceding operation, or `None`
+    /// if the last operation was an append/commit (which clears it).
+    pub fn last_truncation(&self) -> Option<Truncation> {
+        self.last_truncation
+    }
+
+    /// Re-sign the current tree head under the current `fork`.
+    fn resign(&mut self) {
+        let length = self.tree.len();
+        let root = self.tree.root_hash();
+        let sig = self.author.sign(&head_message(self.fork, length, &root));
+        self.head = Some(SignedHead { fork: self.fork, length, root, sig });
+    }
+
     /// Append a value; returns its block index. Append-only: indices only grow.
     pub fn append(&mut self, value: &T) -> Result<u64, Error<S::Error>> {
         let bytes = self.codec.encode(value);
         let index = self.tree.len();
         self.store.put(index, &bytes).map_err(Error::Storage)?;
         self.tree.append(&bytes);
-
-        let length = self.tree.len();
-        let root = self.tree.root_hash();
-        let sig = self.author.sign(&head_message(length, &root));
-        self.head = Some(SignedHead { length, root, sig });
+        self.last_truncation = None;
+        self.resign();
         Ok(index)
+    }
+
+    /// Rewind the log to its first `new_len` blocks, discarding every block at
+    /// index `>= new_len`, then re-sign a new head under an **incremented `fork`
+    /// counter**. Returns the [`Truncation`] performed, or `None` if
+    /// `new_len >= len()` (nothing to truncate). Ports hypercore `core.js`'s
+    /// "append and truncate" behaviour (length / byteLength / fork progression).
+    ///
+    /// The new tree is node-for-node the prefix tree, so the new `root` is exactly
+    /// the prefix's root — but the bumped `fork` (signed into the head) marks this
+    /// as a *deliberate* reorg by the author, so a later truncate-and-rewrite is
+    /// not mistaken for an equivocation (which is a fork at the **same** counter;
+    /// see [`conflicting_heads`] / [`ForkProof`]).
+    ///
+    /// Storage is not eagerly reclaimed: blocks at `>= new_len` become logically
+    /// unreachable ([`get`](Self::get)/[`block`](Self::block) gate on the length)
+    /// and are overwritten when those indices are re-appended. The logical
+    /// truncation (tree + head) is a pure in-memory mutation, so it is atomic and
+    /// infallible; physical reclamation is a separate concern (upstream
+    /// `clear.js`/`purge.js`).
+    pub fn truncate(&mut self, new_len: u64) -> Option<Truncation> {
+        let from = self.tree.len();
+        if !self.tree.truncate(new_len) {
+            return None; // new_len >= len: nothing to do
+        }
+        self.fork += 1;
+        let t = Truncation { from, to: new_len };
+        self.last_truncation = Some(t);
+        self.resign();
+        Some(t)
     }
 
     /// Open an empty [`Batch`] based on the current log length.
@@ -206,11 +281,9 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         for enc in &batch.encoded {
             self.tree.append(enc);
         }
-        let length = self.tree.len();
-        let root = self.tree.root_hash();
-        let sig = self.author.sign(&head_message(length, &root));
-        self.head = Some(SignedHead { length, root, sig });
-        Ok(Some(length))
+        self.last_truncation = None;
+        self.resign();
+        Ok(Some(self.tree.len()))
     }
 
     /// Decode the value at `index`, or `None` if out of range.
@@ -263,9 +336,10 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         match &self.head {
             None => self.tree.is_empty(),
             Some(h) => {
-                h.length == self.tree.len()
+                h.fork == self.fork
+                    && h.length == self.tree.len()
                     && h.root == self.tree.root_hash()
-                    && self.public.verify(&head_message(h.length, &h.root), &h.sig)
+                    && self.public.verify(&head_message(h.fork, h.length, &h.root), &h.sig)
             }
         }
     }
@@ -275,42 +349,53 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
 /// log owned by `public`. This is what a replica/verifier uses — it needs only
 /// the public key, the signed head, and the block's proof.
 pub fn verify_block(public: &PublicKey, head: &SignedHead, index: u64, data: &[u8], proof: &Proof) -> bool {
-    public.verify(&head_message(head.length, &head.root), &head.sig)
+    public.verify(&head_message(head.fork, head.length, &head.root), &head.sig)
         && proof.block == index
         && proof.verify(data, &head.root)
 }
 
-/// Whether two signed heads from the **same author** are a proven fork.
+/// Whether two signed heads from the **same author** are a proven *equivocation*
+/// (a fork at one fork counter).
 ///
-/// For a fixed author the head at a given length is unique and deterministic —
-/// the root is a pure function of the first `length` blocks. So two heads of
-/// **equal length but different root**, each carrying the author's signature,
-/// are non-repudiable evidence that the author signed two incompatible logs (a
-/// fork). This is the proof-free detector: it needs only the two heads, and it
-/// is how a verifier first *notices* a fork — two contradictory heads at one
-/// length (upstream's replication-time `'conflict'` at a length; ADR-0019).
+/// At a fixed `(fork, length)` the head's root is a deterministic pure function
+/// of the first `length` blocks. So two heads of **equal fork and equal length
+/// but different root**, each carrying the author's signature, are non-repudiable
+/// evidence that the author signed two incompatible logs at the same counter —
+/// an equivocation. This is the proof-free detector: it needs only the two
+/// heads, and it is how a verifier first *notices* a fork — two contradictory
+/// heads at one length (upstream's replication-time `'conflict'` at a length;
+/// ADR-0019).
 ///
-/// Heads of **different** lengths are deliberately not flagged here: an honest
-/// log of length `L2 > L1` legitimately extends the length-`L1` head, so a
-/// divergence between different-length heads must instead be pinned to a shared
-/// block index with a [`ForkProof`].
+/// **Different forks are not flagged.** When the author deliberately rewinds and
+/// rewrites it bumps the `fork` counter ([`Hypercore::truncate`]); a reader
+/// follows the highest fork, so two heads at different forks are a legitimate
+/// reorg, not equivocation. Heads of **different lengths** are likewise not
+/// flagged here — an honest log of length `L2 > L1` legitimately extends the
+/// length-`L1` head — so a same-fork divergence across different lengths must
+/// instead be pinned to a shared block index with a [`ForkProof`].
 pub fn conflicting_heads(public: &PublicKey, a: &SignedHead, b: &SignedHead) -> bool {
-    a.length == b.length
+    a.fork == b.fork
+        && a.length == b.length
         && a.root != b.root
-        && public.verify(&head_message(a.length, &a.root), &a.sig)
-        && public.verify(&head_message(b.length, &b.root), &b.sig)
+        && public.verify(&head_message(a.fork, a.length, &a.root), &a.sig)
+        && public.verify(&head_message(b.fork, b.length, &b.root), &b.sig)
 }
 
 /// Non-repudiable evidence that one author committed **two different blocks at
 /// the same index** — a fork proven at a specific block index.
 ///
 /// Each side pairs a signed head with an inclusion proof and the block bytes it
-/// commits at `index`. If both sides are signed by the author and prove their
-/// block at `index`, and the two blocks differ, the author signed two
-/// incompatible histories (under leaf collision-resistance, different bytes ⇒ a
-/// different committed leaf). Unlike [`conflicting_heads`], this works across
-/// heads of **different lengths** (e.g. a truncate-and-rewrite fork): it pins
-/// the disagreement to one shared index rather than the whole-tree root.
+/// commits at `index`. If both sides are signed by the author **at the same fork
+/// counter** and prove their block at `index`, and the two blocks differ, the
+/// author signed two incompatible histories at one counter (under leaf
+/// collision-resistance, different bytes ⇒ a different committed leaf) — an
+/// equivocation. Unlike [`conflicting_heads`], this works across heads of
+/// **different lengths** (e.g. an equivocation that also truncated one side): it
+/// pins the disagreement to one shared index rather than the whole-tree root.
+///
+/// A divergence across **different** forks is *not* a fork: that is a legitimate
+/// reorg by the author ([`Hypercore::truncate`] bumps the counter), which is why
+/// `verify` requires both heads to carry the same `fork`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkProof {
     /// The block index at which the two logs disagree.
@@ -324,12 +409,14 @@ pub struct ForkProof {
 }
 
 impl ForkProof {
-    /// Verify this is a genuine fork by `public`: both sides must be signed by
-    /// `public`, prove their block at `index`, and commit **different** bytes
-    /// there. Returns `false` for anything else — a forged side, a consistent
-    /// pair (same bytes), a tampered proof, or a mismatched index claim.
+    /// Verify this is a genuine equivocation by `public`: both sides must be
+    /// signed by `public` **at the same fork counter**, prove their block at
+    /// `index`, and commit **different** bytes there. Returns `false` for anything
+    /// else — a forged side, a cross-fork (legitimate-reorg) divergence, a
+    /// consistent pair (same bytes), a tampered proof, or a mismatched index claim.
     pub fn verify(&self, public: &PublicKey) -> bool {
-        verify_block(public, &self.head_a, self.index, &self.data_a, &self.proof_a)
+        self.head_a.fork == self.head_b.fork
+            && verify_block(public, &self.head_a, self.index, &self.data_a, &self.proof_a)
             && verify_block(public, &self.head_b, self.index, &self.data_b, &self.proof_b)
             && self.data_a != self.data_b
     }
@@ -425,7 +512,7 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
             && new_head.length > self.tree.len()
             && self
                 .public
-                .verify(&head_message(new_head.length, &new_head.root), &new_head.sig)
+                .verify(&head_message(new_head.fork, new_head.length, &new_head.root), &new_head.sig)
             && proof.verify(&self.tree.roots(), &new_head.root)
     }
 
@@ -512,7 +599,7 @@ mod tests {
         a.append(&1).unwrap();
         let head = a.head().unwrap();
         let b_pub = author(5).public();
-        assert!(!b_pub.verify(&head_message(head.length, &head.root), &head.sig));
+        assert!(!b_pub.verify(&head_message(head.fork, head.length, &head.root), &head.sig));
     }
 
     #[test]
@@ -656,7 +743,7 @@ mod tests {
 
         // The forked head *is* signed by the same author (signature alone passes)...
         assert!(pk.verify(
-            &head_message(forked_head9.length, &forked_head9.root),
+            &head_message(forked_head9.fork, forked_head9.length, &forked_head9.root),
             &forked_head9.sig
         ));
         // ...but the replica's honest roots can't fold the forked extension up to
@@ -1061,5 +1148,182 @@ mod tests {
         let cross = fork_proof_at(2, &a, &b);
         assert!(!cross.verify(&a.public_key()));
         assert!(!cross.verify(&b.public_key()));
+    }
+
+    // ---- truncate + fork counter (upstream `core.js` "append and truncate") ----
+
+    #[test]
+    fn append_and_truncate_tracks_fork_and_byte_length() {
+        // Ports core.js "core - append and truncate": each truncate bumps the
+        // fork counter and shrinks byteLength; lastTruncation records {from,to}
+        // and the next append clears it. (byteLength is the *encoded* prefix size
+        // — the bytes the tree commits — so we compare to a fresh prefix core
+        // rather than raw payload lengths.)
+        let blen = |items: &[&str]| -> u64 {
+            let mut c = Hypercore::<Vec<u8>, _, _>::new(author(50), Bytes, MemoryStore::new());
+            for s in items {
+                c.append(&blk(s)).unwrap();
+            }
+            c.byte_length()
+        };
+
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(50), Bytes, MemoryStore::new());
+        for s in ["hello", "world", "fo", "ooo"] {
+            core.append(&blk(s)).unwrap();
+        }
+        assert_eq!(core.len(), 4);
+        assert_eq!(core.byte_length(), blen(&["hello", "world", "fo", "ooo"]));
+        assert_eq!(core.fork(), 0);
+        assert_eq!(core.last_truncation(), None);
+        assert!(core.verify_head());
+
+        assert_eq!(core.truncate(3), Some(Truncation { from: 4, to: 3 }));
+        assert_eq!(core.last_truncation(), Some(Truncation { from: 4, to: 3 }));
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.byte_length(), blen(&["hello", "world", "fo"]));
+        assert_eq!(core.fork(), 1);
+        assert!(core.verify_head(), "head consistent after truncate");
+
+        for s in ["a", "b", "c", "d"] {
+            core.append(&blk(s)).unwrap();
+        }
+        assert_eq!(core.last_truncation(), None, "append clears lastTruncation");
+        assert_eq!(core.len(), 7);
+
+        assert_eq!(core.truncate(3), Some(Truncation { from: 7, to: 3 }));
+        assert_eq!(core.fork(), 2);
+        assert_eq!(core.len(), 3);
+        assert_eq!(core.byte_length(), blen(&["hello", "world", "fo"]));
+
+        assert_eq!(core.truncate(2), Some(Truncation { from: 3, to: 2 }));
+        assert_eq!(core.fork(), 3);
+        assert_eq!(core.len(), 2);
+        assert_eq!(core.byte_length(), blen(&["hello", "world"]));
+
+        // append-then-truncate cycles, each bumping fork by exactly one — mirrors
+        // the upstream fork progression up to 7.
+        let mut expect_fork = 3u64;
+        for _ in 0..4 {
+            core.append(&blk("a")).unwrap();
+            assert_eq!(core.last_truncation(), None);
+            assert_eq!(core.truncate(2), Some(Truncation { from: 3, to: 2 }));
+            expect_fork += 1;
+            assert_eq!(core.fork(), expect_fork);
+            assert_eq!(core.len(), 2);
+            assert_eq!(core.byte_length(), blen(&["hello", "world"]));
+        }
+        assert_eq!(core.fork(), 7, "seven truncations => fork 7");
+
+        // no-op truncates change nothing.
+        assert_eq!(core.truncate(2), None, "truncate to current length is a no-op");
+        assert_eq!(core.truncate(9), None, "truncate beyond length is a no-op");
+        assert_eq!(core.fork(), 7);
+        assert!(core.verify_head());
+        // surviving blocks are still readable; the truncated tail is gone.
+        assert_eq!(core.get(0).unwrap(), Some(blk("hello")));
+        assert_eq!(core.get(1).unwrap(), Some(blk("world")));
+        assert_eq!(core.get(2).unwrap(), None);
+    }
+
+    #[test]
+    fn truncated_head_matches_fresh_prefix() {
+        // After truncating to L the tree root equals a fresh log of the first L
+        // blocks (root is a pure function of the prefix); the heads differ only
+        // by the fork counter (and thus the signature).
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(51), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d", "e"] {
+            core.append(&blk(s)).unwrap();
+        }
+        core.truncate(3);
+
+        let mut fresh = Hypercore::<Vec<u8>, _, _>::new(author(51), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c"] {
+            fresh.append(&blk(s)).unwrap();
+        }
+
+        let th = core.head().unwrap();
+        let fh = fresh.head().unwrap();
+        assert_eq!(th.length, fh.length);
+        assert_eq!(th.root, fh.root, "truncated root == fresh prefix root");
+        assert_eq!(core.fork(), 1);
+        assert_eq!(fresh.fork(), 0);
+        assert_ne!(th, fh, "heads differ by the fork counter");
+        for i in 0..3u64 {
+            assert_eq!(core.get(i).unwrap(), fresh.get(i).unwrap());
+        }
+        assert_eq!(core.get(3).unwrap(), None, "the truncated block is gone");
+    }
+
+    #[test]
+    fn replica_replicates_truncated_log() {
+        // A replica replicating a truncated-and-rewritten source ends
+        // byte-identical — the fork counter is carried through the signed head
+        // (every block verifies against a head whose message binds the fork).
+        let mut src = Hypercore::<Vec<u8>, _, _>::new(author(52), Bytes, MemoryStore::new());
+        for s in ["a", "b", "c", "d", "e"] {
+            src.append(&blk(s)).unwrap();
+        }
+        src.truncate(2);
+        src.append(&blk("Z")).unwrap(); // [a,b,Z], fork 1
+        let head = src.head().unwrap().clone();
+        assert_eq!(head.fork, 1);
+        assert_eq!(src.len(), 3);
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(src.public_key(), Bytes, MemoryStore::new());
+        for i in 0..src.len() {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head, i, &enc, &proof).unwrap(), "block {i} accepted");
+        }
+        assert_eq!(rep.len(), src.len());
+        assert_eq!(rep.root_hash(), head.root);
+        assert_eq!(rep.verified_head(), Some(&head));
+        for i in 0..src.len() {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn reorg_with_bumped_fork_is_not_equivocation() {
+        // A writer that truncates and rewrites under a *new* fork is doing a
+        // legitimate reorg, not equivocation: same-length heads at *different*
+        // forks are not flagged, and a cross-fork ForkProof does not verify.
+        let original = core_with(53, &["a", "b", "c", "d", "e"]); // fork 0
+
+        let mut reorged = core_with(53, &["a", "b", "c", "d", "e"]);
+        reorged.truncate(3);
+        reorged.append(&blk("X")).unwrap();
+        reorged.append(&blk("Y")).unwrap(); // [a,b,c,X,Y], fork 1
+        let pk = original.public_key();
+        assert_eq!(pk, reorged.public_key());
+
+        let ho = original.head().unwrap();
+        let hr = reorged.head().unwrap();
+        assert_eq!(ho.length, hr.length);
+        assert_ne!(ho.root, hr.root);
+        assert_eq!(ho.fork, 0);
+        assert_eq!(hr.fork, 1);
+        assert!(
+            !conflicting_heads(&pk, ho, hr),
+            "different forks => legitimate reorg, not a conflict"
+        );
+
+        // The per-index disagreement at block 3 ('d' vs 'X') is across forks.
+        let across = fork_proof_at(3, &original, &reorged);
+        assert_ne!(across.data_a, across.data_b);
+        assert!(!across.verify(&pk), "cross-fork divergence is a reorg, not equivocation");
+
+        // Positive control: a second writer reaching the same rewritten content
+        // at the *same* fork (0) IS a provable equivocation.
+        let equivocating = core_with(53, &["a", "b", "c", "X", "Y"]); // fork 0
+        let he = equivocating.head().unwrap();
+        assert_eq!(he.fork, 0);
+        assert_ne!(ho.root, he.root);
+        assert!(
+            conflicting_heads(&pk, ho, he),
+            "same fork, different root => equivocation"
+        );
+        let fork = fork_proof_at(3, &original, &equivocating);
+        assert!(fork.verify(&pk), "same-fork divergence is a provable fork");
     }
 }

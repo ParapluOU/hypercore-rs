@@ -198,6 +198,38 @@ impl MerkleTree {
         block
     }
 
+    /// Rewind the tree to its first `new_len` blocks, discarding every block —
+    /// and every derived node — at index `>= new_len`. Returns `true` if the
+    /// tree changed (`false`, a no-op, when `new_len >= len()`). The local
+    /// "rewind to a prefix" primitive behind hypercore truncate.
+    ///
+    /// Because the first `new_len` blocks are untouched, the result is
+    /// **node-for-node identical** to a fresh tree built from just those blocks:
+    /// a node is kept exactly when its whole block range lies within
+    /// `[0, new_len)`, so every retained node covers only unchanged blocks and
+    /// has the hash the prefix would produce, and the kept set is precisely the
+    /// completed-subtree set a fresh prefix builds. Hence
+    /// [`root_hash`](MerkleTree::root_hash) equals the prefix's root hash (the
+    /// head at a length is a pure function of the first `length` blocks — the
+    /// same property fork detection rests on).
+    pub fn truncate(&mut self, new_len: u64) -> bool {
+        if new_len >= self.length {
+            return false;
+        }
+        // Keep only nodes fully within the surviving prefix; what remains is the
+        // fully-built tree of the first `new_len` blocks.
+        self.nodes.retain(|&i, _| flat::block_range(i).1 <= new_len);
+        self.length = new_len;
+        true
+    }
+
+    /// Total byte size of every live block — the sum of the (authenticated) root
+    /// subtree sizes. Shrinks under [`truncate`](MerkleTree::truncate); `0` when
+    /// empty.
+    pub fn byte_length(&self) -> u64 {
+        self.roots().iter().map(|r| r.size).sum()
+    }
+
     /// The current root nodes (one per complete power-of-two subtree).
     pub fn roots(&self) -> Vec<Node> {
         if self.length == 0 {
@@ -1726,5 +1758,75 @@ mod tests {
                 assert!(corrupt.is_intact(), "recovered tree intact (n={n}, i={i})");
             }
         }
+    }
+
+    // truncate: rewinding to `new_len` leaves a tree node-for-node identical to
+    // a fresh tree of the first `new_len` blocks — for every (new_len < n) over a
+    // range of sizes. The root hash, node set, byte length, and proofs all match.
+    #[test]
+    fn truncate_equals_fresh_prefix_all_sizes() {
+        for n in 1..=20u64 {
+            for new_len in 0..n {
+                let (mut t, blocks) = tree(n as usize);
+                assert!(t.truncate(new_len), "truncate {n}->{new_len} changes the tree");
+                assert_eq!(t.len(), new_len);
+
+                let fresh = tree_from(&blocks[..new_len as usize]);
+                assert_eq!(t.len(), fresh.len());
+                assert_eq!(t.root_hash(), fresh.root_hash(), "root == prefix root ({n}->{new_len})");
+                assert_eq!(t.byte_length(), fresh.byte_length(), "byte_length == prefix");
+                assert_eq!(t.roots(), fresh.roots(), "root nodes identical");
+                // The node maps coincide exactly (no stale nodes left behind).
+                let live: Vec<u64> = t.missing_nodes();
+                assert!(live.is_empty(), "truncated tree is intact ({n}->{new_len})");
+                // Every surviving block still proves against the truncated root.
+                for b in 0..new_len {
+                    let p = t.proof(b).expect("surviving block proves");
+                    assert!(p.verify(&blocks[b as usize], &t.root_hash()), "block {b} proves");
+                }
+                // A block past the new length is gone.
+                assert!(t.proof(new_len).is_none(), "truncated block has no proof");
+            }
+        }
+    }
+
+    // truncate byte_length tracks the live prefix byte size exactly.
+    #[test]
+    fn truncate_byte_length() {
+        let mut t = MerkleTree::new();
+        for b in [&b"hello"[..], b"world", b"fo", b"ooo"] {
+            t.append(b);
+        }
+        assert_eq!(t.byte_length(), 15); // 5+5+2+3
+        assert!(t.truncate(3));
+        assert_eq!(t.byte_length(), 12); // 5+5+2
+        assert!(t.truncate(2));
+        assert_eq!(t.byte_length(), 10); // 5+5
+        assert!(t.truncate(0));
+        assert_eq!(t.byte_length(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.root_hash(), MerkleTree::new().root_hash(), "empty == fresh empty");
+    }
+
+    // truncate is a no-op (returns false, no change) when new_len >= len, and a
+    // truncated tree can be appended to again, re-deriving the discarded indices.
+    #[test]
+    fn truncate_noop_and_reappend() {
+        let (mut t, _) = tree(5);
+        let root5 = t.root_hash();
+        assert!(!t.truncate(5), "truncate to current length is a no-op");
+        assert!(!t.truncate(9), "truncate beyond length is a no-op");
+        assert_eq!(t.root_hash(), root5, "no-op truncate left the tree unchanged");
+
+        assert!(t.truncate(3));
+        // Re-append two blocks; the result equals a fresh 5-block tree of the new
+        // content (the reused indices are overwritten cleanly).
+        t.append(b"new-3");
+        t.append(b"new-4");
+        let mut fresh = tree_from(&[b"block-0".to_vec(), b"block-1".to_vec(), b"block-2".to_vec()]);
+        fresh.append(b"new-3");
+        fresh.append(b"new-4");
+        assert_eq!(t.root_hash(), fresh.root_hash(), "re-append after truncate is clean");
+        assert!(t.is_intact());
     }
 }

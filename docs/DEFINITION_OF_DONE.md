@@ -53,7 +53,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       (data-free consistency / anti-fork-across-lengths, ADR-0020) + **byte-offset seek** (tree-accelerated
       `seek` == linear scan + standalone data-free `SeekProof` locating byte→block against the signed root,
       ADR-0022) + **node recovery** (repair mode + data-free `NodeProof` authenticating any tree node against
-      the signed root + atomic `recover_node`, ADR-0023); upstream `additionalNodes`/seek-`padding`/reorg +
+      the signed root + atomic `recover_node`, ADR-0023) + **truncate** (pure in-memory rewind to a
+      prefix — node-for-node identical to a fresh prefix, so `root_hash` is the prefix root — plus
+      `byte_length`, ADR-0024); upstream `additionalNodes`/seek-`padding`/reorg-by-proof +
       replication-driven repair tracked separately on `merkle-tree.js`/`merkle-tree-recovery.js`
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
@@ -63,7 +65,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +
       **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019) +
       **verified length-extension replication** (`Replica::verify_upgrade` — accept a longer signed head only
-      as an append-only extension of the replica's own roots *before* fetching the new blocks; ADR-0021)
+      as an append-only extension of the replica's own roots *before* fetching the new blocks; ADR-0021) +
+      **truncate** (logical rewind to a prefix + a signed `fork` counter; equivocation refined to a
+      *same-fork* contradiction so a fork-bumped reorg is not flagged; ADR-0024)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)

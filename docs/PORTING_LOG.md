@@ -673,3 +673,66 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg/`additionalNodes` (the last
   `merkle-tree.js`/`merkle-tree-recovery.js` pieces); `autobase` `topolist.js` ordering; and the
   view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 17: `hypercore` truncate + signed `fork` counter
+
+**Did**
+- Added **truncate** — the local "rewind to a prefix" capability behind upstream `core.js`'s
+  "core - append and truncate" test (and `move-to.js`'s `truncate(1)`), with no networking:
+  - `merkle`: `MerkleTree::truncate(new_len)` discards every block — and derived node — at index
+    `>= new_len` (`retain` nodes whose whole block range lies in `[0, new_len)`), leaving a tree
+    **node-for-node identical** to a fresh tree of the first `new_len` blocks, so `root_hash()` equals
+    the prefix's root (the head at a length is a pure function of the first `length` blocks — the same
+    property fork detection rests on). `byte_length()` = sum of the (authenticated) root subtree sizes.
+  - `hypercore`: a signed **`fork` counter** now binds into the head message
+    (`head_message(fork, length, root)`) and `SignedHead`. `Hypercore::truncate(new_len) ->
+    Option<Truncation>` rewinds the tree, **increments `fork` by one**, re-signs, and records
+    `last_truncation { from, to }`; the next `append`/`commit` clears it. Accessors `fork()`,
+    `byte_length()`, `last_truncation()`. A private `resign()` consolidates the three signing sites
+    (append / commit / truncate).
+- **Sharpened fork detection for the fork counter (extends ADR-0019).** An *equivocation* is now two
+  contradictory histories at the **same** fork: `conflicting_heads` requires `a.fork == b.fork` (in
+  addition to equal length / different root), and `ForkProof::verify` requires `head_a.fork ==
+  head_b.fork`. A divergence across **different** forks is a legitimate author reorg (truncate bumps
+  the counter; readers follow the highest fork) and is no longer flagged.
+- 7 asserting tests (merkle 30→33, hypercore 22→26):
+  - merkle: truncate == fresh-prefix for every `(new_len < n)` over sizes 1..=20 (root hash, root
+    nodes, `byte_length`, intactness, surviving-block proofs all match a fresh prefix); `byte_length`
+    tracks the live prefix (incl. truncate-to-0 == fresh empty); no-op truncate (`new_len >= len`) +
+    clean re-append after truncate (reused indices overwritten).
+  - hypercore: the `core.js` fork/length/byteLength/`lastTruncation` progression (fork 0→7 over seven
+    truncations, append clearing `lastTruncation`, no-op truncates); truncated head == fresh-prefix
+    head up to the fork counter; a replica replicates a truncated-and-rewritten source byte-identically
+    (fork carried through the head); and **reorg-with-bumped-fork is not equivocation** (cross-fork
+    same-length heads not flagged, cross-fork `ForkProof` refused) vs a same-fork rewrite which **is** a
+    provable fork.
+- `just verify` green: 89 native tests + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0024: truncate is a **pure in-memory rewind to a prefix + a signed fork counter**, not upstream's
+  storage-batch truncate (`MerkleTreeBatch.truncate` + reorg-hint persistence). The fork counter is
+  signed into the head so a deliberate reorg is distinguishable from an equivocation; this refines fork
+  detection (equivocation = same-fork contradiction). We **defer** physical storage reclamation
+  (blocks `>= new_len` go unreachable and are overwritten on re-append; `clear`/`purge` are separate),
+  reorg-by-proof, and `additionalNodes`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Truncate is just "rewind to a prefix": keep every tree node whose block range is `< new_len` and the
+  result is byte-for-byte the prefix tree (so the root is the prefix's root — no recomputation), because
+  the first `new_len` blocks were never touched. The signed **fork counter** is what makes truncation a
+  first-class, non-equivocating operation: bind it into the head and an equivocation becomes a
+  *same-fork* contradiction (a higher fork is a legitimate reorg, which readers follow). Watch the
+  framing: `byte_length` is the **encoded** (stored) prefix size the tree commits to, not raw payload
+  length, so assert it against a freshly-built prefix rather than hardcoded byte counts.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not started — needs an XPC service outside the loop's allowlist — and the image
+  pull needs network; see iters 11–16). When a container runtime is *started*, build `tools/oracle/`
+  driving the reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg-by-proof/`additionalNodes` (the last
+  `merkle-tree.js`/`merkle-tree-recovery.js` pieces); `autobase` `topolist.js` ordering; and the
+  view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js` view-length assertions need.

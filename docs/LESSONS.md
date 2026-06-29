@@ -153,3 +153,18 @@ personal data** (this repo is public; use repo-relative paths).
   trivial deps via Node's `Module._compile` over the reference source (no npm, no network), feed nodes to
   `Topolist.add` in causal order, and compare `.tip` to our `order()`. Precondition the JS reference can't
   remove: a **started** container runtime (`container system start`) — the sandbox only does `container run`.
+- **Truncate is "rewind to a prefix": keep nodes fully inside `[0, new_len)` and the root is the
+  prefix's root for free.** A flat-tree truncation needs no recomputation — `retain` only the nodes
+  whose whole block range is `< new_len` and what remains is byte-for-byte the tree a fresh prefix
+  builds (the surviving blocks were never touched, so every kept hash already matches). So
+  `root_hash()` after truncate == the fresh prefix's root, which is the same "head at a length is a pure
+  function of the first `length` blocks" property fork detection rests on. The signed **fork counter**
+  is what makes truncate a first-class, non-equivocating op: bind it into the head message and an
+  *equivocation* becomes a **same-fork** contradiction — two heads at different forks are a legitimate
+  reorg the writer performed (readers follow the highest fork), so `conflicting_heads`/`ForkProof` must
+  require equal forks. Two framing gotchas: (1) `byte_length` is the **encoded** (stored) prefix size
+  the tree commits to, not raw payload length (the codec adds a varint length prefix), so assert it
+  against a freshly-built prefix core, not hardcoded byte counts; (2) don't eagerly delete the truncated
+  blocks from storage — they're unreachable (`get`/`block` gate on the length) and overwritten on
+  re-append, so a pure in-memory tree+head mutation keeps truncate atomic and infallible (physical
+  reclamation is a separate `clear`/`purge` capability).

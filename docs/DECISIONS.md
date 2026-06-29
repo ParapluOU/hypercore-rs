@@ -328,3 +328,35 @@ with networking (ADR-0003) — and still defer reorg/`additionalNodes`. Soundnes
 collision-resistance the scheme already assumes (a peer cannot foist a wrong node without colliding the
 trusted root). A corrupt *source* cannot prove the node it lost (`node_proof` needs the node present), so
 proofs necessarily flow from a healthy holder to the gap.
+
+## ADR-0024 — Truncate is a pure rewind-to-a-prefix + a signed fork counter; equivocation is same-fork
+**Context:** Upstream hypercore (`reference/js/hypercore/test/core.js` "core - append and truncate";
+`move-to.js`) truncates a log via `MerkleTreeBatch.truncate(length, fork)` against the storage layer:
+it pops roots past the new length, sets a caller-supplied **`fork`** counter, recomputes `byteLength`,
+flips `upgraded`, persists a reorg hint, and tracks `lastTruncation { from, to }`. The signed head/
+manifest binds the fork, so a reader follows the highest fork and a deliberate truncate-and-rewrite is
+distinguishable from a malicious one. The storage-batch / atom / reorg-hint machinery is sessions/
+storage plumbing (out of scope per the relevance filter).
+**Decision:** Reimplement the **L1 behaviour-under-test**, not the storage-batch layer:
+- `MerkleTree::truncate(new_len)` is a pure in-memory rewind — `retain` only nodes whose whole block
+  range lies in `[0, new_len)`. Because the surviving blocks were never touched, the kept node set
+  (and every hash) is exactly a fresh tree of the first `new_len` blocks, so `root_hash()` equals the
+  prefix's root with **no recomputation**. `byte_length()` is the sum of the (authenticated) root
+  subtree sizes.
+- A **`fork` counter** binds into the head message (`head_message(fork, length, root)`) and
+  `SignedHead`. `Hypercore::truncate(new_len)` rewinds the tree, **increments `fork`** (we auto-bump by
+  one rather than taking an explicit fork like upstream — the loop's writer is the sole authority), re-
+  signs, and records `last_truncation`; `append`/`commit` clear it.
+- The fork counter refines fork detection (extends ADR-0019): an **equivocation** is two contradictory
+  histories at the **same** fork, so `conflicting_heads` and `ForkProof::verify` now require equal
+  `fork`. A divergence across **different** forks is a legitimate author reorg (readers follow the
+  highest fork) and is not flagged.
+**Consequence:** Truncate is atomic and infallible (pure in-memory mutation of the tree + head, the
+log's source of truth). We **defer** physical storage reclamation — blocks at `>= new_len` become
+logically unreachable (`get`/`block` gate on the length) and are overwritten when those indices are
+re-appended; reclaiming them eagerly is a separate capability (upstream `clear.js`/`purge.js`). We also
+defer reorg-by-proof (accepting a remote truncation/reorg over the wire) and `additionalNodes`. The
+`fork` field changes the head's signed-message format (a clean-room divergence; we are not
+wire-compatible anyway, ADR-0001) — every signing/verifying site routes through `head_message`, so the
+change is centralized. `core.js` advances (truncate behaviour ported); `conflicts.js` gains the
+same-fork equivocation refinement.
