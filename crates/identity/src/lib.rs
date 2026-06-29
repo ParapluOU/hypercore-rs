@@ -11,6 +11,9 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+mod manifest;
+pub use manifest::{Manifest, PartialSig, Prologue, Signer as ManifestSigner, DEFAULT_NAMESPACE};
+
 /// An ed25519 signing key. Keep secret.
 #[derive(Clone)]
 pub struct SecretKey(SigningKey);

@@ -1651,3 +1651,87 @@ Repo-relative paths only — no private or personal data (this repo is public).
   - more natively-testable rows: `manifest.js` (the full multi-signer `Verifier`/`multisig` config, of which
     the prologue piece is now done); `merkle` reorg-by-proof / `additionalNodes`; the replication re-download
     that refills a cleared block + `purge`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 32: `identity` multi-signer manifest verifier (`manifest.js`)
+
+**Did**
+- Picked the next natively-testable, in-scope red item from iter 31's "Next": the multi-signer
+  **manifest verifier** (`reference/js/hypercore/test/manifest.js` + `lib/{verifier,multisig,caps}.js`),
+  whose prologue piece was done in iter 31 (ADR-0034). (The other non-env-blocked candidate — the
+  deferred fork/merge consensus, ADR-0015 — LESSONS.md says to defer until the JS oracle, gate #4, can
+  cross-check it; gate #4 is still env-blocked, so attempting it now would defy the project's own recorded
+  guidance.)
+- Distilled the L1 behaviour-under-test — a **content-addressed quorum-of-signers policy** — into a
+  standalone primitive in `crates/identity` (`crates/identity/src/manifest.rs`), clean-room (ADR-0001),
+  stripped of the wire format / v0 compat / `allowPatch` patch-signing / `linked`/`userData` wrapping:
+  - `Signer { public_key: PublicKey, namespace: [u8; 32] }`; `Manifest { quorum, signers, prologue }` with
+    `Manifest::new` (validates: no empty signers / `quorum != 0` / `quorum <= signers.len()` — upstream's
+    `createManifest` rejections), `Manifest::single(pk)` (the default one-author manifest), and
+    `Manifest::static_signer(prologue)` (quorum 0 + prologue only).
+  - `Manifest::hash()` — the **content-addressed identity** (domain-separated, length-bound blake3 over
+    quorum + ordered signers + prologue), i.e. the would-be log key; `Manifest::single(pk).hash()` is a
+    plain core's key (≡ upstream `Hypercore.key(publicKey)`).
+  - `Manifest::signable(length, tree_hash)` — the bytes a signer signs, **binding the manifest hash**
+    (the modern `ctx = manifestHash` path — a signature is valid only under this exact policy; the
+    per-signer namespace folds into the hash, not the v1 signing context); `Manifest::sign(secret, …)`
+    finds the matching declared signer or returns `None`.
+  - `Manifest::verify(length, tree_hash, &[PartialSig])` — a `Prologue` prefix self-authorizes on content
+    (`length == prologue.length && tree_hash == prologue.hash`, no signature; the manifest-level form of
+    ADR-0034), else the **multisig quorum** rule (`_verifyMulti`): ≥ quorum signatures, each a distinct
+    in-range signer, each valid; any out-of-range/repeated signer or any invalid supplied signature
+    rejects. Added `blake3` to `identity`'s deps (already a workspace dep via `merkle`; wasm-safe).
+- 7 asserting tests (identity 4→11; workspace 152→159): `static_signer_authorizes_only_the_committed_prefix`
+  (upstream "static signer" — committed prefix accepted on content, length 2 / wrong hash rejected);
+  `single_signer_sign_then_verify` ("single signer" — sign→verify, tampered sig / non-signer key / wrong-head
+  sig rejected); `multi_signer_quorum_and_distinctness` ("multi signer" — two distinct valid sigs accept;
+  a's sig in b's slot / same signer twice / one sig under quorum 2 / out-of-range index all reject — the
+  `badSignature`/`secondBadSignature`/`thirdBadSignature` cases); `manifest_hash_is_content_addressed_identity`
+  ("defaults" + `Hypercore.key(manifest) == Hypercore.key(publicKey)` — `single` ≡ a built one-signer
+  manifest, deterministic, different key/namespace/quorum → different hash, a sig bound to one policy
+  doesn't verify under another); `invalid_manifests_are_rejected` (construction validation = upstream's
+  throws; majority `default_quorum`); `prologue_floor_with_signers_past_it` (prologue short-circuit then
+  `_verifyMulti`); `extra_signatures_beyond_quorum_are_accepted` (2-of-3, all-three / exact-quorum accept,
+  under-quorum reject). `just verify` green: **159 native tests** (autobase 24 across files + codec 8 +
+  hypercore 55 + identity 11 + merkle 44 + storage 17) + wasm build of `hypercore`/`autobase`/`storage`
+  (which now pulls `identity`+`blake3` for `wasm32`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0035: the multi-signer manifest verifier is an **L1 content-addressed quorum primitive in
+  `identity`**, not upstream's wire/compat/patch layer. We **diverge**: clean-room manifest hash (not
+  compact-encoding + blake2b), require **all supplied** signatures valid+distinct (vs upstream's first-
+  `quorum`; behaviourally identical for a distinct-valid quorum set, strictly safer), and implement only
+  the modern v1 `ctx = manifestHash` path (the namespace folds into the hash). A non-ed25519 signer is
+  **structurally impossible** (type-enforced "unsupported curve"). We **defer**: wiring the verifier into
+  `Hypercore` (the manifest-hash-into-key binding — replacing the single-key `SignedHead`), the **compat
+  (v0)** signer path, `allowPatch` cross-length patch signing, `linked`/`userData` fields, the multisig
+  **wire format** (`assemble`/`inflate`), and the session-level `moveTo`/`multisig - append`/`patches`
+  (sessions/networking). `manifest.js` moves `[ ]`→`[~]`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A multi-signer manifest is a **content-addressed quorum policy** — the signing rule hashed into the
+  identity, so who may sign can't change without changing the key (and a single-signer manifest's hash
+  *is* a plain core's key). Sign over a `signable` that **binds the manifest hash** (the v1 `ctx`); the
+  namespace folds into the hash, not the signing context. `verify` short-circuits a prologue prefix on
+  content, else the quorum rule. Four gotchas: enforce signer **distinctness** (same signer twice ≠ two
+  sigs — a real attack), require **count of distinct-valid ≥ quorum** (not "any valid"), get the
+  "unsupported curve" rejection **for free from the type system** (so test the *config* validation
+  instead), and requiring all-supplied-valid is safely stricter than upstream's first-`quorum`. The wire
+  format / compat / patch / Hypercore wiring are deferred wrapping that don't change the primitive.
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable under
+    the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend `[ ]`
+    would also wire the bitfield's deferred `open`/`flush` persistence (and persist the presence map /
+    snapshots);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view layer
+    (`apply.js`/`anchors.js`);
+  - more natively-testable rows: **wire the manifest verifier into `Hypercore`** (manifest-hash-into-key
+    binding, the deferred half of ADR-0035) — replacing the single-key `SignedHead` with a `Manifest`;
+    `merkle` reorg-by-proof / `additionalNodes`; the replication re-download that refills a cleared block +
+    `purge`; `hyperbee`.

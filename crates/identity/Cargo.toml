@@ -6,3 +6,4 @@ repository.workspace = true
 
 [dependencies]
 ed25519-dalek = "2"
+blake3 = "1"

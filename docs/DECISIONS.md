@@ -682,3 +682,51 @@ multi-signer **manifest** + `Verifier`/`multisig` and the manifest-hash-into-key
 object (sessions, out of scope); and the value-byte/`padding` concerns unchanged from ADR-0022. Soundness
 rests on the same prefix-root collision-resistance the scheme already assumes (a forged prefix can't match
 the committed hash) plus the new key's head signature.
+
+## ADR-0035 — Multi-signer manifest verifier is an L1 quorum primitive in `identity`; wiring + multisig wire format deferred
+**Context:** Upstream hypercore (`reference/js/hypercore/lib/{verifier,multisig,caps}.js`, exercised by
+`test/manifest.js`) makes a log's authority a **manifest**: `{ version, hash, allowPatch, quorum,
+signers: [{ publicKey, namespace, signature: 'ed25519' }], prologue, linked, userData }`. The manifest is
+hashed (`hash(MANIFEST_cap || encode(manifest))`) into the core's **key**, so the signing policy is
+self-authorizing — who may sign cannot change without changing the identity. `Verifier.fromManifest`
+builds signers; `verify(batch, signature)` either short-circuits a **prologue** prefix (accept iff
+`batch.length === prologue.length && batch.hash() === prologue.hash`, no signature) or runs the
+**multisig** rule (`_verifyMulti`): inflate the signature into proofs, require `proofs.length >= quorum`,
+each proof a *distinct* in-range signer, each signer's ed25519 signature valid over `batch.signable(ctx)`
+where `ctx = manifestHash` (v1). A single-signer manifest's hash equals `Hypercore.key(publicKey)` (the
+content-addressed identity of a plain one-author core). The surrounding machinery — the compact-encoding
+wire format, v0 **compat** signers (`ctx = namespace`, legacy `signableCompat`), `allowPatch` cross-length
+patch signing (`generateUpgrade`/`partialSignature` over the replication proof), `linked`/`userData`
+manifest fields, and the session-level `multisig - append`/`patches` (which drive `core.replicate` /
+`download`) — is wire format / disk compat / sessions / networking, out of scope per the relevance filter.
+**Decision:** Reimplement the **L1 behaviour-under-test** — a content-addressed multi-signer quorum
+policy — as a standalone primitive in `crates/identity` (`Manifest` + `Signer` + `PartialSig` +
+`Prologue`), clean-room (ADR-0001), not the wire/compat/patch layer:
+- A [`Signer`] is an ed25519 [`PublicKey`] + a 32-byte `namespace`; a [`Manifest`] commits to `quorum` +
+  ordered signers (+ an optional [`Prologue`]). [`Manifest::hash`] is the **content-addressed identity**
+  (domain-separated, length-bound blake3 over quorum/signers/prologue) — the would-be log key;
+  [`Manifest::single`] is the one-author identity (`single(pk).hash()` is that core's key).
+- To authorize a head `(length, tree_hash)` a signer signs [`Manifest::signable`] — domain-tagged bytes
+  binding the **manifest hash** (the modern `ctx = manifestHash` path) alongside length + root (mirrors
+  `caps.treeSignable`). [`Manifest::sign`] finds the matching declared signer or returns `None`
+  ("public key is not a declared signer").
+- [`Manifest::verify`] short-circuits a [`Prologue`] prefix on content alone (the manifest-level form of
+  ADR-0034's hypercore prologue), else the **multisig quorum** rule: at least `quorum` signatures, each
+  from a distinct in-range signer, each valid — any out-of-range/repeated signer or invalid supplied
+  signature rejects the whole multisig. We require **all supplied** signatures valid+distinct (upstream
+  only checks the first `quorum`); behaviourally identical for a distinct-valid quorum set, and strictly
+  safer (a garbage extra proof can't ride along). Invalid configs (`quorum == 0`, `quorum > signers`,
+  no signers) are rejected at construction (upstream `createManifest` throwing); a **non-ed25519** signer
+  is *structurally* impossible (a [`Signer`] only holds an ed25519 key), so upstream's "unsupported curve"
+  rejection is enforced by the type system.
+**Consequence:** The `create verifier - *` family (static signer, single signer, multi signer, defaults /
+content-addressed key, multisig distinctness/quorum, validation) is ported and host-safe under
+`just verify`. `manifest.js` moves `[ ]`→`[~]`. We **diverge**: clean-room manifest hash (not upstream's
+compact-encoding + blake2b), all-supplied-valid (vs first-`quorum`), and the namespace folds into the
+manifest hash rather than being the v0 signing context (we implement only the modern v1 `ctx =
+manifestHash` path). We **defer**: wiring the verifier into `Hypercore` (replacing the single-key
+`SignedHead` with a manifest — the manifest-hash-into-key identity binding); the **compat (v0)** signer
+path, `allowPatch` cross-length patch signing, and the `linked`/`userData` manifest fields; the multisig
+**wire format** (`assemble`/`inflate` compact-encoding); and the session-level `moveTo`/`multisig -
+append`/`patches` (sessions/networking). Soundness rests on ed25519 unforgeability + manifest-hash
+collision-resistance (a signature is bound to the exact policy via the manifest hash in its signable).

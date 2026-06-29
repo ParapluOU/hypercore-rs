@@ -62,7 +62,13 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `additionalNodes`/seek-`padding`/reorg-by-proof + replication-driven repair tracked separately
       on `merkle-tree.js`/`merkle-tree-recovery.js`
 - [x] `codec` — round-trip + versioned/tolerant decode
-- [x] `identity` — sign/verify + forgery-rejection
+- [x] `identity` — sign/verify + forgery-rejection + **multi-signer manifest verifier** (`Manifest`:
+      content-addressed `hash()` = the would-be log key, `Manifest::single(pk).hash()` ≡
+      `Hypercore.key(pk)`; `sign`/`verify` over a head `(length, tree_hash)` enforcing the multisig
+      **quorum** rule — ≥ quorum distinct in-range signers, each valid over a manifest-hash-bound
+      `signable` — with a `Prologue` prefix self-authorizing on content; non-ed25519 signers structurally
+      impossible, invalid configs rejected at construction; ADR-0035 — wiring into `Hypercore` + compat
+      v0 / `allowPatch` / multisig wire format / session `moveTo` tracked on `manifest.js`)
 - [x] `storage` — trait + in-memory backend
 - [x] `storage` — **sparse bitfield** (`Bitfield`: get / set / set_range / count(start,**length**,val) /
       find_first / find_last over an unbounded, sparse, paged local presence map; clean-room of

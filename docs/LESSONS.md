@@ -401,3 +401,26 @@ personal data** (this repo is public; use repo-relative paths).
   any mutation of the source, so a snapshot taken before the migration keeps returning its own blocks —
   nothing to re-home). Defer the multi-signer manifest + manifest-into-key identity (`manifest.js`) and the
   session-level `moveTo`/`migrate` (sessions/networking).
+- **A multi-signer manifest is a *content-addressed quorum policy*: the signing rule hashed into the
+  identity. Port the quorum primitive; defer the wire/compat/patch wrapping.** Upstream's `Verifier` drags
+  in compact-encoding wire format, v0 compat signers, `allowPatch` cross-length patch signing, and
+  `linked`/`userData` fields; the L1 essence is small. A `Manifest { quorum, signers: [{public_key,
+  namespace}], prologue }` whose `hash()` (domain-separated, length-bound, over quorum + ordered signers +
+  prologue) **is** the would-be log key — so the policy is self-authorizing (who may sign can't change
+  without changing the identity), and a single-signer manifest's hash is exactly a plain core's key
+  (`single(pk).hash() ≡ Hypercore.key(pk)`). To authorize a head a signer signs a `signable` that **binds
+  the manifest hash** (the modern `ctx = manifestHash` path — so a signature is valid only under that exact
+  policy; the per-signer namespace folds into the hash, not the signing context, in v1). `verify`
+  short-circuits a `Prologue` prefix on content alone (the manifest-level form of the hypercore prologue),
+  else the **multisig quorum** rule: ≥ quorum signatures, each a *distinct* in-range signer, each valid.
+  Four gotchas: (1) the distinctness check (a `seen` set / `tried` array) is essential — the same signer
+  twice is *not* two signatures (a real attack the `multi signer` test pins as `secondBadSignature`); (2)
+  reject by *count of distinct-valid >= quorum*, not "any valid" (`thirdBadSignature` = one valid sig under
+  quorum 2 must fail); (3) a non-ed25519 signer is **structurally impossible** if `Signer` only holds an
+  ed25519 key — upstream's runtime "unsupported curve" throw becomes a type-system guarantee, so the
+  asserting analogue is the *config* validation (`quorum == 0` / `quorum > signers` / no signers rejected
+  at construction); (4) requiring **all supplied** signatures valid (vs upstream checking only the first
+  `quorum`) is behaviourally identical for a distinct-valid quorum set and strictly safer (a garbage extra
+  proof can't ride along). The full multisig **wire format** (`assemble`/`inflate`), the v0 **compat**
+  path, `allowPatch` patch signing, and wiring the verifier into `Hypercore` (replacing the single-key
+  signed head) are the deferred wrapping — none change the quorum primitive.
