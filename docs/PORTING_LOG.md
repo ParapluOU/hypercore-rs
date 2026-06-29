@@ -1428,3 +1428,79 @@ Repo-relative paths only — no private or personal data (this repo is public).
     layer (`apply.js`/`anchors.js`);
   - the replication re-download that refills a cleared block + `purge` (both deferred this iter);
     `merkle` reorg-by-proof / `additionalNodes`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 29: `hypercore` snapshots (`snapshots.js`)
+
+**Did**
+- Picked the next natively-testable, in-scope red item: `hypercore` **snapshots**
+  (`reference/js/hypercore/test/snapshots.js`). (The other non-env-blocked candidate — the deferred
+  fork/merge consensus, ADR-0015 — LESSONS.md says to defer until the JS oracle, gate #4, can
+  cross-check it; gate #4 is still env-blocked, so attempting it now would defy the project's own
+  recorded guidance.)
+- Added a **self-contained, by-value** `Snapshot<T, C>` + `Hypercore::snapshot()`. A snapshot owns an
+  immutable copy of the present blocks `[0, len)` (encoded bytes), the `MerkleTree` at that length, the
+  captured `SignedHead`, and a clone of the codec — so it observes the log exactly as it was when taken
+  and is **immune to any later mutation of the core** (append / truncate / truncate-and-rewrite). Its
+  surface: `length()`/`fork()`/`is_empty()`/`head()`/`root_hash()` (all fixed), `block(i)` (raw encoded
+  bytes, `None` past the length or for an absent block), `get(i)` (decode; `None` past the end — our L1
+  form of upstream's out-of-range `SNAPSHOT_NOT_AVAILABLE`), `proof(i)` (inclusion proof against the
+  captured head, so a snapshot block is independently authenticated), and `signed_length(&core)` ≡
+  upstream `snapshot.signedLength` computed content-blind as the shared-prefix LCA
+  (`MerkleTree::lowest_common_ancestor`) of the snapshot's tree and the core's *current* tree.
+- The two built-in codecs (`codec::U64`/`Bytes`) gained `#[derive(Clone, Copy, PartialEq, Eq, Default)]`
+  so a snapshot can own a codec to decode with — a Rust-ergonomics detail (zero-sized config types), not
+  a behavioural change.
+- 4 asserting tests (hypercore 42→46; workspace 139→143):
+  - `snapshot_is_immune_to_truncate_and_rewrite` — the headline `snapshots.js` case: snapshot at len 3,
+    then the core appends Block3, `truncate(3)`, `truncate(2)`, re-appends "new Block2"; the snapshot's
+    `length` stays 3 and `get(2)` stays "block2" throughout, `signed_length` goes 3→3→3→2→2 (drops once
+    the core truncates below 3, and stays at 2 after the divergent re-append), and a read over the
+    snapshot yields the three snapshotted blocks (L1 `createReadStream`).
+  - `snapshot_block_is_independently_authenticated` — after a fork (truncate-and-rewrite, fork 0→1) of
+    the core beneath it, every captured block still verifies against the snapshot's own head with the
+    snapshot's own proof, the snapshot keeps the old block 2, and `signed_length` collapses to the
+    shared 2-block prefix (host-safe form of "snapshots are consistent").
+  - `empty_and_static_snapshots` — an empty snapshot stays empty (no head); a snapshot at len 2 stays
+    static as the core grows; in-range `get` decodes, out-of-range `get`/`block` are `None`;
+    `signed_length` is 0 / 2 respectively ("snapshots wait for ready" minus async-ready/persistence).
+  - `snapshot_is_independent_of_clear` — clearing the core's presence map afterwards doesn't affect the
+    by-value snapshot (it still has every block); clear leaves the tree untouched, so the prefix is
+    still fully shared (`signed_length == len`).
+- `just verify` green: **143 native tests** (autobase 24 across files + codec 8 + hypercore 46 +
+  identity 4 + merkle 44 + storage 17) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0032: a snapshot is a **self-contained by-value point-in-time view**, not upstream's shared-storage
+  copy-on-write disk model. We copy the snapshotted prefix's bytes (identical observable behaviour,
+  simplest L1 way to survive a truncate-and-rewrite); `signed_length` is the content-blind shared-prefix
+  LCA against the live core; out-of-range `get` is `None` (our `SNAPSHOT_NOT_AVAILABLE` analogue). We
+  **defer** `signedLength`-over-replication, implicit per-call snapshotting during a live download,
+  `createReadStream` (`streams.js`), and the session/atom cases (sessions/networking, out of scope).
+  `snapshots.js` moves `[ ]`→`[~]`. The codec `Clone, Copy` derives are an ergonomics detail, not a
+  divergence.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A snapshot that must survive truncate-and-rewrite is a **by-value** copy (own the prefix's bytes +
+  tree + head + codec), not a shared-storage view — then nothing the core does later can change what it
+  reports. Three consequences fall out: out-of-range `get` is `None` (no-wait), a captured block is
+  independently authenticated against the captured head, and `signedLength` is just the content-blind
+  shared-prefix LCA of the snapshot's tree and the core's current tree (never exceeds the snapshot
+  length; drops on truncate-below / in-prefix rewrite). Zero-sized config codecs only need
+  `derive(Clone, Copy)` to be owned for decoding.
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable
+    under the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend
+    `[ ]` would also wire the bitfield's deferred `open`/`flush` persistence (and persist the presence
+    map / snapshots);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view
+    layer (`apply.js`/`anchors.js`);
+  - more natively-testable rows: `hypercore` `move-to.js` / `streams.js` (the rest of the
+    snapshot/seek/stream family); `merkle` reorg-by-proof / `additionalNodes`; `manifest.js`
+    (signing config); the replication re-download that refills a cleared block + `purge`; `hyperbee`.

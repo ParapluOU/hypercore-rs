@@ -348,3 +348,22 @@ personal data** (this repo is public; use repo-relative paths).
   is a harmless no-op (never touch a block you don't hold), and physical reclamation is best-effort (a
   failed `delete` still marks the block absent — same "logical state is the invariant" stance as
   truncate's orphans). `purge` (whole-core deletion) is a separate storage/session concern, not this.
+- **A snapshot that must survive truncate-and-rewrite is a *by-value* copy, not a shared-storage
+  view.** Upstream keeps a snapshot reading the old bytes after a rewrite via disk-layer
+  copy-on-write / fork-namespacing — disk plumbing we don't have. At L1 the simplest faithful
+  reimplementation is to **own a copy** of the snapshotted prefix (encoded block bytes + the
+  `MerkleTree` at that length + the captured `SignedHead` + a clone of the codec): then nothing the
+  core does later (append / truncate / re-append different content over the same indices) can change
+  what the snapshot reports, which is exactly the observable contract. Three things fall out: (1)
+  `get` past the snapshot's fixed length is `None` (our L1 form of upstream's out-of-range
+  `SNAPSHOT_NOT_AVAILABLE` throw — same no-wait stance as the core's `get`); (2) a captured block is
+  **independently authenticated** — its inclusion proof against the *captured* head still verifies even
+  after the core forks away, because the snapshot carries its own tree + signed head; (3) the snapshot's
+  `signedLength` (how much of it the *live* core still backs) is just the **content-blind shared-prefix
+  LCA** of the snapshot's tree and the core's current tree (`lowest_common_ancestor`) — it never
+  exceeds the snapshot length and drops the moment the core truncates below or rewrites a block within
+  the snapshotted prefix, reproducing every upstream `signedLength` assertion without inspecting a
+  payload. To own a codec for decoding, zero-sized config codecs (`U64`/`Bytes`) just need
+  `derive(Clone, Copy)` — an ergonomics detail, not a behavioural change. The by-value copy is a
+  documented divergence (ADR-0032); a consumer needing zero-copy snapshots layers it on the storage
+  backend.

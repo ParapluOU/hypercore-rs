@@ -85,7 +85,14 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `has`/`contiguousLength`; `clear(start,end)` drops present blocks' bytes + bits returning the
       count cleared, leaving the Merkle tree / signed head **untouched** so a cleared block stays
       authenticated + re-verifiable from a holder; `get`/`block` read `None` for an absent block;
-      clearing absent/out-of-range blocks is a no-op; ADR-0031) — `purge`/physical-reclamation
+      clearing absent/out-of-range blocks is a no-op; ADR-0031) +
+      **snapshots** (`Hypercore::snapshot()` → a self-contained by-value `Snapshot<T,C>` owning the
+      present blocks + tree + signed head at capture time, immune to the core's later
+      append/truncate/re-append; `length`/`fork`/`head`/`get`/`block`/`proof` fixed, `get` past the end
+      `None`, a captured block independently authenticated against the snapshot head, and
+      `signed_length(&core)` ≡ upstream `signedLength` via the shared-prefix LCA; ADR-0032 — by-value
+      divergence from upstream's shared-storage COW; `signedLength`-over-replication / implicit-download
+      snapshots / streams deferred, tracked on `snapshots.js`) — `purge`/physical-reclamation
       guarantees + the replication re-download that refills a cleared block tracked on `clear.js`
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks

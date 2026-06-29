@@ -10,6 +10,7 @@
 //! index, without trusting the sender. Ordering and verification never inspect
 //! `T`: it is opaque bytes below the codec.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use codec::Codec;
@@ -412,6 +413,132 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
                     && self.public.verify(&head_message(h.fork, h.length, &h.root), &h.sig)
             }
         }
+    }
+}
+
+impl<T, C: Codec<T> + Clone, S: Store> Hypercore<T, C, S> {
+    /// Capture a read-only, point-in-time [`Snapshot`] of the log at its current
+    /// length. The snapshot owns an immutable copy of the present blocks `[0, len)`
+    /// (their encoded bytes), the Merkle tree at that length, and the signed head —
+    /// so it is **immune to any later mutation of this core** (append, truncate, or
+    /// a truncate-and-rewrite): its [`length`](Snapshot::length) never changes and
+    /// it keeps returning the blocks as they were at snapshot time, even after the
+    /// core rewinds below the snapshot and re-appends different content over those
+    /// indices. Ports upstream `snapshots.js`'s "snapshot does not change when
+    /// original gets modified".
+    ///
+    /// Only **present** blocks are captured (a block dropped by
+    /// [`clear`](Self::clear) cannot be snapshotted — there are no bytes to copy),
+    /// so the snapshot reads `None` for an absent block, exactly like the core.
+    /// Fallible only because reading the bytes to copy goes through the store.
+    pub fn snapshot(&self) -> Result<Snapshot<T, C>, Error<S::Error>> {
+        let length = self.tree.len();
+        let mut blocks = BTreeMap::new();
+        for i in 0..length {
+            if self.presence.get(i) {
+                if let Some(bytes) = self.store.get(i).map_err(Error::Storage)? {
+                    blocks.insert(i, bytes);
+                }
+            }
+        }
+        Ok(Snapshot {
+            length,
+            fork: self.fork,
+            head: self.head.clone(),
+            tree: self.tree.clone(),
+            blocks,
+            codec: self.codec.clone(),
+            _t: PhantomData,
+        })
+    }
+}
+
+/// A read-only, point-in-time view of a [`Hypercore`], captured by
+/// [`Hypercore::snapshot`].
+///
+/// A snapshot is **self-contained**: it owns a copy of the log's first `length`
+/// blocks (encoded bytes), the Merkle tree at that length, and the signed head, so
+/// it observes the log exactly as it was when taken — no shared mutable state with
+/// the original. Later appends/truncations/rewrites of the original never change
+/// what the snapshot reports.
+///
+/// Block bytes are copied **by value** (a clean-room divergence: upstream shares
+/// storage between a core and its snapshots and relies on copy-on-write at the
+/// disk layer, which is disk-format/storage plumbing we do not port — ADR-0032).
+/// The observable behaviour is identical.
+pub struct Snapshot<T, C> {
+    length: u64,
+    fork: u64,
+    head: Option<SignedHead>,
+    tree: MerkleTree,
+    blocks: BTreeMap<u64, Vec<u8>>,
+    codec: C,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T, C: Codec<T>> Snapshot<T, C> {
+    /// The snapshotted length — fixed for the life of the snapshot.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// The fork counter at snapshot time.
+    pub fn fork(&self) -> u64 {
+        self.fork
+    }
+
+    /// The signed head captured at snapshot time (`None` for an empty core).
+    pub fn head(&self) -> Option<&SignedHead> {
+        self.head.as_ref()
+    }
+
+    /// The Merkle root hash of the snapshotted prefix.
+    pub fn root_hash(&self) -> Hash {
+        self.tree.root_hash()
+    }
+
+    /// The raw (codec-encoded) bytes of block `index` as captured, or `None` past
+    /// the snapshot's length or for a block that was absent at snapshot time. This
+    /// is the unit the snapshot's [`proof`](Self::proof) authenticates.
+    pub fn block(&self, index: u64) -> Option<&[u8]> {
+        if index >= self.length {
+            return None;
+        }
+        self.blocks.get(&index).map(Vec::as_slice)
+    }
+
+    /// Decode the value at `index`, or `None` past the snapshot's length (a no-wait
+    /// read — upstream's out-of-range `get` throws `SNAPSHOT_NOT_AVAILABLE`; at L1
+    /// we report absence as `None`, consistent with [`Hypercore::get`]).
+    pub fn get(&self, index: u64) -> Result<Option<T>, codec::Error> {
+        match self.block(index) {
+            Some(bytes) => Ok(Some(self.codec.decode(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A Merkle inclusion proof for `index` against the snapshot's captured head —
+    /// so a snapshot block is independently verifiable ([`verify_block`]) even
+    /// after the original has forked away.
+    pub fn proof(&self, index: u64) -> Option<Proof> {
+        self.tree.proof(index)
+    }
+
+    /// How much of this snapshot is still backed by `core`'s **current** signed
+    /// head: the length of the longest prefix the snapshot and the live core still
+    /// share. It equals the snapshot's length while the core's history still
+    /// contains the snapshotted prefix, and drops when the core truncates below the
+    /// snapshot (or rewrites a block within it) — upstream's `snapshot.signedLength`.
+    ///
+    /// Computed content-blind from the two trees' shared prefix
+    /// ([`MerkleTree::lowest_common_ancestor`]), so it never inspects a payload and
+    /// never exceeds [`length`](Self::length).
+    pub fn signed_length<S: Store>(&self, core: &Hypercore<T, C, S>) -> u64 {
+        self.tree.lowest_common_ancestor(&core.tree)
     }
 }
 
@@ -2200,5 +2327,145 @@ mod tests {
         // networking step we defer); the point proven here is that authentication
         // survives the clear, so the bytes remain recoverable.
         assert_eq!(a.contiguous_length(), 1, "a still has the hole until refetch");
+    }
+
+    // ---- snapshots (upstream `snapshots.js`, L1) ----
+
+    #[test]
+    fn snapshot_is_immune_to_truncate_and_rewrite() {
+        // Upstream `snapshots.js`: "snapshot does not change when original gets
+        // modified". A snapshot pins the length AND the block bytes at snapshot
+        // time, surviving the core's later append / truncate / re-append; its
+        // `signed_length` tracks how much of it the *current* core still backs.
+        let mut core = core_with(50, &["block0", "block1", "block2"]);
+        let snap = core.snapshot().unwrap();
+        assert_eq!(snap.length(), 3, "correct length");
+        assert_eq!(snap.signed_length(&core), 3, "correct signed length");
+        assert_eq!(snap.get(2).unwrap(), Some(blk("block2")), "block exists");
+
+        core.append(&blk("Block3")).unwrap();
+        assert_eq!(snap.length(), 3);
+        assert_eq!(snap.signed_length(&core), 3);
+        assert_eq!(snap.get(2).unwrap(), Some(blk("block2")));
+
+        core.truncate(3); // drops Block3; the snapshotted prefix is untouched
+        assert_eq!(snap.length(), 3);
+        assert_eq!(snap.signed_length(&core), 3);
+        assert_eq!(snap.get(2).unwrap(), Some(blk("block2")));
+
+        core.truncate(2); // now below the snapshot
+        assert_eq!(snap.length(), 3);
+        assert_eq!(
+            snap.signed_length(&core),
+            2,
+            "signed length now lower since it truncated below snap"
+        );
+        assert_eq!(snap.get(2).unwrap(), Some(blk("block2")));
+
+        core.append(&blk("new Block2")).unwrap(); // re-appends different content over index 2
+        assert_eq!(snap.length(), 3);
+        assert_eq!(
+            snap.signed_length(&core),
+            2,
+            "signed length remains at lowest value after re-appending"
+        );
+        assert_eq!(
+            snap.get(2).unwrap(),
+            Some(blk("block2")),
+            "old block still (snapshot did not change)"
+        );
+        // The core itself moved on to the rewritten history.
+        assert_eq!(core.get(2).unwrap(), Some(blk("new Block2")));
+
+        // A read over the snapshot yields exactly the three snapshotted blocks
+        // (the L1 analogue of upstream's `createReadStream`).
+        let read: Vec<Vec<u8>> = (0..snap.length()).map(|i| snap.get(i).unwrap().unwrap()).collect();
+        assert_eq!(read, vec![blk("block0"), blk("block1"), blk("block2")]);
+    }
+
+    #[test]
+    fn snapshot_block_is_independently_authenticated() {
+        // A snapshot carries its own signed head + tree, so each captured block
+        // stays verifiable against the snapshot's head even after the core forks
+        // away beneath it (the host-safe L1 form of `snapshots.js`'s "snapshots
+        // are consistent" — no wire).
+        let mut core = core_with(51, &["a", "b", "c", "d", "e"]);
+        let snap = core.snapshot().unwrap();
+        let head = snap.head().unwrap().clone();
+        let pk = core.public_key();
+        assert_eq!(snap.root_hash(), head.root);
+
+        // Truncate-and-rewrite the core under the snapshot (bumps the fork).
+        core.truncate(2);
+        core.append(&blk("X")).unwrap();
+        core.append(&blk("Y")).unwrap();
+        core.append(&blk("Z")).unwrap();
+        assert_eq!(core.fork(), 1, "core rewound and rewrote");
+        assert_eq!(core.get(2).unwrap(), Some(blk("X")));
+
+        // The snapshot is untouched and every captured block still authenticates.
+        assert_eq!(snap.length(), 5);
+        assert_eq!(snap.fork(), 0, "snapshot keeps its fork");
+        for i in 0..5u64 {
+            let enc = snap.block(i).expect("snapshot holds the block");
+            let proof = snap.proof(i).expect("snapshot proves the block");
+            assert!(verify_block(&pk, &head, i, enc, &proof), "snapshot block {i} authenticated");
+        }
+        assert_eq!(snap.get(2).unwrap(), Some(blk("c")), "snapshot keeps the old block 2");
+        // Only the shared two-block prefix is still backed by the live core.
+        assert_eq!(snap.signed_length(&core), 2);
+    }
+
+    #[test]
+    fn empty_and_static_snapshots() {
+        // Upstream `snapshots.js`: "snapshots wait for ready" — a snapshot's length
+        // is fixed at capture time (an empty snapshot stays empty); plus the
+        // out-of-range read (upstream `SNAPSHOT_NOT_AVAILABLE`, reported as `None`
+        // at L1).
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(52), Bytes, MemoryStore::new());
+        let s1 = core.snapshot().unwrap(); // captured at length 0
+        assert!(s1.is_empty());
+        assert_eq!(s1.head(), None, "empty core has no signed head");
+
+        core.append(&blk("block #0.0")).unwrap();
+        core.append(&blk("block #1.0")).unwrap();
+        let s2 = core.snapshot().unwrap(); // captured at length 2
+        core.append(&blk("block #2.0")).unwrap();
+
+        assert_eq!(s1.length(), 0, "empty snapshot");
+        assert_eq!(s2.length(), 2, "set at capture time");
+
+        core.append(&blk("block #3.0")).unwrap();
+        assert_eq!(s1.length(), 0, "is static");
+        assert_eq!(s2.length(), 2, "is static");
+
+        // Reads: in-range decodes, out-of-range is None.
+        assert_eq!(s1.get(0).unwrap(), None, "nothing in an empty snapshot");
+        assert_eq!(s2.get(1).unwrap(), Some(blk("block #1.0")));
+        assert_eq!(s2.get(2).unwrap(), None, "out of range -> None");
+        assert_eq!(s2.block(2), None);
+
+        assert_eq!(s1.signed_length(&core), 0);
+        assert_eq!(s2.signed_length(&core), 2, "the 2-block prefix is still backed");
+    }
+
+    #[test]
+    fn snapshot_is_independent_of_clear() {
+        // A snapshot owns its bytes by value, so clearing the core's presence map
+        // afterwards (dropping its local bytes) doesn't affect the snapshot.
+        let mut core = core_with(53, &["a", "b", "c", "d"]);
+        let snap = core.snapshot().unwrap();
+
+        assert_eq!(core.clear(1, 3).unwrap(), 2, "two blocks cleared on the core");
+        assert_eq!(core.get(1).unwrap(), None, "core dropped block 1");
+        assert_eq!(core.get(2).unwrap(), None, "core dropped block 2");
+
+        // The snapshot still has every block.
+        assert_eq!(snap.length(), 4);
+        for (i, s) in ["a", "b", "c", "d"].iter().enumerate() {
+            assert_eq!(snap.get(i as u64).unwrap(), Some(blk(s)), "snapshot keeps block {i}");
+        }
+        // Clearing presence does not touch the tree, so the prefix is still fully shared.
+        assert_eq!(snap.signed_length(&core), 4);
     }
 }

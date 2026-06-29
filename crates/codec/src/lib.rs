@@ -111,6 +111,7 @@ pub trait Codec<T> {
 }
 
 /// `u64` as a varint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct U64;
 impl Codec<u64> for U64 {
     fn encode_into(&self, value: &u64, out: &mut Vec<u8>) {
@@ -124,6 +125,7 @@ impl Codec<u64> for U64 {
 
 /// Length-delimited bytes. Decoding **ignores trailing bytes** past the declared
 /// length — an older reader tolerates a newer writer's extra data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Bytes;
 impl Codec<Vec<u8>> for Bytes {
     fn encode_into(&self, value: &Vec<u8>, out: &mut Vec<u8>) {

@@ -571,3 +571,40 @@ a failed `delete` still marks the block absent, leaving an orphan, the same "log
 invariant" stance as ADR-0024's truncate and iter 23's rollback orphan); and the `diff`/byte-API return
 shape (commented out upstream). `clear.js` moves `[ ]`→`[~]`; `purge.js` stays `[ ]`. The `bitfield.js`
 row gains its first L1 *consumer* (`Hypercore` presence), tightening the deferred persistence story.
+
+## ADR-0032 — Snapshot is a self-contained by-value point-in-time view; signed length is the shared-prefix LCA
+**Context:** Upstream hypercore (`reference/js/hypercore/test/snapshots.js`) exposes `core.snapshot()` —
+a read-only view pinned at a length. Its headline behaviour ("snapshot does not change when original
+gets modified"): the snapshot's `length` is fixed; `snap.get(i)` keeps returning the block as it was at
+snapshot time even after the core appends, **truncates below the snapshot, and re-appends different
+content** over those indices; and `snap.signedLength` reflects how much of the snapshot the *current*
+core still backs (it drops to 2 once the core truncates below 3, and stays there after a divergent
+re-append). Upstream snapshots **share storage** with the core and rely on copy-on-write / fork
+namespacing at the disk layer to keep the old bytes readable after a rewrite; they also carry
+session/replication behaviour (`signedLength` over the wire, `createReadStream`, implicit-snapshot gets,
+`SNAPSHOT_NOT_AVAILABLE`, atomized sessions) that is storage-plumbing / sessions / networking — out of
+scope per the relevance filter.
+**Decision:** Reimplement the **L1 behaviour-under-test** as a **self-contained, by-value** snapshot,
+not the shared-storage / copy-on-write disk model. `Hypercore::snapshot()` returns a `Snapshot<T, C>`
+owning an immutable copy of the present blocks `[0, len)` (encoded bytes), the `MerkleTree` at that
+length, the captured `SignedHead`, and a clone of the codec — so the snapshot observes the log exactly
+as it was when taken and is immune to any later mutation of the original (the simplest way to guarantee
+"survives truncate-and-rewrite" without disk-layer COW). `length()`/`fork()`/`head()`/`root_hash()` are
+fixed; `block(i)`/`get(i)` read the captured bytes (`None` past the length — our L1 form of upstream's
+out-of-range `SNAPSHOT_NOT_AVAILABLE`, consistent with `Hypercore::get`'s no-wait `None`); `proof(i)`
+authenticates a captured block against the captured head (a snapshot is independently verifiable even
+after the core forks away). `signed_length(&core)` is the content-blind shared-prefix length
+([`MerkleTree::lowest_common_ancestor`] of the snapshot's tree and the core's current tree), which
+reproduces every `signedLength` assertion exactly (it never exceeds the snapshot length and drops the
+moment the core truncates below or rewrites a block within the snapshotted prefix). The two built-in
+codecs (`U64`/`Bytes`) gain `#[derive(Clone, Copy, …)]` so the snapshot can own a codec to decode with —
+a Rust-ergonomics detail (zero-sized config types), not a behavioural divergence.
+**Consequence:** The headline `snapshots.js` behaviour is ported and host-safe under `just verify`
+(static length; survives append/truncate/re-append; `signed_length` LCA; independent authentication; the
+empty/static-length and out-of-range cases). `move-to.js`/`snapshots.js`/`streams.js` splits:
+`snapshots.js` moves `[ ]`→`[~]`. We **diverge** from upstream's shared-storage COW (we copy bytes by
+value — identical observable behaviour, simpler at L1; a consuming app that needs zero-copy snapshots can
+layer it on the storage backend) and **defer**: `signedLength` propagation over replication, implicit
+per-call snapshotting during a live download, `createReadStream`/streams (`streams.js`), and the
+session/atom cases (sessions/networking, out of scope). Soundness of the independent-authentication
+property rests on the same head-signature + inclusion-proof guarantees the core already provides.
