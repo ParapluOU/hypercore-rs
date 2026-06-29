@@ -62,3 +62,15 @@ personal data** (this repo is public; use repo-relative paths).
 - **Keep the sim L1.** "Application state" in a domain-agnostic convergence test is just an
   order-sensitive checksum of the emitted `NodeId`s (a rolling FNV fold) — equal iff the orders are
   equal. No payload, no domain type; it stands in for "replicas folded the same ops to the same state".
+- **Multi-leaf (range) Merkle proof soundness = path nodes and sibling nodes never mix roles.** Recompute
+  *every* on-path node from the block data; treat the proof's supplied nodes purely as **off-path
+  siblings** (look them up by index, and prefer a recomputed node when both exist) so a forged node can
+  never impersonate a leaf's ancestor; and **force every recomputed leaf up to a genuine root index** —
+  a missing sibling is a rejection, not a silent skip. The trap to avoid: if a recomputed leaf is allowed
+  to *not* connect to a root, a prover can hand you the real roots plus bogus data that is never checked
+  against them, and verification passes. Generate the proof with the *same* traversal the verifier uses
+  (a depth-by-depth climb over a frontier set) so both sides agree on the boundary node set by construction.
+- **A touched root's proof-supplied hash is dead weight.** A range/inclusion proof substitutes every root
+  the range reaches with a node recomputed from the data, so tampering that root's supplied copy has no
+  effect (by design — its integrity comes from the leaves). Tamper-rejection tests must therefore mutate an
+  **untouched** root (or a block, or a boundary node) — mutating a substituted root tests nothing.

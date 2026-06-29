@@ -20,7 +20,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `core.js` | [~] | `hypercore` core append/get/verify + proof-based replication ported |
 | `batch.js` | [ ] | `hypercore` batch append |
 | `atomic.js` | [ ] | `hypercore` atomic append |
-| `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper ported; seeks/reorg/upgrade later) |
+| `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper **and contiguous-range proofs** ported, ADR-0017; byte-offset seeks + length-extension `upgrade`/`additionalNodes` + reorg still later) |
 | `merkle-tree-recovery.js` | [ ] | `merkle` recovery |
 | `encodings.js` | [~] | `codec` (varint/framing/tagged/tolerance concepts ported; upstream-specific encodings are clean-room) |
 | `conflicts.js` | [ ] | `hypercore`/`merkle` fork detection |

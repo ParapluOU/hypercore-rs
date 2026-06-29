@@ -153,3 +153,25 @@ host-safe and dependency-free:
 re-derivation or the deadlock/JS-repro formatting (a test-runner concern). Strengthening `finalized()`
 to advance monotonically *through* resolved partitions is the deferred fork/merge work (ADR-0015),
 to be cross-checked by the JS oracle (gate #4, ADR-0008).
+
+## ADR-0017 — Merkle: one contiguous-range inclusion proof, not upstream's block+upgrade+seek triplet
+**Context:** Upstream hypercore (`reference/js/hypercore/test/merkle-tree.js`) structures proofs as three
+composable parts — a **block** proof (`block.nodes`), an **upgrade** proof that extends a verifier from an
+old length to a new one (`upgrade.nodes` + `upgrade.additionalNodes`), and a **seek** proof (byte offset →
+block). The DoD (`docs/DEFINITION_OF_DONE.md` row #1) asks for "tree + inclusion/**range** proofs".
+**Decision:** Implement a single **contiguous-range inclusion proof**: `RangeProof { start, end, leaf_sizes,
+nodes, roots }`, the multi-block generalization of our existing single-block `Proof`. `nodes` carries only
+the **off-range boundary** siblings (any depth). Generator and verifier run the *same* deterministic
+**depth-by-depth climb** over a frontier `BTreeSet` — at each level two in-range/derived siblings pair into
+a parent for free, an off-range sibling is supplied — so they agree on the boundary set by construction.
+Verification keeps **path nodes and sibling nodes in strictly separate roles**: every on-range node is
+recomputed from the block data and is the only thing that can sit on a leaf's path; the proof's `nodes` are
+consulted purely as off-path siblings, by index, preferring a recomputed node when one exists. Every
+recomputed leaf is force-climbed to a genuine root index (a missing sibling ⇒ rejection), the recomputed
+roots are substituted, and `tree_hash` must equal the trusted `expected_root`.
+**Consequence:** The DoD merkle box is `[x]` (tree + inclusion + range + tamper-rejection). We **defer**
+length-extension (`upgrade`/`additionalNodes`), byte-offset **seek**, and **reorg/recovery** — they remain
+tracked on the `merkle-tree.js` / `merkle-tree-recovery.js` rows in `docs/UPSTREAM_TEST_MAP.md` (still
+`[~]`/`[ ]`). A single-block range carries exactly the single-block proof's sibling set, so the two APIs
+coincide on `end = start + 1`. Soundness rests on recompute-the-path + force-climb-to-a-real-root, so a
+prover cannot pair real roots with disconnected forged data.

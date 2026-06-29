@@ -48,7 +48,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 ## Checklist (high level)
 
 - [x] Workspace scaffold (no data types)
-- [~] `merkle` — tree + inclusion proofs + tamper-rejection (range proofs pending)
+- [x] `merkle` — tree + inclusion **and range** proofs + tamper-rejection (contiguous-range proof via
+      depth-climb, off-path-only boundary nodes, ADR-0017; upstream upgrade/seek/reorg tracked separately
+      on `merkle-tree.js`/`merkle-tree-recovery.js`)
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
 - [x] `storage` — trait + in-memory backend

@@ -293,3 +293,48 @@ Repo-relative paths only — no private or personal data (this repo is public).
   ours; assert identical `order()` (and ideally `quorum_degree`). This is also the cross-check that lets
   us safely strengthen `finalized()` for **forks/merges** + the 2-degree-lead caveat (ADR-0015).
 - Then the remaining wasm runtime / IndexedDB gate (#2) and the per-file upstream test rows.
+
+---
+
+## 2026-06-29 — Iteration 10: `merkle` range proofs
+
+**Did**
+- Closed the **#1 DoD property row** (`merkle` — tree + inclusion/**range** proofs + tamper-rejection):
+  added `MerkleTree::range_proof(start, end)` and `RangeProof::verify(blocks, expected_root)` — the
+  contiguous multi-block generalization of the existing single-block `proof`/`Proof::verify`. A range
+  proof carries only the **off-range boundary** sibling nodes (any depth) needed to roll the range's
+  leaves up to the roots, plus all roots. Generator and verifier share one **depth-by-depth climb** over
+  a frontier `BTreeSet`: at each level two in-range/derived siblings pair into a parent for free, an
+  off-range sibling is supplied; the verifier recomputes every on-range node from the block data and
+  consults the (untrusted) boundary table *strictly* as off-path siblings (preferring a recomputed node
+  by index), so a forged boundary node can never impersonate a leaf's ancestor. Every recomputed leaf is
+  force-climbed to a genuine root index (a missing sibling ⇒ rejection), the recomputed roots are
+  substituted, and `tree_hash` must equal `expected_root`.
+- 6 asserting tests (merkle 5→11): every contiguous sub-range over sizes 1..=20 round-trips; full-tree
+  range recomputes every root and needs **zero** boundary nodes; a range spanning multiple roots needs
+  boundary nodes and still verifies; a single-block range carries exactly the inclusion proof's sibling
+  set; out-of-range/empty/inverted ⇒ `None`; tamper-rejection across the span (any mutated block,
+  reordered blocks, wrong block count, tampered boundary node, tampered **untouched** root, wrong expected
+  root, dropped boundary node). `just verify` green (48 native tests + wasm build).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0017: implement one **contiguous-range inclusion proof** (off-path-only boundary nodes via a
+  deterministic depth-climb) rather than upstream hypercore's block + **upgrade** + **seek** proof triplet
+  (`block.nodes` / `upgrade.nodes` / `additionalNodes`). The DoD asks for *range* proofs; length-extension
+  (upgrade), byte-offset seek, and reorg/recovery stay deferred and continue to be tracked on the
+  `merkle-tree.js` / `merkle-tree-recovery.js` upstream rows.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Multi-leaf Merkle proof soundness = keep path nodes and sibling nodes in separate roles: recompute
+  every on-path node, treat supplied nodes purely as off-path siblings, and force every recomputed leaf
+  up to a real root (missing sibling ⇒ reject). Otherwise a prover can hand you the real roots plus bogus
+  data that never gets connected to them.
+- A *touched* (substituted) root's proof-supplied hash is irrelevant — it is overwritten by the recomputed
+  node — so a tamper-rejection test must mutate an **untouched** root (or a block / boundary node).
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) on the linearizer, via `scripts/node-sandbox.sh`
+  (a container runtime is available as Apple `container`; the reference linearizer pulls `b4a`/`nanoassert`
+  + local `clock`/`consensus`/`topolist`, so the harness reconstructs `add`/`order` against it).
+- Then the wasm runtime / IndexedDB gate (#2) and the per-file upstream test rows (incl. merkle
+  seek/upgrade/reorg).
