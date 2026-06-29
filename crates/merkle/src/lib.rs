@@ -763,6 +763,9 @@ impl Proof {
             size: data.len() as u64,
         };
         for sib in &self.siblings {
+            if sib.index != flat::sibling(node.index) {
+                return false; // not the path node's actual sibling (defense-in-depth)
+            }
             let p = flat::parent(node.index);
             let (left, right) = if sib.index < node.index {
                 (*sib, node)
@@ -820,11 +823,22 @@ impl SeekProof {
     /// not bracket `bytes`). Any tampering breaks the climb or the bracket and
     /// yields `None`.
     pub fn verify(&self, expected_root: &Hash) -> Option<(u64, u64)> {
+        // A seek target must be a real block leaf (even flat-tree index). Without
+        // this, an interior/root node (odd index) authenticates against the root and
+        // its aggregate subtree size brackets any offset, so a prover could pass it
+        // off and get a bogus `index / 2` block accepted. Upstream's `ByteSeeker`
+        // descends to an even index and guards `(index & 1) === 0`; we restore it.
+        if self.leaf.index & 1 != 0 {
+            return None;
+        }
         // Climb the leaf to its containing root, accumulating the byte sizes of
         // every left sibling (each precedes the target block in its entirety).
         let mut node = self.leaf;
         let mut left_sum: u64 = 0;
         for sib in &self.siblings {
+            if sib.index != flat::sibling(node.index) {
+                return None; // not the path node's actual sibling (defense-in-depth)
+            }
             let p = flat::parent(node.index);
             let (left, right) = if sib.index < node.index {
                 left_sum += sib.size;
@@ -2059,5 +2073,49 @@ mod tests {
         let mut back = local.clone();
         back.truncate(ancestors);
         assert_eq!(back.root_hash(), prefix_root, "shared prefix preserved across reorg");
+    }
+
+    // --- audit regression tests (post-iteration-21) ---
+
+    // P0 soundness: a seek target must be a real block leaf. Passing the root node
+    // (odd index) authenticates against the real root and its aggregate subtree size
+    // brackets any offset; without the evenness guard, `verify` returned a bogus
+    // `index / 2` block. (Upstream's ByteSeeker guards `(index & 1) === 0`.)
+    #[test]
+    fn seek_rejects_non_leaf_target() {
+        let (t, _) = tree(4);
+        let root = t.root_hash();
+        let root_node = t.roots()[0]; // index 3 (odd) for 4 blocks
+        assert_eq!(root_node.index & 1, 1, "the 4-block root is an interior (odd) node");
+
+        let forged = SeekProof {
+            bytes: 0,
+            leaf: root_node,
+            siblings: vec![],
+            roots: t.roots(),
+        };
+        assert!(
+            forged.verify(&root).is_none(),
+            "an interior node must not be accepted as a seek leaf"
+        );
+    }
+
+    // P1 defense-in-depth: a proof sibling must be the path node's actual sibling.
+    // `parent_hash` binds child hash+size but NOT index, so a falsified same-side
+    // sibling index leaves the climb hash unchanged — only the structural guard
+    // rejects it.
+    #[test]
+    fn proof_rejects_falsified_sibling_index() {
+        let (t, blocks) = tree(4);
+        let root = t.root_hash();
+        let mut proof = t.proof(0).unwrap();
+        assert!(proof.verify(&blocks[0], &root), "honest proof verifies");
+
+        // Real sibling of leaf 0 is index 2; forge the index to another same-side leaf.
+        proof.siblings[0].index = 6;
+        assert!(
+            !proof.verify(&blocks[0], &root),
+            "a sibling at the wrong index must be rejected structurally"
+        );
     }
 }

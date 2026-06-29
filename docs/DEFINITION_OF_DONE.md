@@ -94,3 +94,16 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [ ] WASM runtime / IndexedDB (gate #2)
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)
 - [ ] `hyperbee` (only if needed)
+
+### Audit follow-ups (after iteration 21; see ADR-0029)
+- [x] `merkle` `SeekProof::verify` rejects non-leaf targets (P0 soundness) + `Proof`/`SeekProof`
+      sibling-index guards (P1) — `seek_rejects_non_leaf_target`, `proof_rejects_falsified_sibling_index`
+- [ ] `hypercore`: replica rejects a block proven under a *different* same-author head (cross-head root
+      binding) and under a wrong author key (negative-path gaps)
+- [ ] `hypercore`: atomic append — first/last-block fault injection + `delete`-failure handling (only a
+      mid-batch `put` fault is currently exercised)
+- [ ] `hypercore`: `verify_reorg` head-`None` branch (untested)
+- [ ] `merkle`: reorg / `lowest_common_ancestor` adversarial — corrupt `other`, gapped `self`,
+      monotonicity-precondition violation; seek zero-size block
+- [ ] `autobase`: quorum-degree *value* cross-checked against an independent computation over random
+      DAGs (today only convergence + monotonicity are fuzzed, not the degree value)

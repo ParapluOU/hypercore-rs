@@ -989,3 +989,28 @@ Repo-relative paths only — no private or personal data (this repo is public).
   (`dags - simple 2`, `linearizer - compete`/`count ordering`) and the **apply/view layer**
   (`apply.js`/`anchors.js`) needed for the per-replica partial views; and `merkle`
   reorg-by-proof/`additionalNodes` (the last `merkle-tree.js` pieces).
+
+---
+
+## 2026-06-29 — Audit round (after iteration 21)
+
+**Did**
+- Audited `autobase` (read directly), `merkle` + `hypercore` (independent adversarial reviewers;
+  every headline finding re-verified against the code before acting).
+- **Found + fixed a real soundness bug:** `SeekProof::verify` accepted a non-leaf (odd-index) node as
+  the seek target — a prover could authenticate the root/an interior node and get a bogus `index/2`
+  block accepted. Fix: reject odd `leaf.index` (matches upstream `ByteSeeker`'s `(index & 1) === 0`).
+  **Not present upstream** — introduced by our clean-room reimpl.
+- Added the missing `sib.index == flat::sibling(..)` structural guard to `Proof`/`SeekProof` (present
+  in `NodeProof`). 2 regression tests; `merkle` 38 → 40 tests; `just verify` green. ADR-0029.
+
+**Findings (queued in DEFINITION_OF_DONE as audit follow-ups)**
+- Strong positive-path but under-tested negative-path across crates: `hypercore` replica
+  cross-head/wrong-key rejection, atomic first/last-block + `delete`-failure, reorg head-`None`;
+  `merkle` reorg/LCA adversarial; `autobase` quorum-degree value not oracle-checked.
+- Overall quality high (pervasive non-vacuity guards, honest in-code deferrals); the audit's value
+  was the one real exploit + the structural-binding asymmetry.
+
+**Next**
+- The queued audit follow-ups, then resume feature iterations (the gate-#4 JS oracle when a container
+  runtime is available; wasm/IndexedDB gate; deferred fork/merge consensus; `hyperbee`).

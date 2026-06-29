@@ -494,3 +494,19 @@ before full sync; cross-replica view *convergence* still holds and is the proper
 **not** add a typed payload or a per-node batch (domain concerns, ADR-0002/0007). `linearizer.js` /
 `dags.js` stay `[~]`: view materialization + the fork-free indexed length + cross-replica convergence
 ported; the fork/merge confirmed lengths and the apply/view layer (`apply.js`/`anchors.js`) remain.
+
+## ADR-0029 — Proof verifiers bind structural position, not just the root hash
+**Context:** `parent_hash` binds each child's hash + size but **not** its flat-tree index, so the final
+`tree_hash == root` check authenticates *content*, not *position*. An audit (after iteration 21) found
+`SeekProof::verify` trusted a prover-supplied `leaf`: an interior/root node (odd index) authenticates
+against the real root and its aggregate subtree size brackets any byte offset, so a prover could get a
+bogus `index/2` block accepted — **a real soundness bug**. Upstream's `ByteSeeker` guards `(index & 1)
+=== 0`; our clean-room reimpl dropped it. `Proof`/`SeekProof` also omitted the `sib.index ==
+flat::sibling(..)` guard that `NodeProof::verify` has.
+**Decision:** Every proof verifier enforces structural position explicitly — a seek leaf must be even
+(a real block), and every supplied sibling must be the path node's actual flat-tree sibling. Position
+must never rest solely on collision-resistance.
+**Consequence:** `SeekProof::verify` rejects odd-index leaves; `Proof`/`SeekProof` gained the
+sibling-index guard (now consistent with `NodeProof`); regression tests pin both. A deeper fix —
+binding child indices into `parent_hash` — would make these structural by construction but rewrites
+every hash (a permanent ABI change), so it is deferred as a decision, not a quick fix.

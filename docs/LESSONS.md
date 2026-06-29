@@ -238,3 +238,13 @@ personal data** (this repo is public; use repo-relative paths).
   indexed view ⊑ view). Also: a forced chain (each step has exactly one causally-ready node) has only
   *one* valid delivery order, so a "converges across delivery orders" test over it is vacuous — use a
   genuinely forked DAG (concurrent tails) to exercise reordering.
+- **A proof verifier must bind structural position, not just the root hash** (audit, after iter 21).
+  `parent_hash` binds child hash+size but NOT index, so `tree_hash == root` authenticates *content*,
+  not *position*. Two real consequences found: (1) **a seek leaf must be even** — `SeekProof::verify`
+  trusted a prover-supplied node, so the root / an interior node (odd index) authenticated and its
+  aggregate subtree size bracketed any offset → a bogus `index/2` block accepted (a genuine soundness
+  bug; upstream `ByteSeeker` guards `(index & 1) === 0`, our reimpl dropped it); (2) **a sibling must be
+  the actual sibling** — `NodeProof::verify` checked `sib.index == flat::sibling(..)`, `Proof`/`SeekProof`
+  did not. Rule: when a verifier trusts a prover-supplied index, guard it structurally. Every seek test
+  used honest (even-index) proofs, so the hole was invisible to "green" — **write the *forged* proof,
+  not just the honest one.**
