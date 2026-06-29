@@ -1,0 +1,12 @@
+[submodule "reference/rust/datrs-hypercore"]
+	path = reference/rust/datrs-hypercore
+	url = https://github.com/datrs/hypercore.git
+[submodule "reference/js/hypercore"]
+	path = reference/js/hypercore
+	url = https://github.com/holepunchto/hypercore.git
+[submodule "reference/js/autobase"]
+	path = reference/js/autobase
+	url = https://github.com/holepunchto/autobase.git
+[submodule "reference/js/hyperbee"]
+	path = reference/js/hyperbee
+	url = https://github.com/holepunchto/hyperbee.git
