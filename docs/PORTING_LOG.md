@@ -78,3 +78,26 @@ Repo-relative paths only — no private or personal data (this repo is public).
 
 **Next**
 - `identity`: ed25519 keygen / sign / verify + forgery-rejection (maps onto an Iroh `NodeId`).
+
+---
+
+## 2026-06-29 — Iteration 3: `identity`
+
+**Did**
+- Implemented `crates/identity` on `ed25519-dalek` v2: `SecretKey::from_seed` (deterministic,
+  RNG-free → wasm-safe), `sign`, `PublicKey::verify` (author id; maps to an Iroh `NodeId`), and
+  byte round-trips for keys/sigs.
+- 4 asserting tests: sign→verify, forgery-rejection (wrong msg / wrong key / tampered sig),
+  determinism, public-key byte round-trip. `just verify` green — incl. the wasm build of
+  `hypercore` pulling ed25519/curve25519 for `wasm32`.
+
+**Decisions**
+- Keys derive from a 32-byte seed; no `rand`/`getrandom`/OsRng in the build path → wasm builds
+  cleanly and tests stay deterministic. The host supplies entropy for real keys.
+
+**Lessons**
+- ed25519-dalek v2 + curve25519-dalek build for `wasm32-unknown-unknown` out of the box, *as long
+  as* you avoid the `rand_core`/OsRng path (use `from_bytes`/`from_seed`).
+
+**Next**
+- `storage`: byte-storage trait + in-memory backend (random-access read / write / len / truncate).

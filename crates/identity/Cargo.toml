@@ -5,3 +5,4 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+ed25519-dalek = "2"
