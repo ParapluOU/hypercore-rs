@@ -183,3 +183,21 @@ personal data** (this repo is public; use repo-relative paths).
   `Replica::verify_upgrade`. Test gotcha: reorg always makes the local follow the remote (up **or** down
   to the remote's length), so the post-reorg target is always the remote — don't branch on "which is
   longer".
+- **A replica follows a reorg by re-anchoring the upgrade proof on a *proper prefix* of its own
+  history — and the claimed ancestor authenticates itself.** The same-fork length-extension gate
+  (`verify_upgrade`) folds the peer's new nodes onto the replica's *entire* current head; a reorg is
+  the cross-fork case (the author rewound + rewrote under a bumped `fork`), so the shared part is only
+  a prefix `[0, ancestors)`. Reuse the exact same data-free `UpgradeProof`, but anchor it on the
+  replica's roots *at `ancestors`* (`prefix_roots`) instead of its full roots — because the head at a
+  length is a pure function of the first `length` blocks, those roots equal the source's iff the
+  prefix is genuinely shared. Consequences that fall out for free: (1) the `ancestors` value needs no
+  separate trust — an **over-claim** (larger than the true LCA) names a prefix the new history doesn't
+  share, so the fold misses `new_head.root` and is rejected; an **under-claim** is a real shorter
+  shared prefix, accepted, costing only extra refetch — so the binary-search LCA is purely an
+  efficiency optimization, not a security boundary. (2) Gate the *fork*: follow only a **strictly
+  higher** fork (a same/lower fork is a stale head or an equivocation — an attack, not a history to
+  adopt). (3) Two degenerate anchors need no proof: `ancestors == new_head.length` is a pure
+  truncation (the new head *is* your prefix — compare `prefix_root_hash`), and `ancestors == 0` has no
+  prefix to anchor (an upgrade proof needs `old >= 1`), so adopt the signed higher-fork head from
+  scratch and let `add_block` re-verify every block. After verifying, `truncate` to `ancestors` and
+  refetch the suffix with the existing `add_block` — byte-identical to the source's rewritten history.

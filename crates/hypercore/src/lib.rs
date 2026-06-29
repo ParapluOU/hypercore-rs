@@ -516,6 +516,117 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
             && proof.verify(&self.tree.roots(), &new_head.root)
     }
 
+    /// Verify that `new_head` is a legitimate **reorg** this replica should
+    /// follow: a *higher-fork* signed head whose history shares this replica's
+    /// `[0, ancestors)` prefix and append-only-extends it. The cross-fork
+    /// analogue of [`Self::verify_upgrade`] — pure (no mutation).
+    ///
+    /// Where [`Self::verify_upgrade`] handles a **same-fork** extension anchored
+    /// on the replica's *entire* current head, a reorg is the author rewriting
+    /// history under a bumped `fork` counter ([`Hypercore::truncate`]): readers
+    /// follow the highest fork, so the new head shares only a **proper prefix**
+    /// `[0, ancestors)` (the [lowest common ancestor]) and diverges after it. The
+    /// gate re-anchors the same data-free [`UpgradeProof`] on the replica's own
+    /// roots *at `ancestors`* (`tree.prefix_roots`): those roots are identical to
+    /// the source's roots at that length **iff** the prefix is genuinely shared,
+    /// so the fold reaches `new_head.root` only for a real shared ancestor.
+    ///
+    /// Returns `true` only if: we already trust a head; `new_head.fork` is
+    /// **strictly greater** than ours (a same/lower fork is a stale head or an
+    /// *equivocation* — an attack, see [`conflicting_heads`] — never a history to
+    /// adopt); the author signed `new_head`; `ancestors <= len()` and
+    /// `<= new_head.length`; and the prefix is authenticated:
+    /// - `ancestors == new_head.length` — a **pure truncation**: the new head *is*
+    ///   our prefix at `ancestors` (`prefix_root_hash` must equal `new_head.root`);
+    ///   no `proof` needed.
+    /// - `ancestors == 0` — **no shared prefix**: nothing to anchor (an upgrade
+    ///   proof needs `old >= 1`), so the signed higher-fork head is adopted from
+    ///   scratch and every refetched block is verified against it by
+    ///   [`Self::add_block`]; no `proof` needed.
+    /// - otherwise — `proof` must bridge exactly `ancestors -> new_head.length`
+    ///   and fold our trusted prefix roots up to `new_head.root`.
+    ///
+    /// Soundness note on `ancestors`: the value is *authenticated*, not trusted —
+    /// an **over-claim** (a larger `ancestors` than the true ancestor) names a
+    /// prefix the replica holds but the new history does not, so the fold can't
+    /// reach `new_head.root` and is rejected. An **under-claim** (smaller) is a
+    /// genuine shorter shared prefix and is accepted; it only costs extra refetch
+    /// (the maximal ancestor is the [`MerkleTree::lowest_common_ancestor`] binary
+    /// search — a separate, efficiency concern). Either way the replica ends
+    /// byte-identical to `new_head`.
+    ///
+    /// [lowest common ancestor]: merkle::MerkleTree::lowest_common_ancestor
+    pub fn verify_reorg(
+        &self,
+        new_head: &SignedHead,
+        ancestors: u64,
+        proof: Option<&UpgradeProof>,
+    ) -> bool {
+        let cur = match &self.head {
+            Some(h) => h,
+            None => return false, // nothing trusted to reorg away from
+        };
+        if new_head.fork <= cur.fork {
+            return false; // only a strictly higher fork is a reorg to follow
+        }
+        if !self
+            .public
+            .verify(&head_message(new_head.fork, new_head.length, &new_head.root), &new_head.sig)
+        {
+            return false;
+        }
+        if ancestors > self.tree.len() || ancestors > new_head.length {
+            return false;
+        }
+        // Our own roots at `ancestors` are the trusted anchor — equal to the
+        // source's roots there iff [0, ancestors) is genuinely shared.
+        let anchor = match self.tree.prefix_roots(ancestors) {
+            Some(r) => r,
+            None => return false, // missing prefix nodes (not intact)
+        };
+        if ancestors == new_head.length {
+            // Pure truncation: the new head must be exactly our prefix.
+            self.tree.prefix_root_hash(ancestors) == Some(new_head.root)
+        } else if ancestors == 0 {
+            // No prefix to anchor: adopt the signed higher-fork head from scratch
+            // (blocks are verified against it on refetch).
+            true
+        } else {
+            match proof {
+                Some(p) => {
+                    p.old_len == ancestors
+                        && p.new_len == new_head.length
+                        && p.verify(&anchor, &new_head.root)
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Follow a reorg: verify `new_head` is a legitimate higher-fork rewrite that
+    /// shares this replica's `[0, ancestors)` prefix (via [`Self::verify_reorg`]),
+    /// then drop the divergent suffix, keeping that prefix. Returns `false` and
+    /// leaves the replica **untouched** if verification fails.
+    ///
+    /// On success the replica is at length `ancestors`; fetch the new suffix
+    /// `[ancestors, new_head.length)` with [`Self::add_block`] (against
+    /// `new_head`) to finish. The shared prefix is preserved, not re-derived (the
+    /// surviving nodes already equal the new history's prefix). If
+    /// `ancestors == new_head.length` (a pure truncation) there is no suffix and
+    /// `new_head` becomes the verified head immediately.
+    pub fn reorg(&mut self, new_head: &SignedHead, ancestors: u64, proof: Option<&UpgradeProof>) -> bool {
+        if !self.verify_reorg(new_head, ancestors, proof) {
+            return false;
+        }
+        self.tree.truncate(ancestors); // keep the shared prefix (no-op if == len)
+        if self.tree.len() == new_head.length && self.tree.root_hash() == new_head.root {
+            self.head = Some(new_head.clone()); // pure truncation: reorg complete
+        } else {
+            self.head = None; // suffix refetch pending — no fully-verified head yet
+        }
+        true
+    }
+
     /// Decode the value at `index`, or `None`.
     pub fn get(&self, index: u64) -> Result<Option<T>, Error<S::Error>> {
         if index >= self.tree.len() {
@@ -1325,5 +1436,200 @@ mod tests {
         );
         let fork = fork_proof_at(3, &original, &equivocating);
         assert!(fork.verify(&pk), "same-fork divergence is a provable fork");
+    }
+
+    // ---- secure replica-level reorg (follow a higher-fork truncate-and-rewrite) ----
+
+    #[test]
+    fn replica_follows_reorg_and_refetches_suffix() {
+        // A replica fully replicates [a,b,c,d,e] (fork 0). The author then
+        // reorgs: rewind to 3 (bumping the fork) and rewrite the tail to [X,Y].
+        // The replica follows it — it verifies the higher-fork head shares its
+        // [0,3) prefix, drops the divergent suffix, and refetches [3,5) — ending
+        // byte-identical to the source's new history. The cross-fork analogue of
+        // the verified length-extension flow (ADR-0021/0025).
+        let mut src = core_with(60, &["a", "b", "c", "d", "e"]); // fork 0
+        let head5 = src.head().unwrap().clone();
+        let pk = src.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.verified_head(), Some(&head5));
+
+        // The author reorgs: rewind to 3 (fork -> 1), then rewrite [X, Y].
+        src.truncate(3);
+        src.append(&blk("X")).unwrap();
+        src.append(&blk("Y")).unwrap();
+        let head_r = src.head().unwrap().clone();
+        assert_eq!(head_r.fork, 1);
+        assert_eq!(head_r.length, 5);
+        assert_ne!(head_r.root, head5.root);
+
+        // Shared prefix is [0,3) (a,b,c kept; block 3 d -> X). The author proves
+        // the new history append-only-extends that shared prefix.
+        let ancestors = 3u64;
+        let up = src.upgrade_proof(ancestors, 5).unwrap();
+        assert!(rep.verify_reorg(&head_r, ancestors, Some(&up)), "legit reorg accepted");
+
+        assert!(rep.reorg(&head_r, ancestors, Some(&up)));
+        assert_eq!(rep.len(), 3, "divergent suffix dropped, shared prefix kept");
+        assert!(rep.verified_head().is_none(), "no verified head until suffix refetched");
+
+        // Refetch the new suffix [3,5) against the new head.
+        for i in 3..5u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head_r, i, &enc, &proof).unwrap(), "suffix block {i}");
+        }
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.root_hash(), head_r.root, "replica root == reorged signed root");
+        assert_eq!(rep.verified_head(), Some(&head_r));
+        for i in 0..5u64 {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap(), "byte-identical to reorged source");
+        }
+    }
+
+    #[test]
+    fn replica_reorg_pure_truncation() {
+        // The author simply rewinds to a shorter prefix under a bumped fork (no
+        // rewrite). The replica follows it with no upgrade proof: the new head
+        // *is* its own [0,2) prefix, so the reorg completes immediately.
+        let mut src = core_with(61, &["a", "b", "c", "d", "e"]); // fork 0
+        let head5 = src.head().unwrap().clone();
+        let pk = src.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+
+        src.truncate(2); // [a,b], fork 1
+        let head2 = src.head().unwrap().clone();
+        assert_eq!(head2.fork, 1);
+        assert_eq!(head2.length, 2);
+
+        // ancestors == new length: a pure truncation, no proof required.
+        assert!(rep.verify_reorg(&head2, 2, None));
+        assert!(rep.reorg(&head2, 2, None));
+        assert_eq!(rep.len(), 2);
+        assert_eq!(rep.root_hash(), head2.root);
+        assert_eq!(rep.verified_head(), Some(&head2), "pure truncation completes the reorg");
+        for i in 0..2u64 {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap());
+        }
+        assert_eq!(rep.get(2).unwrap(), None, "dropped block gone");
+    }
+
+    #[test]
+    fn replica_reorg_from_scratch() {
+        // A higher-fork head sharing *no* prefix (block 0 differs): the replica
+        // discards everything (ancestors = 0, no proof) and refetches against the
+        // signed new head, which authenticates every block.
+        let mut src = core_with(62, &["a", "b", "c"]); // fork 0
+        let head3 = src.head().unwrap().clone();
+        let pk = src.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..3u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head3, i, &enc, &proof).unwrap());
+        }
+
+        src.truncate(0); // fork 1, empty
+        for s in ["x", "y", "z", "w"] {
+            src.append(&blk(s)).unwrap();
+        }
+        let head_new = src.head().unwrap().clone();
+        assert_eq!(head_new.fork, 1);
+        assert_eq!(head_new.length, 4);
+
+        assert!(rep.verify_reorg(&head_new, 0, None));
+        assert!(rep.reorg(&head_new, 0, None));
+        assert_eq!(rep.len(), 0, "no shared prefix: replica reset");
+        assert!(rep.verified_head().is_none());
+
+        for i in 0..4u64 {
+            let enc = src.block(i).unwrap().unwrap();
+            let proof = src.proof(i).unwrap();
+            assert!(rep.add_block(&head_new, i, &enc, &proof).unwrap());
+        }
+        assert_eq!(rep.len(), 4);
+        assert_eq!(rep.root_hash(), head_new.root);
+        assert_eq!(rep.verified_head(), Some(&head_new));
+        for i in 0..4u64 {
+            assert_eq!(rep.get(i).unwrap(), src.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn replica_rejects_illegitimate_reorg() {
+        // A replica trusting the honest [a,b,c,d,e] (fork 0) must reject every
+        // illegitimate "reorg" and stay untouched.
+        let honest = core_with(63, &["a", "b", "c", "d", "e"]); // fork 0
+        let head5 = honest.head().unwrap().clone();
+        let pk = honest.public_key();
+
+        let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, MemoryStore::new());
+        for i in 0..5u64 {
+            let enc = honest.block(i).unwrap().unwrap();
+            let proof = honest.proof(i).unwrap();
+            assert!(rep.add_block(&head5, i, &enc, &proof).unwrap());
+        }
+
+        // (a) An honest higher-fork reorg, but the caller *over-claims* the shared
+        // ancestor (4, when the histories diverge at block 3): the replica's own
+        // prefix at 4 ('d') disagrees with the new history ('X'), so the fold
+        // can't reach the new root and the reorg is refused.
+        let mut src = core_with(63, &["a", "b", "c", "d", "e"]);
+        src.truncate(3);
+        src.append(&blk("X")).unwrap();
+        src.append(&blk("Y")).unwrap(); // [a,b,c,X,Y], fork 1
+        let head_r = src.head().unwrap().clone();
+        let over = src.upgrade_proof(4, 5).unwrap();
+        assert!(!rep.reorg(&head_r, 4, Some(&over)), "over-claimed ancestor rejected");
+        // ...while the *true* ancestor (3) for the same head is accepted (the
+        // head itself is an honest reorg — only the claimed ancestor was wrong).
+        let good = src.upgrade_proof(3, 5).unwrap();
+        assert!(rep.verify_reorg(&head_r, 3, Some(&good)), "true ancestor accepted");
+
+        // (b) A forking writer rewrote an *old* block (block 1: b -> Z) under a
+        // bumped fork, claiming to share [0,5). The forked head is validly
+        // self-signed by the same author, but the replica's honest prefix at 5
+        // can't fold to the forked root.
+        let mut forker = core_with(63, &["a", "b", "c", "d", "e"]);
+        forker.truncate(0); // fork 1
+        for s in ["a", "Z", "c", "d", "e", "f"] {
+            forker.append(&blk(s)).unwrap();
+        }
+        let bad_head = forker.head().unwrap().clone();
+        assert_eq!(bad_head.fork, 1);
+        let bad_up = forker.upgrade_proof(5, 6).unwrap();
+        assert!(pk.verify(
+            &head_message(bad_head.fork, bad_head.length, &bad_head.root),
+            &bad_head.sig
+        ));
+        assert!(!rep.reorg(&bad_head, 5, Some(&bad_up)), "forked old block rejected");
+
+        // (c) A same-fork divergence is an equivocation, never a reorg to follow:
+        // refused regardless of the claimed ancestor (and with no proof).
+        let equiv = core_with(63, &["a", "b", "c", "X", "Y"]); // fork 0
+        let eq_head = equiv.head().unwrap().clone();
+        assert_eq!(eq_head.fork, 0);
+        assert!(!rep.reorg(&eq_head, 0, None), "same-fork head is not a reorg");
+        assert!(!rep.reorg(&eq_head, 3, None), "same-fork head refused at any ancestor");
+
+        // Throughout, the replica is untouched at its honest fork-0 head.
+        assert_eq!(rep.len(), 5);
+        assert_eq!(rep.verified_head(), Some(&head5));
+        for i in 0..5u64 {
+            assert_eq!(rep.get(i).unwrap(), honest.get(i).unwrap());
+        }
     }
 }

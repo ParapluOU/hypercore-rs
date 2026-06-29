@@ -71,7 +71,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       **verified length-extension replication** (`Replica::verify_upgrade` — accept a longer signed head only
       as an append-only extension of the replica's own roots *before* fetching the new blocks; ADR-0021) +
       **truncate** (logical rewind to a prefix + a signed `fork` counter; equivocation refined to a
-      *same-fork* contradiction so a fork-bumped reorg is not flagged; ADR-0024)
+      *same-fork* contradiction so a fork-bumped reorg is not flagged; ADR-0024) +
+      **secure replica-level reorg** (`Replica::verify_reorg`/`reorg` — follow only a *strictly
+      higher*-fork signed head, authenticate the claimed shared-prefix length by re-anchoring an
+      `UpgradeProof` on the replica's own roots at that prefix, then drop the divergent suffix and
+      refetch byte-identically; an over-claimed ancestor / forked old block is rejected; ADR-0026)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)

@@ -395,3 +395,37 @@ case. We also still defer `additionalNodes` (which, with standalone proofs per A
 capability our `upgrade_proof(old, any_new)` lacks). `merkle-tree.js` stays `[~]` (LCA/reorg added; the
 bundled-wire seek + `additionalNodes` remain). Soundness rests on the same prefix-root collision-
 resistance the scheme already assumes.
+
+## ADR-0026 — Secure replica-level reorg re-anchors the upgrade proof on the shared prefix's roots
+**Context:** ADR-0025 implemented the *local-tree* reorg (`MerkleTree::lowest_common_ancestor` +
+`reorg`, both trees in memory) and explicitly **deferred the secure replica-level reorg** — a
+verify-only `Replica` (no peer's full tree, only a signed head) following the source's
+truncate-and-rewrite — as the cross-fork analogue of how iter 14 (ADR-0021) wired the data-free
+`UpgradeProof` into `Replica::verify_upgrade` for the same-fork length-extension case. Upstream
+drives this inside the replication protocol's `want`/`update` proof-narrowing exchange, which is
+networking (ADR-0003).
+**Decision:** Reimplement the **L1 gate**, not the wire exchange. `Replica::verify_reorg(new_head,
+ancestors, proof)` (pure) + `Replica::reorg(..)` (verify-then-truncate). A reorg is followed only at
+a **strictly higher `fork`** than the replica's current head (a same/lower fork is a stale head or an
+*equivocation* — ADR-0019/0024 — never a history to adopt) and only if the author signed `new_head`.
+The shared-prefix length `ancestors` is **authenticated, not trusted**, by *re-anchoring the same
+`UpgradeProof` (ADR-0020) on the replica's own roots at `ancestors`* — exposed as
+`MerkleTree::prefix_roots` (and `prefix_root_hash`, now public): because the head at a length is a
+pure function of the first `length` blocks, those roots equal the source's roots there **iff** the
+prefix is genuinely shared, so the fold reaches `new_head.root` only for a real ancestor. Three
+cases: `ancestors == new_head.length` (pure truncation — the new head *is* our prefix, no proof);
+`ancestors == 0` (no prefix to anchor — adopt the signed higher-fork head from scratch, every block
+re-verified on refetch); otherwise the proof bridges `ancestors -> new_head.length`. `reorg` then
+`truncate`s to `ancestors` (preserving the shared prefix, ADR-0024) and the caller refetches the
+suffix with the existing `add_block`.
+**Consequence:** Closes the iter 17 truncate loop — a replica now follows the author's reorg
+end-to-end and ends **byte-identical** to the rewritten history, while a forking writer's rewrite of
+*old* history is rejected (the honest prefix can't fold to the forked root) before any divergent
+block is fetched. `ancestors` over-claiming is rejected (a too-large prefix the new history doesn't
+share); under-claiming is safe (a genuine shorter shared prefix — only extra refetch), so finding the
+**maximal** ancestor (the `lowest_common_ancestor` binary search, ADR-0025) stays a pure efficiency
+concern. We still **defer** the `want`/`update` proof-narrowing wire exchange that *discovers*
+`ancestors` and delivers the suffix proofs in a live system (networking, ADR-0003) — here the test
+supplies `ancestors` (the construction-known divergence point) and the source produces the proofs.
+`core.js` advances (secure reorg-follow ported); the deferred replica-level reorg of ADR-0025 is now
+done. Soundness rests on the same leaf/prefix-root collision-resistance the scheme already assumes.

@@ -803,3 +803,64 @@ Repo-relative paths only — no private or personal data (this repo is public).
   truncate loop). Then the wasm runtime / IndexedDB gate (#2); `merkle` reorg-by-proof/`additionalNodes`;
   `autobase` `topolist.js` ordering; and the view/apply layer (`apply.js`/`anchors.js`) the
   `linearizer.js`/`dags.js` view-length assertions need.
+
+---
+
+## 2026-06-29 — Iteration 19: `hypercore` secure replica-level reorg
+
+**Did**
+- Closed the **secure replica-level reorg** ADR-0025 deferred to the hypercore layer (the cross-fork
+  analogue of iter 14's `verify_upgrade`, ADR-0021), wiring iter 18's local LCA/reorg into a
+  verify-only `Replica` that follows the author's truncate-and-rewrite (`core.js`):
+  - `merkle`: exposed `MerkleTree::prefix_roots(len)` (the authenticated anchor — the roots the tree
+    *would* have at a prefix length; identical in any two trees sharing that prefix) and made
+    `prefix_root_hash` public; the latter now delegates to the former.
+  - `hypercore`: `Replica::verify_reorg(new_head, ancestors, proof)` (pure) + `Replica::reorg(..)`
+    (verify-then-truncate). A reorg is followed only at a **strictly higher `fork`** (a same/lower
+    fork is a stale head or an equivocation — never a history to adopt) signed by the author. The
+    claimed shared-prefix length `ancestors` is **authenticated, not trusted**, by re-anchoring the
+    data-free `UpgradeProof` on the replica's own roots *at `ancestors`* (`prefix_roots`): the fold
+    reaches `new_head.root` only if `[0, ancestors)` is genuinely shared. Three anchor cases:
+    `ancestors == new_head.length` (pure truncation — the new head *is* our prefix, no proof);
+    `ancestors == 0` (no prefix — adopt the signed head from scratch, every block re-verified on
+    refetch); else the proof bridges `ancestors -> new_head.length`. `reorg` then `truncate`s to
+    `ancestors` and the caller refetches the suffix with the existing `add_block`, ending
+    **byte-identical** to the rewritten history.
+- 4 asserting tests (hypercore 26→30): follow a fork-bumped rewrite ([a,b,c,d,e] ⇒ [a,b,c,X,Y]) —
+  verify, drop the suffix to len 3, refetch [3,5), byte-identical; **pure truncation** (ancestors ==
+  new length, no proof, completes immediately); **from scratch** (ancestors 0, no shared prefix,
+  full re-replication); and a **rejection battery** — an *over-claimed* ancestor (4 when the true
+  divergence is 3) on an honest head, a forking writer that rewrote an *old* block (b→Z) under a
+  bumped fork claiming to share [0,5), and a *same-fork* divergence (equivocation) refused at any
+  ancestor — with the replica left untouched at its honest fork-0 head throughout.
+- `just verify` green: 98 native tests + wasm build of `hypercore`/`autobase`/`storage`. (Also added
+  the stray empty `verify.log` to `.gitignore`.)
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0026: the secure reorg is an **L1 gate that re-anchors the `UpgradeProof` on the shared prefix's
+  roots**, not upstream's `want`/`update` proof-narrowing wire exchange. `ancestors` authenticates
+  itself (over-claim ⇒ the fold misses the new root ⇒ rejected; under-claim ⇒ a real shorter shared
+  prefix, safe, only extra refetch), so the maximal-ancestor `lowest_common_ancestor` binary search
+  (ADR-0025) is a pure efficiency concern, not a security boundary. We **defer** the wire exchange
+  that *discovers* `ancestors` and delivers the suffix proofs in a live system (networking, ADR-0003)
+  — the test supplies the construction-known divergence point and the source produces the proofs.
+  `core.js` advances; ADR-0025's deferred replica-level reorg is now done.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A replica follows a reorg by re-anchoring the *same* upgrade proof on a **proper prefix** of its own
+  history (`prefix_roots` at `ancestors`), not its full head — and the claimed ancestor then
+  authenticates itself (over-claim rejected, under-claim safe), so the LCA search is purely
+  efficiency. Gate the fork (strictly higher only); two degenerate anchors (`ancestors == new length`
+  pure truncation, `ancestors == 0` from scratch) need no proof; then `truncate` + refetch via
+  `add_block`.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) — still environment-blocked (Apple
+  `container` service not startable under the loop's scoped allowlist + image pull needs network; see
+  iters 11–18). When a container runtime is *started*, build `tools/oracle/` driving the reference
+  `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2, needs headless Chrome); `merkle`
+  reorg-by-proof/`additionalNodes` (the last `merkle-tree.js` pieces); `autobase` `topolist.js`
+  ordering; and the view/apply layer (`apply.js`/`anchors.js`) the `linearizer.js`/`dags.js`
+  view-length assertions need.

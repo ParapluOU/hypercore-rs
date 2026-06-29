@@ -230,18 +230,34 @@ impl MerkleTree {
         self.roots().iter().map(|r| r.size).sum()
     }
 
+    /// The root nodes the tree *would* have if truncated to its first `len`
+    /// blocks, or `None` if any node that prefix needs is missing. `len == 0`
+    /// yields the empty root set; `len > len()` yields `None`.
+    ///
+    /// This is the authenticated anchor a holder folds an [`UpgradeProof`] onto
+    /// when following a reorg (the hypercore layer's `Replica::reorg`): because
+    /// the head at a length is a pure function of the first `length` blocks,
+    /// these roots are **identical** in any two trees that share the `[0, len)`
+    /// prefix — so a verifier can re-anchor a length-extension proof on a proper
+    /// prefix of its own trusted history, not just on its full current head.
+    pub fn prefix_roots(&self, len: u64) -> Option<Vec<Node>> {
+        if len > self.length {
+            return None;
+        }
+        flat::full_roots(len * 2)
+            .into_iter()
+            .map(|i| self.nodes.get(&i).copied())
+            .collect()
+    }
+
     /// The root hash the tree *would* have if truncated to its first `len`
     /// blocks, or `None` if any node that prefix needs is missing (repair mode).
     /// `len == 0` yields the empty-tree hash. Used by
     /// [`lowest_common_ancestor`](MerkleTree::lowest_common_ancestor): because
     /// the head at a length is a pure function of the first `length` blocks, two
     /// trees agree on blocks `[0, len)` iff this hash is equal in both.
-    fn prefix_root_hash(&self, len: u64) -> Option<Hash> {
-        let roots: Option<Vec<Node>> = flat::full_roots(len * 2)
-            .into_iter()
-            .map(|i| self.nodes.get(&i).copied())
-            .collect();
-        Some(tree_hash(&roots?))
+    pub fn prefix_root_hash(&self, len: u64) -> Option<Hash> {
+        Some(tree_hash(&self.prefix_roots(len)?))
     }
 
     /// The **lowest common ancestor** of `self` and `other`: the length `a` of
