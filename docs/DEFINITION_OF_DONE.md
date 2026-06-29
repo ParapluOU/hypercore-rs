@@ -57,7 +57,9 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
       prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)
-- [ ] convergence simulation (gate #3)
+- [x] convergence simulation (gate #3) — `crates/autobase/tests/convergence.rs`: seeded random
+      partitioned/cooperative DAGs; order + state + finalized converge across delivery orders;
+      finalized prefix monotone under cooperative growth (ADR-0016)
 - [ ] JS algorithmic-equivalence oracle (gate #4)
 - [ ] WASM runtime / IndexedDB (gate #2)
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)

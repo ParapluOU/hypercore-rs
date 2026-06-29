@@ -252,3 +252,44 @@ Repo-relative paths only — no private or personal data (this repo is public).
 - Then the generic **convergence sim** (gate #3): N writers, seeded random causal visibility; assert
   convergence + finalized-prefix-never-reorders. Then the **JS oracle** (gate #4) on `order()` +
   `quorum_degree`.
+
+---
+
+## 2026-06-29 — Iteration 9: convergence simulation (gate #3)
+
+**Did**
+- Closed **integration gate #3**: `crates/autobase/tests/convergence.rs`, a clean-room reimplementation
+  of `reference/js/autobase/test/fuzz/` — host-safe and dependency-free (own seeded **SplitMix64** PRNG;
+  no `rand`/`getrandom`, no `Math.random`). Two random-DAG generators: **partitioned** (the upstream
+  `createDag` subset-of-tails model — forks/merges/reordering) and **cooperative** (each node references
+  *all* current tails ⇒ a total order). Delivery-order variety comes from a **randomized-Kahn** topo sort.
+- Two asserting tests: (1) over 16 partitioned seeds (mixed sparse/dense reference density), replaying
+  the same node set through 4 distinct causally-valid delivery orders yields identical `order()`, an
+  identical generic **state fold** (rolling FNV checksum over `NodeId`s — no domain types), and identical
+  `finalized()`, plus per-edge causal-respect; a non-vacuity guard asserts the dense seeds actually
+  finalize *something*. (2) over 8 cooperative seeds, incremental creation-order delivery keeps the
+  finalized prefix **monotone** (`starts_with` the previous) and ⊑ `order()` at every step, and a long
+  run finalizes a non-empty prefix. `just verify` green (42 native tests + wasm build).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0016: reimplement the fuzz *behaviour*, not the harness — seeded PRNG **is** the repro (replacing
+  upstream's "format a failing DAG to a JS file"); skip `rollBack`'s node-deletion re-derivation and the
+  deadlock/JS-formatting plumbing (test-runner concerns). Crucially, **finality monotonicity is asserted
+  only under cooperative growth**: the conservative `finalized()` (ADR-0015, comparable-to-every-node) can
+  legitimately *shrink* under arbitrary partitions when a late concurrent node strands a previously-
+  finalized node — that is the deferred fork/merge gap, not a bug — so partitioned DAGs assert only
+  convergence (a pure function of the node set always agrees).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A fuzz/convergence sim needs a *seeded* PRNG (a 5-line SplitMix64, no deps) so a failure reproduces
+  forever; drive delivery variety with randomized-Kahn (every output is a valid causal order).
+- Convergence is a pure function of the node set ⇒ holds under arbitrary partitions; the conservative
+  *finality* prefix is monotone only under cooperative growth — assert each where it actually holds.
+- L1 "application state" in a domain-agnostic sim is just an order-sensitive checksum of the `NodeId`s.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008): feed the same random DAGs (reuse this sim's
+  seeded generator) to `reference/js/autobase`'s linearizer **inside `scripts/node-sandbox.sh`** and to
+  ours; assert identical `order()` (and ideally `quorum_degree`). This is also the cross-check that lets
+  us safely strengthen `finalized()` for **forks/merges** + the 2-degree-lead caveat (ADR-0015).
+- Then the remaining wasm runtime / IndexedDB gate (#2) and the per-file upstream test rows.

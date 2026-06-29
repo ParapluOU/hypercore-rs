@@ -46,3 +46,19 @@ personal data** (this repo is public; use repo-relative paths).
   finality-*stability* directly (a finalized prefix only ever extends under cooperative growth) rather
   than claiming the full fork/merge rule. Defer the 2-degree-lead caveat to the iteration that has the
   JS oracle to check against.
+- **A convergence/fuzz sim needs a *seeded* PRNG, not the platform RNG.** Use a tiny inline
+  deterministic generator (SplitMix64 is ~5 lines, no deps) so a failing case reproduces forever — it
+  *is* the repro, which is what upstream's "format a failing DAG to a JS file" machinery exists to
+  provide. Drive delivery-order variety with a **randomized-Kahn** topological sort (pick a random
+  causally-ready node each step); every output is a valid causal delivery order.
+- **Convergence (a pure function of the node set) holds under arbitrary partitions; conservative
+  *finality* does not.** `order()`/`finalized()` are pure functions of the DAG, so any delivery order
+  agrees — assert that everywhere. But the conservative `finalized()` (comparable-to-every-node) can
+  legitimately *shrink* when a late concurrent node strands a previously-finalized node, so assert
+  *monotonic, never-reordering* growth only under **cooperative** generation (each node references all
+  current tails ⇒ a total order, no stranding). Asserting strict monotonicity on a partitioned DAG
+  would be testing a property the conservative form is honestly allowed to violate (the deferred
+  fork/merge gap, ADR-0015/0016), not a real bug.
+- **Keep the sim L1.** "Application state" in a domain-agnostic convergence test is just an
+  order-sensitive checksum of the emitted `NodeId`s (a rolling FNV fold) — equal iff the orders are
+  equal. No payload, no domain type; it stands in for "replicas folded the same ops to the same state".

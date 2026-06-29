@@ -50,7 +50,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `autoack.js` | [ ] | quorum acknowledgement |
 | `repair.js`, `snapshots.js` | [ ] | reorder repair / snapshots |
 | `fast-forward.js`, `optimistic.js` | [ ] | signed-length fast-forward / optimistic blocks (later) |
-| `fuzz/` | [ ] | **model for our convergence sim (gate #3)** |
+| `fuzz/` | [x] | **convergence sim (gate #3)** ported clean-room as `crates/autobase/tests/convergence.rs`: seeded random DAG generator (`createDag` model) + delivery-order convergence + cooperative-growth finality-stability (the `rollBack` confirmed-prefix-stability idea). Deadlock/JS-formatting harness out of scope (ADR-0016) |
 | `messages.js`, `node-buffer.js`, `encoding/` | — | wire encoding (→ our `codec`, not ported as-is) |
 | `encryption.js` | — | encryption deferred |
 | `suspend.js`, `timer.js`, `trace.js` | — | session/runtime/tracing |

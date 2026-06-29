@@ -125,3 +125,31 @@ upstream, never earlier/wrongly); and (b) view materialization, so the upstream
 validated as a *property* (a finalized prefix never reorders under cooperative growth), to be
 strengthened against arbitrary partitions by the convergence sim (gate #3) and the JS oracle
 (gate #4).
+
+## ADR-0016 — Convergence sim: clean-room generator; monotonicity scoped to cooperative growth
+**Context:** Gate #3 (`docs/DEFINITION_OF_DONE.md`) is modeled on `reference/js/autobase/test/fuzz/`.
+Upstream's `fuzz/helpers.js` generates random DAGs (`createDag`: each node references a random subset
+of current tails) and runs `rollBack` — incrementally feeding nodes, randomly deleting head nodes, and
+re-deriving — asserting the *confirmed/indexed* prefix never disagrees across runs. It then formats any
+failure as a runnable JS repro. It executes `Linearizer` via node and uses `Math.random()`.
+**Decision:** Reimplement the *behaviour*, not the harness, as `crates/autobase/tests/convergence.rs`,
+host-safe and dependency-free:
+- our own **seeded** SplitMix64 PRNG (reproducible; no `rand`/`getrandom`, no `Math.random`), so a
+  failing seed is a permanent repro — replacing the upstream "format a JS repro file" machinery;
+- two generators: **partitioned** (the `createDag` subset-reference model — forks/merges/reordering)
+  and **cooperative** (each node references *all* current tails ⇒ a total order);
+- assert the gate's four properties directly: deliver each DAG through several **randomized-Kahn**
+  topological orders and check `order()`, a generic content-agnostic **state fold** (rolling FNV
+  checksum — no domain types), and `finalized()` are identical across delivery orders (determinism /
+  convergence / state-equality), plus per-edge causal-respect.
+- **Finality-stability is asserted only on the cooperative generator.** The conservative `finalized()`
+  (ADR-0015) requires each finalized node be *comparable to every other node*; under arbitrary
+  partitions a **late-arriving concurrent node can strand a previously-finalized node** (it loses
+  comparability), so `finalized()` may legitimately *shrink* there. That is the very fork/merge gap
+  ADR-0015 defers — not a regression — so on partitioned DAGs we assert only convergence (a pure
+  function of the node set always agrees), and we assert *monotonic, never-reordering* growth only
+  under cooperative delivery, where no stranding can occur.
+**Consequence:** Gate #3 is green and host-safe. We do **not** port `rollBack`'s node-deletion
+re-derivation or the deadlock/JS-repro formatting (a test-runner concern). Strengthening `finalized()`
+to advance monotonically *through* resolved partitions is the deferred fork/merge work (ADR-0015),
+to be cross-checked by the JS oracle (gate #4, ADR-0008).
