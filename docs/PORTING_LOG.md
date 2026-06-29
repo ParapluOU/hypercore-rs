@@ -101,3 +101,27 @@ Repo-relative paths only — no private or personal data (this repo is public).
 
 **Next**
 - `storage`: byte-storage trait + in-memory backend (random-access read / write / len / truncate).
+
+---
+
+## 2026-06-29 — Iteration 4: `storage`
+
+**Did**
+- Implemented `crates/storage`: a `u64`-keyed `Store` trait (put / get / delete / len / contains),
+  a `MemoryStore` backend (BTreeMap, `Error = Infallible`), and a reusable `contract::run<S: Store>`
+  that any backend must pass. 2 asserting tests; `just verify` green.
+
+**Decisions**
+- `Store` is a synchronous `u64`-keyed KV (blocks and tree nodes addressed by index).
+- The browser backend is **deferred** and intentionally reordered after `hypercore`: IndexedDB is
+  *async*, so it needs either an async backend trait or a synchronous `localStorage` backend, and it
+  can only be runtime-tested in a browser (a `verify-full` gate). `hypercore` is the centerpiece and
+  fully testable natively, so it goes next to keep every iteration green-by-real-test.
+
+**Lessons**
+- A shared `contract::run` is the concrete enforcement of "same contract upheld by every backend" —
+  the memory test and the future browser test call the exact same assertions.
+
+**Next**
+- `hypercore`: the typed, signed, append-only log — `append`/`get`/`verify` over `codec` + `merkle`
+  + `identity` + `storage` (port `basic.js` / `core.js` behaviours). Then proof-based replication.

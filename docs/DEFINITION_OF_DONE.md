@@ -51,7 +51,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [~] `merkle` — tree + inclusion proofs + tamper-rejection (range proofs pending)
 - [x] `codec` — round-trip + versioned/tolerant decode
 - [x] `identity` — sign/verify + forgery-rejection
-- [ ] `storage` — trait + in-memory backend
+- [x] `storage` — trait + in-memory backend
 - [ ] `storage` — IndexedDB backend (wasm)
 - [ ] `hypercore` — append/get/verify + proof-based replication
 - [ ] `autobase` — linearizer (causal order + deterministic tiebreak)
