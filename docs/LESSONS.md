@@ -424,3 +424,19 @@ personal data** (this repo is public; use repo-relative paths).
   proof can't ride along). The full multisig **wire format** (`assemble`/`inflate`), the v0 **compat**
   path, `allowPatch` patch signing, and wiring the verifier into `Hypercore` (replacing the single-key
   signed head) are the deferred wrapping — none change the quorum primitive.
+- **Wiring a new authority into a large, well-tested core: add a focused parallel type, don't refactor the
+  hot core in place under a single green gate.** Changing how a head is *signed* (e.g. binding a manifest
+  hash so a quorum can authorize it) changes the head's signed bytes, which cascades into every
+  verify/replicate call site and their tests — in a 3000-line core with ~60 tests, many of them textually
+  identical (`verify_block(&pk, &head, i, &enc, &proof)`), that is ~60 brittle edits with no behavioural gain
+  for the single-signer case. The lower-risk, equally-faithful move is a self-contained sibling type
+  (`ManifestCore`/`ManifestReplica`) that wires the new authority end-to-end (key = `manifest.hash()`; head =
+  ≥ quorum distinct valid sigs; verify-only replica keyed by the *public* manifest), with the single-signer
+  manifest as the special case so `key()` still equals the plain core's identity. The capability lands green;
+  *unifying* the sibling into the original (retiring its single-key path) becomes a deferred mechanical step,
+  not a prerequisite. Two design notes fall out: (1) a core collects a partial signature from each **local**
+  signer secret it holds, so a core holding `< quorum` secrets honestly produces an *unauthorized* head it
+  cannot ratify alone — that is the quorum gate, and it's the test worth writing; (2) sort the collected
+  partial sigs by signer index so two cores with the same signer set produce **byte-identical** heads
+  (determinism), and keep the head fork-free when the focused type has no `truncate` (don't import a
+  fork-counter you don't yet use).

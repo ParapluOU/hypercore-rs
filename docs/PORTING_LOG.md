@@ -1735,3 +1735,80 @@ Repo-relative paths only — no private or personal data (this repo is public).
     binding, the deferred half of ADR-0035) — replacing the single-key `SignedHead` with a `Manifest`;
     `merkle` reorg-by-proof / `additionalNodes`; the replication re-download that refills a cleared block +
     `purge`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 33: `hypercore` manifest-authorized core (`ManifestCore`/`ManifestReplica`)
+
+**Did**
+- Picked the top natively-testable item from iter 32's "Next": **wire the iter-32 `identity::Manifest`
+  verifier (ADR-0035) into a hypercore-style core** — the manifest-hash-into-key binding + a quorum-
+  authorized head. (The other non-env-blocked candidate — the deferred fork/merge consensus, ADR-0015 —
+  LESSONS.md says defer until the JS oracle, gate #4, can cross-check it; gate #4 is still env-blocked.)
+- **Scoped it as a focused new type, not an in-place `Hypercore` refactor** (ADR-0036). An in-place
+  replacement of the single-key `SignedHead` changes the head's *signed bytes* (a head must bind the
+  **manifest hash**, so a single-author head over `head_message(fork,length,root)` no longer verifies under a
+  manifest), cascading into ~60 call sites across the 3057-line core + its ~60 tests — many textually
+  identical `verify_block(&pk, &head, i, &enc, &proof)` lines (not uniquely editable) — high-risk churn with
+  no behavioural gain for the single-signer case. Instead, added `crates/hypercore/src/manifest_core.rs`,
+  leaving the single-key core 100% untouched:
+  - `ManifestCore<T, C, S>` — an append-only log governed by a `Manifest` quorum. `key()` = the content-
+    addressed `Manifest::hash()` (so `Manifest::single(pk).hash()` ≡ a plain core's identity); `append`
+    collects a partial signature from **each locally-held declared signer** (signer-index-sorted →
+    byte-identical heads across cores with the same signer set); `verify_head()` passes iff those reach the
+    manifest's quorum. A head is at a single (implicit fork-0) history, so it carries **no fork field** (the
+    fork counter + `truncate`/batch/snapshot/streams stay on the single-key `Hypercore`).
+  - `verify_manifest_block(manifest, head, index, data, proof)` — the multi-signer analogue of `verify_block`:
+    the head meets the manifest quorum *and* the proof places `data` at `index` under the head's root.
+  - `ManifestReplica<T, C, S>` — verify-only, holding only the **public** `Manifest`; rebuilds a byte-
+    identical log, trusting no sender.
+- 5 asserting tests (hypercore 55→60; workspace 159→164): `single_signer_core_is_the_plain_identity`
+  (`key()` ≡ `Manifest::single(pk).hash()`, deterministic + author-distinct; append/get round-trip;
+  `verify_head`; each block authenticates, forged bytes / wrong index rejected);
+  `multi_signer_quorum_authorizes_and_replicates` (2-of-3 holding all three secrets — head verifies, carries
+  ≥ quorum sigs, a public-manifest replica rebuilds byte-identically: same root, same head, same decoded
+  values); `head_below_quorum_is_unauthorized` (a 2-of-3 core holding **one** secret yields a 1-sig head —
+  `verify_head` false, replica refuses, nothing stored — the quorum gate, the whole point);
+  `manifest_is_the_content_addressed_authority` (same author secret, different namespace → different key, and
+  a head authorized under one policy does **not** verify under the other — `who may sign` can't change without
+  changing the identity); `forged_and_non_distinct_heads_are_rejected` (a replica rejects a tampered sig, the
+  same signer twice (distinctness), and a non-signer's sig in a real slot — leaving nothing stored — then the
+  honest head still replicates). `just verify` green: **164 native tests** (autobase 24 across files +
+  codec 8 + hypercore 60 + identity 11 + merkle 44 + storage 17) + wasm build of
+  `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0036: the manifest-authorized core is a **focused new type** (`ManifestCore`/`ManifestReplica`), not an
+  in-place `Hypercore` refactor. `Manifest::single(pk)` is the single-signer special case (so `key()` equals a
+  plain core's identity); a `< quorum` core yields an unauthorized head. We **diverge** by adding a parallel
+  type rather than retrofitting `Hypercore`; **unifying** the two (reframing `Hypercore` as `Manifest::single`,
+  retiring its single-key `SignedHead`) + putting the fork counter on `ManifestCore` is the remaining
+  mechanical follow-up, deferred. Still **deferred** (from ADR-0035): compat (v0), `allowPatch`, the multisig
+  wire format, session `moveTo`/`migrate`. `manifest.js` stays `[~]` (advances further).
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Wiring a new authority into a large, well-tested core: add a **focused parallel type**, don't refactor the
+  hot core in place under a single green gate. Changing how a head is *signed* changes its signed bytes →
+  ~60 brittle, often-identical verify/replicate edits, with no single-signer behavioural gain. A self-contained
+  `ManifestCore`/`ManifestReplica` (key = `manifest.hash()`; head = ≥ quorum distinct valid sigs; public-
+  manifest replica) lands the capability green, with single-signer as the special case; *unifying* it into the
+  original becomes a deferred mechanical step. Two notes: a core collects a partial sig from each **local**
+  secret it holds, so a `< quorum` core honestly produces an unauthorized head (the gate worth testing); and
+  signer-index-sort the partial sigs for byte-identical heads, keeping the head fork-free until the type has a
+  `truncate`.
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable under
+    the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend `[ ]`
+    would also wire the bitfield's deferred `open`/`flush` persistence (and persist the presence map /
+    snapshots);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view layer
+    (`apply.js`/`anchors.js`);
+  - more natively-testable rows: **unify the single-key `Hypercore` and `ManifestCore`** (reframe `Hypercore`
+    as a `Manifest::single` special case, retiring its single-key `SignedHead`; add the fork counter +
+    `truncate` to the manifest path) — the in-place half of ADR-0036/ADR-0035; `merkle` reorg-by-proof /
+    `additionalNodes`; the replication re-download that refills a cleared block + `purge`; `hyperbee`.

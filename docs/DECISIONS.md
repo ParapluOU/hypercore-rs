@@ -730,3 +730,38 @@ path, `allowPatch` cross-length patch signing, and the `linked`/`userData` manif
 **wire format** (`assemble`/`inflate` compact-encoding); and the session-level `moveTo`/`multisig -
 append`/`patches` (sessions/networking). Soundness rests on ed25519 unforgeability + manifest-hash
 collision-resistance (a signature is bound to the exact policy via the manifest hash in its signable).
+
+## ADR-0036 — Manifest-authorized core is a focused new type (`ManifestCore`), not an in-place `Hypercore` refactor
+**Context:** ADR-0035 deferred *wiring* the iter-32 `identity::Manifest` verifier into a hypercore-style
+core — "replacing the single-key `SignedHead` with a `Manifest`" (the manifest-hash-into-key identity
+binding + a quorum-authorized head). The single-key `Hypercore` is a 3057-line module with ~60 tests; an
+in-place replacement changes the head's *signed bytes* (a head must bind the **manifest hash**, so a
+single-author head signed over `head_message(fork,length,root)` no longer verifies under a manifest), which
+cascades into ~60 call sites (`verify_block`/`conflicting_heads`/`ForkProof::verify`/`Replica`/`Snapshot` +
+their tests, many of which are textually identical `verify_block(&pk, &head, i, &enc, &proof)` lines).
+Doing that under a single green gate, in one single-writer step, is high-risk churn with no behavioural
+gain for the single-signer case.
+**Decision:** Deliver the **manifest-authorized core capability** as a focused, self-contained new type in
+`crates/hypercore` (`crates/hypercore/src/manifest_core.rs`), leaving the single-key `Hypercore` untouched:
+- [`ManifestCore<T, C, S>`] — an append-only log governed by a [`Manifest`] quorum. Its identity is the
+  content-addressed [`Manifest::hash`] ([`key`]), each head `(length, root)` is signed by every locally-held
+  declared signer (collected in signer-index order — deterministic), and [`verify_head`] passes iff those
+  reach the manifest's quorum. A head here is at a single (implicit fork-0) history, so it carries **no fork
+  field** (the fork counter + `truncate`/batch/snapshot/streams stay on the single-key `Hypercore`).
+- [`verify_manifest_block`] — the multi-signer analogue of `verify_block`: a head meets the manifest quorum
+  *and* the proof places `data` at `index` under the head's root.
+- [`ManifestReplica<T, C, S>`] — verify-only, holding only the **public** [`Manifest`] (the policy); rebuilds
+  a byte-identical log, trusting no sender.
+`Manifest::single(pk)` makes `ManifestCore::key()` equal a plain one-author core's identity, so the
+single-signer case is the special case; a true multi-signer (e.g. 2-of-3) core that holds < quorum secrets
+produces an *unauthorized* head it cannot ratify alone.
+**Consequence:** The manifest-hash-into-key binding + quorum-authorized head + manifest-keyed verify-only
+replication (the L1 of `manifest.js`'s `multisig - append` shape, minus sessions/networking) are ported and
+host-safe under `just verify`. `manifest.js` stays `[~]` (advances further). We **diverge** by adding a
+parallel core type rather than retrofitting `Hypercore` in place; **unifying** the two (reframing `Hypercore`
+as `ManifestCore` with `Manifest::single`, retiring the single-key `SignedHead`) is the remaining mechanical
+follow-up, deferred. We still **defer** (from ADR-0035) the compat (v0) signer path, `allowPatch`
+cross-length patch signing, the multisig wire format, and the session-level `moveTo`/`migrate`. The fork
+counter is not yet on `ManifestCore` (no `truncate` here), so cross-fork equivocation lives only on the
+single-key core until unification. Soundness rests on the same ed25519 + manifest-hash collision-resistance
+ADR-0035 already assumes, plus the Merkle leaf binding `verify_block` rests on.

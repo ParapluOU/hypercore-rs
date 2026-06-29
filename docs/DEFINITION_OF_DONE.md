@@ -67,8 +67,11 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `Hypercore.key(pk)`; `sign`/`verify` over a head `(length, tree_hash)` enforcing the multisig
       **quorum** rule — ≥ quorum distinct in-range signers, each valid over a manifest-hash-bound
       `signable` — with a `Prologue` prefix self-authorizing on content; non-ed25519 signers structurally
-      impossible, invalid configs rejected at construction; ADR-0035 — wiring into `Hypercore` + compat
-      v0 / `allowPatch` / multisig wire format / session `moveTo` tracked on `manifest.js`)
+      impossible, invalid configs rejected at construction; ADR-0035) **+ wired into a manifest-authorized
+      core** (`hypercore::ManifestCore`/`ManifestReplica` — `key()` = `manifest.hash()`, a head authorized
+      only by ≥ quorum distinct valid sigs, verify-only replication keyed by the public manifest; ADR-0036;
+      the in-place `Hypercore` unification + compat v0 / `allowPatch` / multisig wire format / session
+      `moveTo` still tracked on `manifest.js`)
 - [x] `storage` — trait + in-memory backend
 - [x] `storage` — **sparse bitfield** (`Bitfield`: get / set / set_range / count(start,**length**,val) /
       find_first / find_last over an unbounded, sparse, paged local presence map; clean-room of
@@ -115,7 +118,13 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       length is a `truncate` floor — the L1 of `move-to.js`'s "move - basic"/"move - snapshots", ADR-0034;
       the full multi-signer manifest/`Verifier`/`multisig` + manifest-into-key identity, and the
       session-level `moveTo`/`migrate` re-homing, deferred) — `purge`/physical-reclamation
-      guarantees + the replication re-download that refills a cleared block tracked on `clear.js`
+      guarantees + the replication re-download that refills a cleared block tracked on `clear.js` +
+      **manifest-authorized core** (`ManifestCore`/`ManifestReplica`: `key()` = `Manifest::hash()` content-
+      addressed identity, `append` collects a partial sig from each local signer, `verify_head`/
+      `verify_manifest_block` enforce the ≥ quorum distinct-valid rule, a `< quorum` core yields an
+      unauthorized head it can't ratify alone, verify-only replication keyed by the public manifest — the
+      L1 of `manifest.js`'s `multisig - append`; ADR-0036 — a focused sibling type, not an in-place
+      `Hypercore` refactor; unifying the two + fork counter on it deferred)
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks
       that priority-Kahn `order()` agrees node-for-node with it (both = the lex-minimal linear extension)

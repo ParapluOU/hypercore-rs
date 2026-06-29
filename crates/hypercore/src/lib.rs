@@ -18,6 +18,9 @@ use identity::{PublicKey, SecretKey, Sig};
 use merkle::{Hash, MerkleTree, Proof, UpgradeProof};
 use storage::{Bitfield, Store};
 
+mod manifest_core;
+pub use manifest_core::{verify_manifest_block, ManifestCore, ManifestHead, ManifestReplica};
+
 /// Domain tag for the head-signable message (separates it from any other thing
 /// the author might sign).
 const HEAD_DOMAIN: u8 = 0xC0;
