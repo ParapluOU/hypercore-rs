@@ -22,7 +22,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `atomic.js` | [ ] | `hypercore` atomic append |
 | `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper ported; seeks/reorg/upgrade later) |
 | `merkle-tree-recovery.js` | [ ] | `merkle` recovery |
-| `encodings.js` | [ ] | `codec` |
+| `encodings.js` | [~] | `codec` (varint/framing/tagged/tolerance concepts ported; upstream-specific encodings are clean-room) |
 | `conflicts.js` | [ ] | `hypercore`/`merkle` fork detection |
 | `bitfield.js`, `bit-interlude.js`, `mark-bitfield.js`, `mark-n-sweep.js` | [ ] | `storage`/sparse bitfield (local) |
 | `clear.js`, `purge.js` | [ ] | `hypercore` clear/truncate |

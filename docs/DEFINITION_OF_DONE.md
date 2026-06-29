@@ -49,7 +49,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 
 - [x] Workspace scaffold (no data types)
 - [~] `merkle` — tree + inclusion proofs + tamper-rejection (range proofs pending)
-- [ ] `codec` — round-trip + versioned/tolerant decode
+- [x] `codec` — round-trip + versioned/tolerant decode
 - [ ] `identity` — sign/verify + forgery-rejection
 - [ ] `storage` — trait + in-memory backend
 - [ ] `storage` — IndexedDB backend (wasm)

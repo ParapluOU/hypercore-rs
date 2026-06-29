@@ -54,3 +54,27 @@ Repo-relative paths only — no private or personal data (this repo is public).
 **Next**
 - `merkle` range proofs (multi-block) to fully close the merkle DoD item.
 - `codec`: round-trip + versioned/tolerant decode (port hypercore `encodings.js`).
+
+---
+
+## 2026-06-29 — Iteration 2: `codec`
+
+**Did**
+- Implemented `crates/codec` (dependency-free): LEB128 `varint`, version `frame`/`unframe`,
+  length-skippable `write_tagged`/`read_tagged`, and a `Codec<T>` trait (separate from `T`) with
+  built-in `U64` and `Bytes` codecs.
+- 8 asserting tests: varint round-trip + truncation-EOF, built-in round-trip, trailing-byte
+  tolerance, version framing, unknown-variant skip, and schema evolution both directions (old bytes
+  under a newer schema; newer bytes tolerated by an older reader). `just verify` green.
+
+**Decisions**
+- `Codec<T>` is a separate encoder type (matches `Hypercore<T, C: Codec<T>>`), not a self-encoding
+  trait — one type can carry different wire formats; storage/ordering stay content-blind.
+- Dependency-free (no serde): deterministic bytes for content-addressing, trivially wasm-safe.
+
+**Lessons**
+- "Tolerant" = explicit lengths + ignore-trailing + default-on-EOF for newer fields. The
+  length-delimited tagged frame is what lets a reader skip unknown variants without losing the stream.
+
+**Next**
+- `identity`: ed25519 keygen / sign / verify + forgery-rejection (maps onto an Iroh `NodeId`).
