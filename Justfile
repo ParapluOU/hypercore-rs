@@ -28,7 +28,8 @@ wasm:
 wasm-test:
     wasm-pack test --headless --chrome crates/storage
 
-# JS algorithmic-equivalence oracle: compare our linearizer to reference/js/autobase. Requires node.
-# (Implemented as an ignored cargo test that shells out to node; enabled once the linearizer exists.)
+# JS algorithmic-equivalence oracle: compare our linearizer to reference/js/autobase.
+# Runs node ONLY inside a container via scripts/node-sandbox.sh (untrusted npm tree — see CLAUDE.md
+# rule 7); requires a container runtime (Apple `container` or docker). Enabled once the linearizer exists.
 oracle:
     cargo test -p autobase --features oracle -- --ignored oracle

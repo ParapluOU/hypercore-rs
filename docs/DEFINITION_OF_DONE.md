@@ -33,7 +33,8 @@ Every **relevant** upstream test file becomes a passing Rust test. Tracking + re
    `reference/js/autobase/test/fuzz/`.)
 4. **JS algorithmic-equivalence oracle** — `just oracle`: feed the same random DAGs to
    `reference/js/autobase`'s linearizer (via node) and ours; assert identical order. The
-   verovio-style deterministic oracle, at the algorithm level.
+   verovio-style deterministic oracle, at the algorithm level. **node runs only inside a container**
+   via `scripts/node-sandbox.sh` — never on the host (untrusted npm tree; see CLAUDE.md rule 7).
 
 ## The gate
 

@@ -49,3 +49,21 @@ same DAG ⇒ identical linearization order.
 **Decision:** Never commit absolute disk paths, machine/user names, emails, tokens/secrets,
 internal hostnames, or consumer-project internals — in code, tests, docs, or the porting log. Use
 repo-relative paths; sanitize tool output before committing.
+
+## ADR-0011 — Run JS reference only in a sandbox/container
+**Context:** The JS oracle (ADR-0008) executes `reference/js/autobase` via node, pulling an
+untrusted npm dependency tree (supply-chain exploits are common).
+**Decision:** Never run `npm`/`node` against the reference on the host. Route it through
+`scripts/node-sandbox.sh` — a container runtime (Apple `container` or docker), with npm install
+scripts disabled and optional no-network at runtime. Reading/porting JS to Rust is host-safe;
+*executing* it is not.
+**Consequence:** The `oracle` gate and any reference-JS execution go through the wrapper; a host with
+no container runtime cannot run them, by design.
+
+## ADR-0012 — Single-writer loop; no code-editing subagents
+**Context:** Parallel editing agents within one iteration would race on files and the porting log.
+**Decision:** Each iteration has exactly one writer — the iteration agent. It may spawn read-only
+exploration subagents (e.g. `Explore`) for searching, but must not spawn code-editing subagents or
+delegate edits.
+**Consequence:** Enforced by the driver prompt (`scripts/iterate.sh`) and CLAUDE.md; subagent use in
+the loop is read-only.

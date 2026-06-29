@@ -22,6 +22,14 @@ architecture and `docs/DEFINITION_OF_DONE.md` for what "done" means.
 6. **Networking is out of scope** (deferred to Iroh). Skip upstream tests about
    replication / wire protocol / disk-format interop / sessions / encryption — the relevance
    filter is `docs/UPSTREAM_TEST_MAP.md`.
+7. **Never run `npm`/`node` for the JS reference on the host.** The upstream npm dependency tree is
+   untrusted (supply-chain exploits). Run any reference JS — including the algorithmic-equivalence
+   oracle — inside a sandbox/container via `scripts/node-sandbox.sh` (containerized, npm install
+   scripts disabled). Porting an upstream test means **reading** the JS and reimplementing it in
+   Rust, *not* executing it on the host.
+8. **Single writer — no code-editing subagents.** The iteration agent makes every edit itself.
+   Read-only exploration subagents (e.g. the `Explore` agent) are fine for searching the code; never
+   spawn a code-editing subagent or run edits in parallel. (Fittingly: this is a single-writer log.)
 
 ## The loop
 

@@ -12,3 +12,6 @@ personal data** (this repo is public; use repo-relative paths).
   that is a bug. (See `reference/js/autobase/DESIGN.md`.)
 - **Keep `T` out of L1.** If ordering/verification code needs to look inside a payload, domain
   semantics have leaked into the transport — stop and rethink the boundary.
+- **Never run the JS reference on the host.** npm supply-chain exploits are common; `reference/js/*`
+  and its dependency tree are untrusted. Read the JS to port it; only *execute* it inside
+  `scripts/node-sandbox.sh` (container, install-scripts disabled).

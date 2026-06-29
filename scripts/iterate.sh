@@ -53,6 +53,10 @@ Otherwise do EXACTLY ONE iteration:
 5. Commit using the "iter <n>: " prefix given above; end with the Co-Authored-By
    trailer. Do NOT push.
 
+You are the SINGLE WRITER for this iteration: you may spawn read-only exploration
+subagents (e.g. the Explore agent) to search the code, but you MUST NOT spawn
+code-editing subagents or delegate any edit -- make every change yourself.
+
 Stop after one iteration.
 EOF
 
