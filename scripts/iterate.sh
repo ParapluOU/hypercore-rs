@@ -10,7 +10,8 @@
 # gate `just verify`. Nothing is pushed; commits stay local.
 #
 # Env:
-#   HC_PERM     permission mode (default: bypassPermissions)
+#   HC_PERM     permission mode (default: acceptEdits). Bash is governed by the
+#               scoped allowlist in .claude/settings.json -- NOT blanket bypass.
 #   HC_MODEL    optional --model alias/name (default: inherit configured model)
 #   HC_BUDGET   optional per-iteration USD cap (--max-budget-usd)
 #
@@ -70,7 +71,10 @@ Use \"iter ${i}: \" as the commit message prefix.
 
 ${BODY}"
 
-  args=( -p "$PROMPT" --permission-mode "${HC_PERM:-bypassPermissions}" )
+  # acceptEdits auto-applies file edits; all Bash is constrained by the scoped
+  # allowlist in .claude/settings.json (cargo / just / wasm / sandboxed node /
+  # non-push git). No blanket bypass; subagents are not allowlisted (single writer).
+  args=( -p "$PROMPT" --permission-mode "${HC_PERM:-acceptEdits}" )
   [ -n "${HC_MODEL:-}" ]  && args+=( --model "$HC_MODEL" )
   [ -n "${HC_BUDGET:-}" ] && args+=( --max-budget-usd "$HC_BUDGET" )
 

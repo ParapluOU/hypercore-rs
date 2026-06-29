@@ -67,3 +67,14 @@ exploration subagents (e.g. `Explore`) for searching, but must not spawn code-ed
 delegate edits.
 **Consequence:** Enforced by the driver prompt (`scripts/iterate.sh`) and CLAUDE.md; subagent use in
 the loop is read-only.
+
+## ADR-0013 — Scoped permission allowlist for the driver (no blanket bypass)
+**Context:** Headless driver agents must not block on approval prompts, but
+`--permission-mode bypassPermissions` disables *all* gates — an autonomous loop running arbitrary
+shell, which is unsafe (and was correctly flagged).
+**Decision:** Run with `--permission-mode acceptEdits` plus a scoped `.claude/settings.json`
+allowlist: allow `cargo` / `rustup` / `rustc` / `just` / `wasm-pack` / `scripts/node-sandbox.sh` and
+non-push `git`; **deny** `git push`, `rm`, `curl`/`wget`, and host `node`/`npm`/`npx` (node only via
+the sandbox wrapper — reinforces ADR-0011). Subagents are not allowlisted → strictly single-writer.
+**Consequence:** Autonomous iterations are constrained to build / test / commit. They cannot push,
+delete, exfiltrate over the network, or run untrusted node on the host.

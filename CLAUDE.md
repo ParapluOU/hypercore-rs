@@ -61,6 +61,11 @@ Each invocation spawns a headless agent that performs exactly one step above, th
 **independently re-runs `just verify`** and only accepts the iteration if it is green. Commits stay
 local (nothing is pushed). Env knobs: `HC_MODEL`, `HC_BUDGET` (per-iteration USD cap), `HC_PERM`.
 
+The agent runs under a **scoped allowlist** (`.claude/settings.json`), not blanket bypass: it may
+run `cargo` / `rustup` / `just` / `wasm-pack` / `scripts/node-sandbox.sh` and non-push `git`, and is
+explicitly denied `git push`, `rm`, `curl`, and host `node`/`npm` (node must go through the
+sandbox). Subagents are not allowlisted, so the iteration agent is strictly the single writer.
+
 ## Where things are
 
 - `crates/` — the workspace (dependency graph in `README.md`)
