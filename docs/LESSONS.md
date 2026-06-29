@@ -381,3 +381,23 @@ personal data** (this repo is public; use repo-relative paths).
   Keep byte offsets over the **encoded** layout the tree authenticates (not the payload — the `padding`
   divergence, ADR-0022); derive the test's offsets/lengths from `block(i).len()`, not hardcoded payload
   sizes. `createWriteStream` is just buffered `append` — no new L1 behaviour, don't build a type for it.
+- **A log migration ("move-to") is a *content-addressed prefix commitment* + a by-value copy under a new
+  key — strip the manifest/multisig/session wrapping.** Upstream re-homes a log onto a new core whose
+  *manifest* carries a `prologue { length, hash }`, copies the prefix in (`copyPrologue`), and `moveTo`s a
+  session/snapshot onto it (with a `migrate` event); the prologue is *self-authorizing* (the manifest hash
+  is the authority, no per-head signature over the copied prefix) and is one field of the full multi-signer
+  `Verifier`/`multisig` manifest (`manifest.js`). The L1 essence is much smaller: a `Prologue { length,
+  hash }` names a prefix by its **Merkle hash** (so it is content-addressed — *any* log holding the same
+  prefix content backs it, regardless of author — the same "head at a length is a pure function of the first
+  `length` blocks" property truncate/fork-detection/LCA all rest on). `copy_prologue` then **content-checks
+  before copying** (`source.prefix_root_hash(length) == hash`, so a non-matching source leaves the target
+  untouched — verify-then-mutate, like every proof verifier here), copies the prefix **by value** (ADR-0032's
+  snapshot stance — own the bytes, no shared storage), and **re-signs the prefix under the new key** (a head
+  at `length`) rather than reproducing manifest self-authorization — observably identical, since the new
+  key's first real append already signs a head ⊇ the prefix, so signing at `length` just does it one step
+  early, and it keeps `verify_head`/`verify_block`/proofs uniform. Two consequences fall out: the prologue
+  length is a **`truncate` floor** (a committed prefix can never be rewound, keeping `verify_prologue` an
+  invariant), and the snapshot-`moveTo` case is a **no-op at L1** (a by-value snapshot is already immune to
+  any mutation of the source, so a snapshot taken before the migration keeps returning its own blocks —
+  nothing to re-home). Defer the multi-signer manifest + manifest-into-key identity (`manifest.js`) and the
+  session-level `moveTo`/`migrate` (sessions/networking).

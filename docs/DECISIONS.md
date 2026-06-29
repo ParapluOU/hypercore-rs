@@ -644,3 +644,41 @@ runtime), sub-block byte slicing of a non-boundary offset + `padding`, and the s
 stream variants (`{ snapshot }` / atom — sessions/networking, out of scope). `move-to.js` (the move-to
 operation) and the write-stream object remain. Soundness is unchanged — streams are read-only views over
 already-authenticated blocks.
+
+## ADR-0034 — Prologue migration is a content-addressed prefix commitment + by-value copy under a new key
+**Context:** Upstream hypercore (`reference/js/hypercore/test/move-to.js`) migrates a log's history onto a
+**new core** under a fresh keypair: the new core is created with a manifest whose `prologue` is `{ length,
+hash }` (a commitment to a prefix of the old log), `core2.copyPrologue(core.state)` copies that prefix's
+blocks/tree in, and `session.moveTo(core2, len)` / `snapshot.moveTo(...)` re-homes the writer (or snapshot)
+onto it, emitting a `migrate` event; appends then continue under the new key. The prologue is one field of
+the full **manifest** (`manifest.js` — multi-signer `quorum`/`signers`/`namespace`, the `Verifier`/
+`multisig` machinery), which is hashed into the core's key, so the prefix is *self-authorizing* (the manifest
+commitment is the authority — no per-head signature by the new key over the copied prefix). `moveTo`/`migrate`
+are session-level operations.
+**Decision:** Reimplement the **L1 behaviour-under-test** — migrate a log's prefix onto a new identity — as
+a standalone, content-addressed primitive, not the manifest/multisig/session layer:
+- A [`Prologue`] is just `{ length, hash }` — a commitment naming a prefix by its **Merkle hash**, carried
+  on the core (not embedded in a multi-signer manifest). `Hypercore::prologue_at(length)` mints one from a
+  source (`{ length, prefix_root_hash(length) }` ≡ upstream's `{ length: core.length, hash: core.state.hash() }`);
+  `with_prologue(author, codec, store, prologue)` creates a fresh core bound to it under a *new* key.
+- `copy_prologue(source)` adopts the committed prefix **by value** (the same divergence as the by-value
+  snapshot, ADR-0032): it content-checks `source.prefix_root_hash(length) == hash` *before* copying (so a
+  non-matching source leaves the core untouched), copies the prefix blocks in, rebuilds an identical prefix
+  tree, marks them present, and **re-signs the prefix under the new key** (a head at `length`, fork 0).
+  Re-signing — rather than upstream's manifest-self-authorization — keeps `verify_head`/`verify_block`/
+  proofs uniform; it is observably equivalent (the new key's first real append already signs a head ⊇ the
+  prefix, so signing at `length` just does it one step early). Because the commitment is content-addressed,
+  `source` need **not** share the new key — any log holding the same prefix content backs it.
+- `verify_prologue()` is the maintained invariant (`prefix_root_hash(length) == hash`), and the prologue
+  length is a **`truncate` floor** (a prologue-bound core refuses to rewind into the committed prefix). The
+  snapshot `moveTo` case reduces to a no-op at L1 — our by-value snapshot (ADR-0032) is already immune to any
+  mutation of the source, so a snapshot taken before the migration keeps returning its own captured blocks.
+**Consequence:** The `move-to.js` headline (migrate a prefix onto a new identity; the truncate-and-rewrite +
+surviving-snapshot case) is ported and host-safe under `just verify`. `move-to.js` moves `[ ]`→`[~]`. We
+**diverge** by copying the prefix by value (vs upstream's shared-storage `copyPrologue`) and by re-signing it
+under the new key (vs manifest self-authorization) — identical observable behaviour. We **defer**: the full
+multi-signer **manifest** + `Verifier`/`multisig` and the manifest-hash-into-key identity binding
+(`manifest.js`, still `[ ]`); the session-level `moveTo`/`migrate` re-homing and the `createWriteStream`
+object (sessions, out of scope); and the value-byte/`padding` concerns unchanged from ADR-0022. Soundness
+rests on the same prefix-root collision-resistance the scheme already assumes (a forged prefix can't match
+the committed hash) plus the new key's head signature.

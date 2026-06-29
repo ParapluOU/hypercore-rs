@@ -100,7 +100,15 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `ByteStream` iterator over whole **encoded** blocks covering a byte range ≡ `createByteStream`,
       `seek`-located, empty-payload blocks still emitted; encoded-byte (padding-free, ADR-0022)
       addressing; ADR-0033 — `live` tailing / duplex backpressure / sub-block slicing / write-stream
-      object deferred, tracked on `streams.js`) — `purge`/physical-reclamation
+      object deferred, tracked on `streams.js`) +
+      **prologue migration / move-to** (`Prologue { length, hash }` = a content-addressed commitment to a
+      prefix; `prologue_at` mints one from a source ≡ upstream `{ length, core.state.hash() }`;
+      `with_prologue` creates a fresh core under a *new* key bound to it; `copy_prologue` ≡ `copyPrologue`
+      content-checks `source.prefix_root_hash(length) == hash` then adopts the prefix **by value**,
+      re-signing it under the new key; `verify_prologue` is the maintained invariant and the prologue
+      length is a `truncate` floor — the L1 of `move-to.js`'s "move - basic"/"move - snapshots", ADR-0034;
+      the full multi-signer manifest/`Verifier`/`multisig` + manifest-into-key identity, and the
+      session-level `moveTo`/`migrate` re-homing, deferred) — `purge`/physical-reclamation
       guarantees + the replication re-download that refills a cleared block tracked on `clear.js`
 - [x] `autobase` — linearizer (causal order + deterministic tiebreak); **`topolist.js` stable-ordering
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks

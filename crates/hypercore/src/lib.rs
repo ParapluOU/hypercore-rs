@@ -56,6 +56,30 @@ pub struct Truncation {
     pub to: u64,
 }
 
+/// A commitment binding a core to a fixed **prefix** of another log: its first
+/// `length` blocks must have Merkle root `hash`.
+///
+/// Mint one from a source with [`Hypercore::prologue_at`], carry it on a new core
+/// created with [`Hypercore::with_prologue`], then adopt the committed prefix into
+/// that new core with [`Hypercore::copy_prologue`] (which re-signs the prefix under
+/// the new key). This is the L1 essence of upstream `move-to.js`: migrating a log's
+/// history onto a fresh identity (key rotation / fast-forward) while
+/// *cryptographically* pinning that the first `length` blocks are unchanged.
+///
+/// The commitment is **content-addressed** — it names the prefix by its Merkle
+/// hash, never by the author — so any holder of the same prefix *content* can
+/// satisfy it, regardless of who wrote it. Because the head at a length is a pure
+/// function of the first `length` blocks, [`verify_prologue`](Hypercore::verify_prologue)
+/// is a checkable invariant, and the prologue length is a [`truncate`](Hypercore::truncate)
+/// floor (the committed prefix can never be rewound).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prologue {
+    /// Number of blocks the commitment fixes (the prefix `[0, length)`).
+    pub length: u64,
+    /// The Merkle root of those first `length` blocks.
+    pub hash: Hash,
+}
+
 /// Options for [`Hypercore::read_stream`] — a forward (or `reverse`) iteration
 /// over the decoded blocks in `[start, end)`. The L1 form of upstream's
 /// `createReadStream` options.
@@ -109,6 +133,15 @@ pub enum Error<SE> {
     Codec(codec::Error),
     /// A stored block was missing where the tree says one exists.
     Corrupt,
+    /// [`copy_prologue`](Hypercore::copy_prologue) was called on a core that
+    /// carries no [`Prologue`] commitment to satisfy.
+    NoPrologue,
+    /// A source offered to [`copy_prologue`](Hypercore::copy_prologue) does not
+    /// back the [`Prologue`]: it is shorter than the prologue length, is missing a
+    /// prefix block, or its prefix hashes differently than the commitment names.
+    /// Also returned if the target core already holds blocks (a prologue is copied
+    /// only into a fresh, empty core).
+    PrologueMismatch,
 }
 
 /// A staged, atomic multi-block append.
@@ -164,6 +197,12 @@ pub struct Hypercore<T, C, S> {
     head: Option<SignedHead>,
     fork: u64,
     last_truncation: Option<Truncation>,
+    /// A commitment to a fixed prefix this core was migrated onto (upstream's
+    /// manifest `prologue`). `None` for an ordinary core. When set, the first
+    /// `prologue.length` blocks are pinned to `prologue.hash`: it is a
+    /// [`truncate`](Self::truncate) floor and a [`verify_prologue`](Self::verify_prologue)
+    /// invariant.
+    prologue: Option<Prologue>,
     _t: PhantomData<fn() -> T>,
 }
 
@@ -181,12 +220,50 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             head: None,
             fork: 0,
             last_truncation: None,
+            prologue: None,
             _t: PhantomData,
         }
     }
 
+    /// Create a fresh, empty log written by `author` and **bound to a
+    /// [`Prologue`]** — a commitment to a prefix of some other log. The core
+    /// starts empty; [`copy_prologue`](Self::copy_prologue) then adopts the
+    /// committed prefix's blocks under this `author`'s key. This is how a log is
+    /// migrated onto a new identity (the L1 of upstream `move-to.js`).
+    pub fn with_prologue(author: SecretKey, codec: C, store: S, prologue: Prologue) -> Self {
+        let mut core = Self::new(author, codec, store);
+        core.prologue = Some(prologue);
+        core
+    }
+
     pub fn public_key(&self) -> PublicKey {
         self.public
+    }
+
+    /// The [`Prologue`] this core is bound to, if any (set by
+    /// [`with_prologue`](Self::with_prologue)).
+    pub fn prologue(&self) -> Option<&Prologue> {
+        self.prologue.as_ref()
+    }
+
+    /// Mint a [`Prologue`] committing to this core's first `length` blocks
+    /// (`{ length, root-of-the-prefix }`), or `None` if `length > len()`. The
+    /// migration source hands this to [`with_prologue`](Self::with_prologue) so a
+    /// new core can adopt the same prefix. Upstream's `{ length, hash }` manifest
+    /// prologue.
+    pub fn prologue_at(&self, length: u64) -> Option<Prologue> {
+        Some(Prologue { length, hash: self.tree.prefix_root_hash(length)? })
+    }
+
+    /// Whether this core still satisfies its [`Prologue`] commitment: its first
+    /// `prologue.length` blocks hash to `prologue.hash`. A core with no prologue
+    /// trivially satisfies it. Maintained as an invariant — appends only extend the
+    /// log and [`truncate`](Self::truncate) refuses to rewind below the prologue.
+    pub fn verify_prologue(&self) -> bool {
+        match self.prologue {
+            None => true,
+            Some(pr) => self.tree.prefix_root_hash(pr.length) == Some(pr.hash),
+        }
     }
 
     pub fn len(&self) -> u64 {
@@ -259,6 +336,11 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
     /// `clear.js`/`purge.js`).
     pub fn truncate(&mut self, new_len: u64) -> Option<Truncation> {
         let from = self.tree.len();
+        if let Some(pr) = self.prologue {
+            if new_len < pr.length {
+                return None; // cannot rewind into the committed prologue prefix
+            }
+        }
         if !self.tree.truncate(new_len) {
             return None; // new_len >= len: nothing to do
         }
@@ -343,6 +425,53 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         self.last_truncation = None;
         self.resign();
         Ok(Some(self.tree.len()))
+    }
+
+    /// Adopt this (empty, prologue-bound) core's committed prefix from `source`,
+    /// re-signing it under **our** key — the L1 of upstream `core.copyPrologue`.
+    ///
+    /// The migration step behind `move-to.js`: a fresh core created with
+    /// [`with_prologue`](Self::with_prologue) copies in the first
+    /// `prologue.length` blocks of an existing log and re-signs them under its own
+    /// (new) identity, so the history continues under a rotated key while the
+    /// prefix is preserved **byte-identically**. New blocks then [`append`](Self::append)
+    /// on top of the migrated prefix as normal.
+    ///
+    /// Because a [`Prologue`] is **content-addressed** (it names the prefix by its
+    /// Merkle hash, ADR-0034), `source` need not share our key — any log whose
+    /// first `prologue.length` blocks hash to `prologue.hash` backs it. The match
+    /// is checked *before* copying, so a non-matching `source` leaves this core
+    /// untouched.
+    ///
+    /// Returns the migrated length (`= prologue.length`). Errors:
+    /// [`NoPrologue`](Error::NoPrologue) if this core carries no prologue;
+    /// [`PrologueMismatch`](Error::PrologueMismatch) if this core is non-empty, or
+    /// `source` is too short / missing a prefix block / hashes differently than the
+    /// commitment names.
+    pub fn copy_prologue(&mut self, source: &Hypercore<T, C, S>) -> Result<u64, Error<S::Error>> {
+        let pr = self.prologue.ok_or(Error::NoPrologue)?;
+        if !self.is_empty() {
+            return Err(Error::PrologueMismatch); // a prologue is copied only into a fresh core
+        }
+        // Content-addressed check: `source`'s first `pr.length` blocks must hash to
+        // exactly what the commitment names. `prefix_root_hash` is `None` if the
+        // source is shorter than `pr.length`, so a too-short source is rejected here.
+        if source.tree.prefix_root_hash(pr.length) != Some(pr.hash) {
+            return Err(Error::PrologueMismatch);
+        }
+        // Copy the committed prefix in, rebuilding an identical prefix tree (the
+        // surviving nodes are a pure function of the block bytes, so our root ends
+        // equal to `pr.hash`), marking each block present, and signing it under our
+        // own key (fork 0).
+        for i in 0..pr.length {
+            let enc = source.block(i)?.ok_or(Error::PrologueMismatch)?;
+            self.store.put(i, &enc).map_err(Error::Storage)?;
+            self.tree.append(&enc);
+            self.presence.set(i, true);
+        }
+        self.last_truncation = None;
+        self.resign();
+        Ok(pr.length)
     }
 
     /// Decode the value at `index`, or `None` if out of range **or locally
@@ -2764,5 +2893,165 @@ mod tests {
         let enc: Vec<Vec<u8>> = (0..5).map(|i| core.block(i).unwrap().unwrap()).collect();
         // the default byte stream covers the whole log -> every block, incl. the empties
         assert_eq!(collect_bytes(&core, ByteStreamOptions::default()), enc);
+    }
+
+    // ---- prologue migration / move-to (upstream `move-to.js`, L1) ----
+
+    #[test]
+    fn move_to_basic_preserves_prefix_under_new_key() {
+        // Ports `move-to.js` "move - basic": a log of [1,2,3] is migrated onto a
+        // NEW core under a fresh key, committing to the prefix via a prologue; the
+        // prefix is preserved byte-identically and a new block appends on top — the
+        // L1 of `copyPrologue` + `moveTo` + append('4').
+        let src = core_with(70, &["1", "2", "3"]);
+        assert_eq!(src.len(), 3);
+        let pr = src.prologue_at(3).unwrap(); // { length: 3, hash: root-of-[1,2,3] }
+        assert_eq!(pr.length, 3);
+
+        // A new core under a DIFFERENT author, bound to the prologue.
+        let mut migrated =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(71), Bytes, MemoryStore::new(), pr);
+        assert_ne!(migrated.public_key(), src.public_key(), "migration is to a new identity");
+        assert_eq!(migrated.prologue(), Some(&pr));
+        assert!(migrated.is_empty());
+
+        assert_eq!(migrated.copy_prologue(&src).unwrap(), 3);
+        assert_eq!(migrated.len(), 3);
+        assert!(migrated.verify_prologue());
+        assert!(migrated.verify_head());
+
+        // The prefix is byte-identical (raw stored bytes and decoded values).
+        for i in 0..3u64 {
+            assert_eq!(migrated.block(i).unwrap(), src.block(i).unwrap(), "block {i} bytes");
+            assert_eq!(migrated.get(i).unwrap(), src.get(i).unwrap(), "block {i} value");
+        }
+
+        // The migrated head is signed by the NEW key, not the source's.
+        let h = migrated.head().unwrap().clone();
+        assert!(
+            migrated.public_key().verify(&head_message(h.fork, h.length, &h.root), &h.sig),
+            "new key signs the migrated head"
+        );
+        assert!(
+            !src.public_key().verify(&head_message(h.fork, h.length, &h.root), &h.sig),
+            "old key does NOT sign the migrated head"
+        );
+
+        // Continue the log under the new key: append('4').
+        assert_eq!(migrated.append(&blk("4")).unwrap(), 3);
+        assert_eq!(migrated.len(), 4);
+        assert_eq!(migrated.get(3).unwrap(), Some(blk("4")));
+        assert!(migrated.verify_prologue(), "prologue prefix still intact after append");
+
+        // Every block authenticates against the new head (prefix + new block alike).
+        let head = migrated.head().unwrap().clone();
+        let pk = migrated.public_key();
+        for i in 0..4u64 {
+            let enc = migrated.block(i).unwrap().unwrap();
+            let proof = migrated.proof(i).unwrap();
+            assert!(verify_block(&pk, &head, i, &enc, &proof), "migrated block {i} authenticated");
+        }
+    }
+
+    #[test]
+    fn copy_prologue_is_content_addressed_and_rejects_mismatch() {
+        // A prologue names a prefix by its Merkle hash, not by author — so any log
+        // with the same prefix content satisfies it, while diverging / too-short /
+        // unbound cases are rejected without touching the target core.
+        let src = core_with(72, &["1", "2", "3", "4"]);
+        let pr = src.prologue_at(3).unwrap(); // commits to the first 3 blocks
+
+        // A DIFFERENT author whose first 3 blocks match the content backs it.
+        let cross_author = core_with(73, &["1", "2", "3", "different-tail"]);
+        assert_ne!(cross_author.public_key(), src.public_key());
+        let mut m_ok =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(74), Bytes, MemoryStore::new(), pr);
+        assert_eq!(m_ok.copy_prologue(&cross_author).unwrap(), 3, "content-addressed: cross-author ok");
+        assert!(m_ok.verify_prologue());
+        for (i, s) in ["1", "2", "3"].iter().enumerate() {
+            assert_eq!(m_ok.get(i as u64).unwrap(), Some(blk(s)));
+        }
+
+        // A source diverging within the prefix (block 2 differs) does NOT back it.
+        let diverging = core_with(75, &["1", "2", "X"]);
+        let mut m_bad =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(74), Bytes, MemoryStore::new(), pr);
+        assert_eq!(m_bad.copy_prologue(&diverging), Err(Error::PrologueMismatch));
+        assert!(m_bad.is_empty(), "nothing copied on a content mismatch");
+
+        // A source shorter than the prologue length cannot back it.
+        let short = core_with(76, &["1", "2"]);
+        let mut m_short =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(74), Bytes, MemoryStore::new(), pr);
+        assert_eq!(m_short.copy_prologue(&short), Err(Error::PrologueMismatch));
+        assert!(m_short.is_empty());
+
+        // copy_prologue on a core with no prologue is rejected.
+        let mut plain = Hypercore::<Vec<u8>, _, _>::new(author(77), Bytes, MemoryStore::new());
+        assert_eq!(plain.copy_prologue(&src), Err(Error::NoPrologue));
+
+        // copy_prologue into a non-empty (already-migrated) core is rejected.
+        assert_eq!(m_ok.copy_prologue(&src), Err(Error::PrologueMismatch));
+        assert_eq!(m_ok.len(), 3, "a second copy_prologue leaves the core unchanged");
+    }
+
+    #[test]
+    fn move_to_after_truncate_with_surviving_snapshot() {
+        // Ports `move-to.js` "move - snapshots": the source is truncated-and-
+        // rewritten, then migrated onto a new core; a snapshot taken *before* the
+        // rewrite still returns its own captured blocks (by-value immunity, iter 29),
+        // unaffected by the migration of the live core.
+        let mut core = core_with(78, &["hello", "world", "again"]); // len 3
+        let snap = core.snapshot().unwrap(); // captured at length 3
+
+        core.truncate(1); // rewind to [hello]
+        core.append(&blk("break")).unwrap(); // core = [hello, break], len 2, fork 1
+        assert_eq!(core.len(), 2);
+        assert_eq!(core.fork(), 1);
+        assert_eq!(snap.length(), 3, "snapshot is unaffected by the truncate-and-rewrite");
+
+        // Migrate the rewritten core onto a new identity.
+        let pr = core.prologue_at(2).unwrap(); // commits to [hello, break]
+        let mut migrated =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(79), Bytes, MemoryStore::new(), pr);
+        assert_eq!(migrated.copy_prologue(&core).unwrap(), 2);
+        assert_eq!(migrated.len(), 2);
+        assert!(migrated.verify_prologue());
+        assert_eq!(migrated.get(0).unwrap(), Some(blk("hello")));
+        assert_eq!(migrated.get(1).unwrap(), Some(blk("break")));
+
+        // The snapshot still has its three original blocks (moveTo on a by-value
+        // snapshot is a no-op for the observable behaviour).
+        assert_eq!(snap.length(), 3);
+        assert_eq!(snap.get(0).unwrap(), Some(blk("hello")));
+        assert_eq!(snap.get(1).unwrap(), Some(blk("world")));
+        assert_eq!(snap.get(2).unwrap(), Some(blk("again")));
+    }
+
+    #[test]
+    fn prologue_is_a_truncate_floor() {
+        // A prologue-bound core can never rewind into the committed prefix —
+        // truncating below `prologue.length` is refused, keeping `verify_prologue`
+        // an invariant. (Upstream forbids truncating into the prologue.)
+        let src = core_with(80, &["a", "b", "c"]);
+        let pr = src.prologue_at(2).unwrap(); // floor at length 2
+        let mut m =
+            Hypercore::<Vec<u8>, _, _>::with_prologue(author(81), Bytes, MemoryStore::new(), pr);
+        m.copy_prologue(&src).unwrap(); // m = [a, b], len 2
+        m.append(&blk("c2")).unwrap();
+        m.append(&blk("d2")).unwrap(); // m = [a, b, c2, d2], len 4
+
+        // Above the floor: allowed.
+        assert_eq!(m.truncate(3), Some(Truncation { from: 4, to: 3 }));
+        // Exactly the floor: allowed (keeps the prologue exactly).
+        assert_eq!(m.truncate(2), Some(Truncation { from: 3, to: 2 }));
+        assert!(m.verify_prologue());
+        // Below the floor: refused, core untouched.
+        assert_eq!(m.truncate(1), None, "cannot truncate into the prologue prefix");
+        assert_eq!(m.truncate(0), None);
+        assert_eq!(m.len(), 2);
+        assert!(m.verify_prologue());
+        assert_eq!(m.get(0).unwrap(), Some(blk("a")));
+        assert_eq!(m.get(1).unwrap(), Some(blk("b")));
     }
 }

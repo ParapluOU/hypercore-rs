@@ -1572,3 +1572,82 @@ Repo-relative paths only — no private or personal data (this repo is public).
   - more natively-testable rows: `hypercore` `move-to.js` (the move-to operation + write-stream object);
     `merkle` reorg-by-proof / `additionalNodes`; `manifest.js` (signing config); the replication
     re-download that refills a cleared block + `purge`; `hyperbee`.
+
+---
+
+## 2026-06-30 — Iteration 31: `hypercore` prologue migration / move-to (`move-to.js`)
+
+**Did**
+- Picked the next natively-testable, in-scope red item from iter 30's "Next": `hypercore` **move-to**
+  (`reference/js/hypercore/test/move-to.js`). (The other non-env-blocked candidate — the deferred
+  fork/merge consensus, ADR-0015 — LESSONS.md says to defer until the JS oracle, gate #4, can cross-check
+  it; gate #4 is still env-blocked, so attempting it now would defy the project's own recorded guidance.
+  `manifest.js` is the full multi-signer `Verifier`/`multisig` feature — much larger; its one prologue-
+  relevant piece is exactly what move-to needs, ported here. `additionalNodes` was already noted (ADR-0025)
+  to add no L1 capability our standalone `upgrade_proof` lacks.)
+- Distilled the L1 behaviour-under-test — **migrate a log's history onto a new identity** — into a
+  content-addressed prologue primitive (no manifest/multisig/session wrapping):
+  - `Prologue { length, hash }` — a commitment naming a prefix by its **Merkle hash**.
+    `Hypercore::prologue_at(length)` mints one from a source (`{ length, prefix_root_hash(length) }` ≡
+    upstream's `{ length, core.state.hash() }`); `with_prologue(author, codec, store, prologue)` creates a
+    fresh core under a *new* key bound to it; `prologue()` accessor.
+  - `copy_prologue(source)` ≡ upstream `copyPrologue`: it **content-checks before copying**
+    (`source.prefix_root_hash(length) == hash`, so a non-matching source leaves the target untouched),
+    copies the committed prefix in **by value** (ADR-0032's snapshot stance), rebuilds an identical prefix
+    tree, marks each block present, and **re-signs the prefix under the new key** (a head at `length`,
+    fork 0). Returns the migrated length; errors `NoPrologue` (no commitment to satisfy) / `PrologueMismatch`
+    (non-empty target, too-short source, missing prefix block, or a content mismatch).
+  - `verify_prologue()` is the maintained invariant (`prefix_root_hash(length) == hash`), and the prologue
+    length is a **`truncate` floor** (a prologue-bound core refuses to rewind into the committed prefix).
+- 4 asserting tests (hypercore 51→55; workspace 148→152):
+  - `move_to_basic_preserves_prefix_under_new_key` — the "move - basic" headline: [1,2,3] migrated onto a
+    new key, prefix byte-identical (raw bytes + decoded values), the migrated head signed by the **new** key
+    and **not** the source's, then append('4') on top; every block (prefix + new) authenticates against the
+    new head.
+  - `copy_prologue_is_content_addressed_and_rejects_mismatch` — a **cross-author** source with the same
+    prefix content backs the prologue (content-addressed, not identity-bound); a diverging source / a
+    too-short source / a core with no prologue / a non-empty target are each rejected leaving the core
+    untouched.
+  - `move_to_after_truncate_with_surviving_snapshot` — the "move - snapshots" case: the source is
+    truncate-and-rewritten ([hello,world,again] → [hello,break], fork 1) then migrated; a snapshot taken
+    *before* the rewrite still returns its own three blocks (by-value immunity, iter 29 — `moveTo` on a
+    snapshot is a no-op at L1).
+  - `prologue_is_a_truncate_floor` — truncate above / exactly at the floor is allowed; below it is refused,
+    keeping `verify_prologue` an invariant.
+- `just verify` green: **152 native tests** (autobase 24 across files + codec 8 + hypercore 55 + identity 4 +
+  merkle 44 + storage 17) + wasm build of `hypercore`/`autobase`/`storage`.
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0034: prologue migration is a **content-addressed prefix commitment + a by-value copy re-signed under
+  a new key**, not upstream's manifest-embedded multisig prologue / shared-storage `copyPrologue` / session-
+  level `moveTo`. We **diverge** by copying by value (vs shared storage) and re-signing the prefix under the
+  new key (vs manifest self-authorization) — observably identical. We **defer**: the full multi-signer
+  manifest + `Verifier`/`multisig` and the manifest-hash-into-key identity binding (`manifest.js`, still
+  `[ ]`), and the session-level `moveTo`/`migrate` re-homing + `createWriteStream` object (sessions/
+  networking, out of scope). `move-to.js` moves `[ ]`→`[~]`.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- A log migration is a content-addressed prefix commitment + a by-value copy under a new key — strip the
+  manifest/multisig/session wrapping. The `Prologue { length, hash }` names the prefix by its Merkle hash
+  (content-addressed: any holder of the same prefix content backs it, regardless of author — the "head at a
+  length is a pure function of the first `length` blocks" property again); `copy_prologue` content-checks
+  before copying (verify-then-mutate), copies by value (ADR-0032), and re-signs the prefix under the new key
+  (observably identical to upstream's manifest self-authorization, keeping `verify_head`/`verify_block`
+  uniform). Two consequences: the prologue length is a `truncate` floor (keeping `verify_prologue` an
+  invariant), and the snapshot-`moveTo` case is a no-op at L1 (a by-value snapshot is already immune to the
+  source's mutation).
+
+**Next**
+- All remaining feature iterations are environment-blocked or larger deferred work:
+  - the gate-#4 **JS oracle** (ADR-0008) — still env-blocked (Apple `container` service not startable under
+    the loop's scoped allowlist + image pull needs network; iters 11–21);
+  - the **wasm runtime / IndexedDB gate (#2)** — needs headless Chrome; the `storage` IndexedDB backend `[ ]`
+    would also wire the bitfield's deferred `open`/`flush` persistence (and persist the presence map /
+    snapshots);
+  - the **deferred fork/merge consensus** (ADR-0015) — the 2-degree-lead caveat + confirmation across a
+    resolved fork/merge (LESSONS.md: best done once the JS oracle can cross-check it), which would let
+    `finalized()`/`indexed_view_len()` match upstream's earlier-confirming cases; needs the apply/view layer
+    (`apply.js`/`anchors.js`);
+  - more natively-testable rows: `manifest.js` (the full multi-signer `Verifier`/`multisig` config, of which
+    the prologue piece is now done); `merkle` reorg-by-proof / `additionalNodes`; the replication re-download
+    that refills a cleared block + `purge`; `hyperbee`.
