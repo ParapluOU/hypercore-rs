@@ -173,3 +173,37 @@ Repo-relative paths only — no private or personal data (this repo is public).
 **Next**
 - `autobase`: the causal linearizer — DAG order + deterministic tiebreak (port `linearizer.js` +
   `dags.js` basics). Then quorum/finality and the generic convergence sim.
+
+---
+
+## 2026-06-29 — Iteration 7: `autobase` linearizer (causal order + tiebreak)
+
+**Did**
+- Implemented `crates/autobase`: a `Linearizer` over a causal DAG of `NodeId { key, seq }`. `add`
+  enforces causal delivery (rejects duplicate / seq-gap / dangling head) and auto-adds the
+  same-writer predecessor as a dependency; `order()` returns the deterministic linearization via a
+  **priority-Kahn topological sort** — emit the smallest causally-ready `NodeId` each step. Lowest
+  writer key first, then seq ("lowest key wins"); never a timestamp, never a payload peek.
+- 6 asserting tests: the three canonical DESIGN.md DAGs (linear chain; branch tiebreak; the recursive
+  `[a0, c0, a1, b0, b1, c1, b2]`), determinism across three causally-valid arrival orders,
+  causal-respect over every edge, causal-delivery rejection (duplicate/gap/missing-head with no
+  partial commit), and empty. `just verify` green incl. the wasm build of `autobase`.
+- Trimmed `autobase`'s `hypercore`/`identity` deps: the linearizer is pure L1 ordering over opaque
+  writer keys (they return with quorum/view materialization).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0014: priority-Kahn instead of upstream's incremental `topolist` tip. We port the *ordering*
+  from `DESIGN.md`, not the `undo`/`shared` streaming-patch bookkeeping; quorum confirmation is the
+  next capability, so the `linearizer.js`/`dags.js` *indexed-view-length* assertions stay deferred
+  (those rows are now `[~]`).
+
+**Lessons**
+- The definition of the order lives in `DESIGN.md`; `topolist.js` is an optimized view-patcher.
+- Folding the tiebreak into `NodeId`'s `Ord` makes a `BTreeSet` frontier the tiebreak itself —
+  determinism becomes structural, immune to arrival order. (Both moved to `docs/LESSONS.md`.)
+
+**Next**
+- `autobase` quorum / finality-stability: count distinct-writer votes over a node (causal closure),
+  define the double-quorum confirmation rule from `DESIGN.md`, and assert a quorum-finalized prefix
+  never reorders. Then the generic convergence sim (gate #3) and the JS oracle (gate #4) on top of
+  `order()`.

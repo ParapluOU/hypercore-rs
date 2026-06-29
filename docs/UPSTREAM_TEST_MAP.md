@@ -38,8 +38,8 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 
 | File | Status | Maps to |
 |------|--------|---------|
-| `linearizer.js` | [ ] | `autobase` linearizer ★★ |
-| `dags.js` | [ ] | `autobase` DAG ordering ★★ |
+| `linearizer.js` | [~] | `autobase` linearizer — causal order + key/seq tiebreak ported (via DESIGN.md canonical DAGs); `shouldAck`/indexed-view assertions need quorum ★★ |
+| `dags.js` | [~] | `autobase` DAG ordering — ordering + causal-respect + determinism ported; confirmed-view-length assertions need quorum ★★ |
 | `basic.js` | [ ] | `autobase` basics ★ |
 | `core.js` | [ ] | `autobase` core |
 | `anchors.js` | [ ] | `autobase` anchoring ★ |

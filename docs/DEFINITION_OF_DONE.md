@@ -54,7 +54,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `storage` — trait + in-memory backend
 - [ ] `storage` — IndexedDB backend (wasm)
 - [x] `hypercore` — append/get/verify + proof-based replication
-- [ ] `autobase` — linearizer (causal order + deterministic tiebreak)
+- [x] `autobase` — linearizer (causal order + deterministic tiebreak)
 - [ ] `autobase` — quorum / finality-stability
 - [ ] convergence simulation (gate #3)
 - [ ] JS algorithmic-equivalence oracle (gate #4)

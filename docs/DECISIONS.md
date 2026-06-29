@@ -78,3 +78,21 @@ non-push `git`; **deny** `git push`, `rm`, `curl`/`wget`, and host `node`/`npm`/
 the sandbox wrapper — reinforces ADR-0011). Subagents are not allowlisted → strictly single-writer.
 **Consequence:** Autonomous iterations are constrained to build / test / commit. They cannot push,
 delete, exfiltrate over the network, or run untrusted node on the host.
+
+## ADR-0014 — Linearizer is a priority-Kahn topo sort, not upstream's incremental tip
+**Context:** Upstream (`reference/js/autobase/lib/topolist.js`) keeps an incremental sorted "tip"
+and shuffles each arriving node into place (`moveDown`/`moveUp`), tracking `undo`/`shared` so a
+streaming view can be patched cheaply. That bookkeeping is an optimization for live updates, not the
+ordering definition.
+**Decision:** Reimplement the *behaviour* with a **priority Kahn topological sort**: recompute the
+order each call, at every step emitting the causally-ready node with the smallest `NodeId`
+(`(writer_key, seq)`, lowest-key-first — the documented "lowest key wins" tiebreak). Enforce causal
+delivery on `add` (no duplicate / no seq gap / no dangling head) so the DAG is always acyclic and
+causally closed.
+**Consequence:** Determinism is *manifest* — `order()` is a pure function of the node set,
+independent of arrival order — and it reproduces the canonical linearizations in
+`reference/js/autobase/DESIGN.md` (incl. the recursive `[a0, c0, a1, b0, b1, c1, b2]` example). We
+do **not** port the `undo`/`shared` reorder-tracking (a streaming optimization) nor the
+consensus/quorum confirmation (next capability; the upstream `linearizer.js`/`dags.js` assertions on
+*indexed* view length depend on it). Equivalence is at the linearization level for causally-closed
+DAGs.

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+# The linearizer is pure L1 causal ordering over opaque writer keys — no crypto,
+# storage, or payload access. `hypercore`/`identity` return as dependencies when
+# autobase wires real per-writer cores (quorum / view materialization).
 [dependencies]
-hypercore = { path = "../hypercore" }
-identity = { path = "../identity" }
