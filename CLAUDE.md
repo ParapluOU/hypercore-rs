@@ -1,0 +1,48 @@
+# hypercore-rs — agent guide
+
+Clean-room Rust distillation of **Hypercore / Autobase / (Hyperbee)** as a domain-agnostic,
+secure, append-only log substrate. **This is a public repo.** Read `README.md` for the
+architecture and `docs/DEFINITION_OF_DONE.md` for what "done" means.
+
+## Working rules
+
+1. **Clean-room, not verbatim.** We do **not** transliterate upstream line-by-line, and we are
+   **not** wire-/disk-/JS-compatible. Reimplement *behaviour*; cherry-pick *ideas*. (This is the
+   opposite of a verbatim port — divergence is expected and good.)
+2. **Public repo — never commit private or personal data.** No absolute disk paths
+   (`/Users/...`, `/home/...`, `C:\...`), no machine/user names, no emails, tokens, or secrets,
+   no internal hostnames, no consumer-project internals. Use **repo-relative paths** in all code,
+   tests, docs, and the porting log. **Sanitize tool output before pasting it into anything
+   committed.**
+3. **L1 only — domain-agnostic.** Ordering and verification must never inspect a payload's
+   contents. No application/domain types live here; tests use generic/toy payloads.
+4. **Every test asserts.** Tests must fail honestly — never `#[ignore]` or `#[should_panic]` to
+   hide a gap.
+5. **Record every divergence from upstream as an ADR** in `docs/DECISIONS.md`.
+6. **Networking is out of scope** (deferred to Iroh). Skip upstream tests about
+   replication / wire protocol / disk-format interop / sessions / encryption — the relevance
+   filter is `docs/UPSTREAM_TEST_MAP.md`.
+
+## The loop
+
+One iteration:
+1. Read `docs/PORTING_LOG.md` (state) and `docs/DEFINITION_OF_DONE.md` + `docs/UPSTREAM_TEST_MAP.md`
+   (what's red).
+2. Pick the next red item — a capability or an upstream test to port. Study the matching source
+   under `reference/`.
+3. Implement it; write or port its test until green.
+4. Run `just verify`.
+5. Append an entry to `docs/PORTING_LOG.md` (what / decisions / lessons / next). Move any reusable
+   gotcha to `docs/LESSONS.md`; any divergence to `docs/DECISIONS.md`; tick the relevant boxes.
+6. Commit. End the message with the `Co-Authored-By` trailer.
+
+**Done** = `just verify-full` green **and** every box in `docs/DEFINITION_OF_DONE.md` and
+`docs/UPSTREAM_TEST_MAP.md` ticked.
+
+## Where things are
+
+- `crates/` — the workspace (dependency graph in `README.md`)
+- `reference/` — upstream sources (git submodules), read-only: study + test porting
+- `docs/` — `DEFINITION_OF_DONE.md`, `UPSTREAM_TEST_MAP.md`, `PORTING_LOG.md`, `DECISIONS.md`,
+  `LESSONS.md`
+- `Justfile` — `just verify` (loop gate), `just wasm`, `just oracle`
