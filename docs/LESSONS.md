@@ -80,6 +80,19 @@ personal data** (this repo is public; use repo-relative paths).
   storage failure can never advance the log's logical state. Test it with a **fault-injecting store**
   wrapper that fails the `put` at a chosen key — assert length/head/reads are untouched, no orphan blocks
   remain, *and* a fault-free retry recovers. A happy-path-only test never exercises the rollback branch.
+- **Fork detection is two L1 primitives, not a replication event.** Upstream surfaces a forking writer
+  via a `'conflict'` event mid-replication, but the *provable* fact is content-blind and needs no
+  network: (1) two signed heads of **equal length but different root** from one author are a fork on
+  their own (the head at a length is a deterministic pure function of the first `length` blocks — two
+  roots ⇒ two histories), so a proof-free `conflicting_heads` is the first-notice detector; (2) for
+  forks across **different** lengths (truncate-and-rewrite), pin the disagreement to a **shared block
+  index** — two inclusion proofs at the same index, both signed by the author, committing different
+  bytes (reuse `verify_block` per side). Soundness is just leaf collision-resistance (different bytes ⇒
+  different committed leaf) — the assumption the Merkle scheme already makes. Gotcha when writing the
+  tamper tests: a block that *is* a root has an **empty** sibling list (e.g. block 4 in a 5-block log =
+  leaf 8 = a root), so to exercise a "tampered sibling" case pick a fork index whose inclusion proof is
+  interior (diverge at index 1 of a ≥4-block log), not the last block.
+
 - **The minimal-dependency JS oracle is the bare `topolist.js`.** Upstream's `Linearizer` drags in the whole
   writer/core/consensus/clock object graph (and `batch.js`/`dags.js` drive the *full* native stack —
   sodium, hypercore, corestore). But the actual *ordering* producer (ADR-0014) is `lib/topolist.js`, which

@@ -270,6 +270,61 @@ pub fn verify_block(public: &PublicKey, head: &SignedHead, index: u64, data: &[u
         && proof.verify(data, &head.root)
 }
 
+/// Whether two signed heads from the **same author** are a proven fork.
+///
+/// For a fixed author the head at a given length is unique and deterministic —
+/// the root is a pure function of the first `length` blocks. So two heads of
+/// **equal length but different root**, each carrying the author's signature,
+/// are non-repudiable evidence that the author signed two incompatible logs (a
+/// fork). This is the proof-free detector: it needs only the two heads, and it
+/// is how a verifier first *notices* a fork — two contradictory heads at one
+/// length (upstream's replication-time `'conflict'` at a length; ADR-0019).
+///
+/// Heads of **different** lengths are deliberately not flagged here: an honest
+/// log of length `L2 > L1` legitimately extends the length-`L1` head, so a
+/// divergence between different-length heads must instead be pinned to a shared
+/// block index with a [`ForkProof`].
+pub fn conflicting_heads(public: &PublicKey, a: &SignedHead, b: &SignedHead) -> bool {
+    a.length == b.length
+        && a.root != b.root
+        && public.verify(&head_message(a.length, &a.root), &a.sig)
+        && public.verify(&head_message(b.length, &b.root), &b.sig)
+}
+
+/// Non-repudiable evidence that one author committed **two different blocks at
+/// the same index** — a fork proven at a specific block index.
+///
+/// Each side pairs a signed head with an inclusion proof and the block bytes it
+/// commits at `index`. If both sides are signed by the author and prove their
+/// block at `index`, and the two blocks differ, the author signed two
+/// incompatible histories (under leaf collision-resistance, different bytes ⇒ a
+/// different committed leaf). Unlike [`conflicting_heads`], this works across
+/// heads of **different lengths** (e.g. a truncate-and-rewrite fork): it pins
+/// the disagreement to one shared index rather than the whole-tree root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkProof {
+    /// The block index at which the two logs disagree.
+    pub index: u64,
+    pub head_a: SignedHead,
+    pub data_a: Vec<u8>,
+    pub proof_a: Proof,
+    pub head_b: SignedHead,
+    pub data_b: Vec<u8>,
+    pub proof_b: Proof,
+}
+
+impl ForkProof {
+    /// Verify this is a genuine fork by `public`: both sides must be signed by
+    /// `public`, prove their block at `index`, and commit **different** bytes
+    /// there. Returns `false` for anything else — a forged side, a consistent
+    /// pair (same bytes), a tampered proof, or a mismatched index claim.
+    pub fn verify(&self, public: &PublicKey) -> bool {
+        verify_block(public, &self.head_a, self.index, &self.data_a, &self.proof_a)
+            && verify_block(public, &self.head_b, self.index, &self.data_b, &self.proof_b)
+            && self.data_a != self.data_b
+    }
+}
+
 /// A verify-only replica of a [`Hypercore`]. It holds no secret key; it accepts
 /// blocks accompanied by a proof against a signed head, verifies each, and
 /// rebuilds an **identical** log — never trusting the sender.
@@ -688,5 +743,135 @@ mod tests {
         }
         assert_eq!(core.commit(b2).unwrap(), Some(6));
         assert_eq!(core.get(5).unwrap(), Some(blk("f")));
+    }
+
+    // ---- fork detection (upstream `conflicts.js`, L1) ----
+
+    type ByteCore = Hypercore<Vec<u8>, Bytes, MemoryStore>;
+
+    fn core_with(seed: u8, blocks: &[&str]) -> ByteCore {
+        let mut c = Hypercore::<Vec<u8>, _, _>::new(author(seed), Bytes, MemoryStore::new());
+        for b in blocks {
+            c.append(&blk(b)).unwrap();
+        }
+        c
+    }
+
+    /// Assemble a [`ForkProof`] at `index` from two cores (each supplies its own
+    /// signed head, block bytes, and inclusion proof at that index).
+    fn fork_proof_at(index: u64, a: &ByteCore, b: &ByteCore) -> ForkProof {
+        ForkProof {
+            index,
+            head_a: a.head().unwrap().clone(),
+            data_a: a.block(index).unwrap().unwrap(),
+            proof_a: a.proof(index).unwrap(),
+            head_b: b.head().unwrap().clone(),
+            data_b: b.block(index).unwrap().unwrap(),
+            proof_b: b.proof(index).unwrap(),
+        }
+    }
+
+    #[test]
+    fn forking_writer_is_detected() {
+        // Same author (seed 40), two logs sharing the prefix [a,b,c,d] but
+        // diverging at index 4 — mirrors conflicts.js (a=[..e], c=[..f]).
+        let a = core_with(40, &["a", "b", "c", "d", "e"]);
+        let c = core_with(40, &["a", "b", "c", "d", "f"]);
+        let pk = a.public_key();
+        assert_eq!(pk, c.public_key(), "same seed => same author key");
+
+        // Both heads are length 5 with different roots: a proof-free fork.
+        let ha = a.head().unwrap();
+        let hc = c.head().unwrap();
+        assert_eq!(ha.length, hc.length);
+        assert_ne!(ha.root, hc.root);
+        assert!(conflicting_heads(&pk, ha, hc), "same-length conflicting heads = fork");
+
+        // And the per-index fork proof at the divergence (block 4: 'e' vs 'f').
+        let fork = fork_proof_at(4, &a, &c);
+        assert!(fork.verify(&pk), "per-index fork proof verifies");
+    }
+
+    #[test]
+    fn honest_extension_is_not_a_fork() {
+        // A length-5 log and an honest length-7 continuation by the same author:
+        // shared blocks agree, so neither detector flags a fork.
+        let short = core_with(41, &["a", "b", "c", "d", "e"]);
+        let long = core_with(41, &["a", "b", "c", "d", "e", "f", "g"]);
+        let pk = short.public_key();
+
+        // Different lengths => conflicting_heads never flags (it judges equal lengths only).
+        assert!(!conflicting_heads(&pk, short.head().unwrap(), long.head().unwrap()));
+
+        // A "fork proof" over any shared index has identical data on both sides => not a fork.
+        for i in 0..5u64 {
+            let not_fork = fork_proof_at(i, &short, &long);
+            assert_eq!(not_fork.data_a, not_fork.data_b, "shared block agrees at {i}");
+            assert!(!not_fork.verify(&pk), "consistent block is not a fork (i={i})");
+        }
+    }
+
+    #[test]
+    fn identical_logs_do_not_conflict() {
+        // Same author, same appends => identical deterministic heads => no conflict.
+        let a = core_with(42, &["x", "y", "z"]);
+        let b = core_with(42, &["x", "y", "z"]);
+        let pk = a.public_key();
+        assert_eq!(a.head().unwrap(), b.head().unwrap());
+        assert!(!conflicting_heads(&pk, a.head().unwrap(), b.head().unwrap()));
+    }
+
+    #[test]
+    fn fork_proof_rejects_forgery() {
+        // Diverge at index 1 (block 'b' vs 'Z') in a 4-block log, so the block-1
+        // inclusion proof carries interior siblings to tamper with.
+        let a = core_with(43, &["a", "b", "c", "d"]);
+        let c = core_with(43, &["a", "Z", "c", "d"]);
+        let pk = a.public_key();
+        let good = fork_proof_at(1, &a, &c);
+        assert!(good.verify(&pk));
+        assert!(!good.proof_a.siblings.is_empty(), "block 1 proof has siblings");
+
+        // Wrong author key: neither head is signed by it.
+        assert!(!good.verify(&author(99).public()));
+
+        // Tampered data on one side: its proof no longer matches the head root.
+        let mut bad_data = good.clone();
+        bad_data.data_a = blk("zzz");
+        assert!(!bad_data.verify(&pk));
+
+        // Tampered proof sibling on one side.
+        let mut bad_proof = good.clone();
+        bad_proof.proof_a.siblings[0].hash[0] ^= 0xff;
+        assert!(!bad_proof.verify(&pk));
+
+        // Tampered head: mutating the signed root invalidates the head's signature.
+        let mut bad_head = good.clone();
+        bad_head.head_a.root[0] ^= 0xff;
+        assert!(!bad_head.verify(&pk));
+
+        // Mismatched index claim: the proofs are for block 1, not 0.
+        let mut wrong_index = good.clone();
+        wrong_index.index = 0;
+        assert!(!wrong_index.verify(&pk));
+    }
+
+    #[test]
+    fn different_authors_are_not_a_fork() {
+        // Two independent authors with differing length-3 logs are NOT a fork —
+        // a fork is one author signing two histories, not two authors disagreeing.
+        let a = core_with(44, &["a", "b", "c"]);
+        let b = core_with(45, &["a", "b", "d"]); // different author and content
+        assert_ne!(a.public_key(), b.public_key());
+
+        // Neither key validates the other's head, so no same-length conflict.
+        assert!(!conflicting_heads(&a.public_key(), a.head().unwrap(), b.head().unwrap()));
+        assert!(!conflicting_heads(&b.public_key(), a.head().unwrap(), b.head().unwrap()));
+
+        // A fork proof built across the two cores fails under either key — one
+        // side is always signed by the other author.
+        let cross = fork_proof_at(2, &a, &b);
+        assert!(!cross.verify(&a.public_key()));
+        assert!(!cross.verify(&b.public_key()));
     }
 }

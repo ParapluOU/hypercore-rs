@@ -23,7 +23,7 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `merkle-tree.js` | [~] | `merkle` (roots/proof/verify/determinism/tamper **and contiguous-range proofs** ported, ADR-0017; byte-offset seeks + length-extension `upgrade`/`additionalNodes` + reorg still later) |
 | `merkle-tree-recovery.js` | [ ] | `merkle` recovery |
 | `encodings.js` | [~] | `codec` (varint/framing/tagged/tolerance concepts ported; upstream-specific encodings are clean-room) |
-| `conflicts.js` | [ ] | `hypercore`/`merkle` fork detection |
+| `conflicts.js` | [~] | `hypercore` fork detection — L1 behaviour ported (ADR-0019): `conflicting_heads` (same-length, different-root signed heads) + per-index `ForkProof::verify`; the replication-time `'conflict'` event + session teardown are networking/sessions (out of scope, return with Iroh) |
 | `bitfield.js`, `bit-interlude.js`, `mark-bitfield.js`, `mark-n-sweep.js` | [ ] | `storage`/sparse bitfield (local) |
 | `clear.js`, `purge.js` | [ ] | `hypercore` clear/truncate |
 | `move-to.js`, `snapshots.js`, `streams.js` | [ ] | `hypercore` seek/snapshot/stream |

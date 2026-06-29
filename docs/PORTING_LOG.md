@@ -399,3 +399,52 @@ Repo-relative paths only — no private or personal data (this repo is public).
   also the cross-check that lets us safely strengthen `finalized()` for forks/merges (ADR-0015).
 - Then the wasm runtime / IndexedDB gate (#2), and more upstream rows (`conflicts.js` fork detection;
   merkle seek/upgrade/reorg).
+
+---
+
+## 2026-06-29 — Iteration 12: `hypercore` fork detection (`conflicts.js`)
+
+**Did**
+- Added **fork detection** to `crates/hypercore` — the L1 behaviour behind upstream `conflicts.js`,
+  with no networking and no events (two self-contained, content-blind primitives over the existing
+  signed head + Merkle inclusion proof + identity):
+  - `conflicting_heads(public, a, b)` — **proof-free**: two heads of *equal length but different
+    root*, each verifying under the author's key, are a fork (the head at a length is a deterministic
+    pure function of the first `length` blocks ⇒ two roots at one length ⇒ two histories). How a
+    verifier first *notices* a fork.
+  - `ForkProof { index, head_a/b, data_a/b, proof_a/b }` + `verify(public)` — pins the disagreement to
+    a **shared block index**: both sides must be signed by `public` and prove their block at `index`
+    (reuses `verify_block`), and the two blocks must differ. Works across **different-length** heads
+    (truncate-and-rewrite forks), where `conflicting_heads` abstains.
+- 5 asserting tests (hypercore 14→19): a forking writer (same author, `[a,b,c,d,e]` vs `[a,b,c,d,f]`)
+  is caught by both detectors at the divergence; an honest length-7 extension of a length-5 log is
+  **not** a fork (different lengths ⇒ `conflicting_heads` abstains; shared blocks agree ⇒ no
+  `ForkProof`); identical logs don't conflict; `ForkProof` tamper-rejection (wrong author key, tampered
+  data / proof sibling / signed head root, mismatched index claim — diverging at index 1 of a 4-block
+  log so the proof carries interior siblings); two *different* authors disagreeing are **not** a fork
+  under either key. `just verify` green (60 native tests + wasm build of `hypercore`/`autobase`/`storage`).
+
+**Decisions** (see `docs/DECISIONS.md`)
+- ADR-0019: fork detection is a self-contained L1 capability (signed-head conflict + per-index
+  `ForkProof`), not upstream's replication-time `'conflict'` event. The replication mechanism (peer
+  streams, the event, session teardown) is out of scope (networking/sessions; returns with Iroh,
+  ADR-0003) and upstream's own `conflicts.js` is `test.skip`ed for a session-lifecycle flake — so
+  `conflicts.js` stays `[~]`: detection behaviour ported, mechanism deferred. Soundness rests only on
+  leaf collision-resistance, which the Merkle scheme already assumes.
+
+**Lessons** (moved to `docs/LESSONS.md`)
+- Fork detection = two L1 primitives (same-length/different-root proof-free detector; per-index
+  inclusion-proof fork proof), not a replication event — soundness is just leaf collision-resistance.
+- Tamper-test gotcha: a block that *is* a root has an **empty** sibling list (block 4 of a 5-block log
+  = leaf 8 = a root), so to exercise a "tampered sibling" case diverge at an interior index (index 1 of
+  a ≥4-block log), not the last block.
+
+**Next**
+- **JS algorithmic-equivalence oracle** (gate #4, ADR-0008) once a container runtime is *started*
+  (still environment-blocked: Apple `container` service isn't started — needs an XPC service outside
+  the loop's allowlist — and the image pull needs network; see iter 11). Build `tools/oracle/` driving
+  the reference `lib/topolist.js` (deps injected via `Module._compile`, network-free) through
+  `scripts/node-sandbox.sh`; compare order vs our `order()`.
+- Then the wasm runtime / IndexedDB gate (#2), and more upstream rows: merkle **seek/upgrade/reorg**
+  (`merkle-tree.js`/`merkle-tree-recovery.js`), `autobase` `topolist.js` ordering, and the view/apply
+  layer (`apply.js`/`anchors.js`) that the `linearizer.js`/`dags.js` view-length assertions need.

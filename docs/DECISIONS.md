@@ -196,3 +196,30 @@ advanced past `base`), mirroring upstream's "`commit` returns `null` when the co
 multi-session interactions, `byteLength`, `truncate`/`append` events, and the `atom.flush()` storage
 overlay; `batch.js`/`atomic.js` stay `[~]`. Atomic rollback is honestly tested with a fault-injecting
 store (`FaultyStore`), not just the happy path.
+
+## ADR-0019 — Fork detection is a self-contained L1 capability, not a replication-time event
+**Context:** Upstream hypercore (`reference/js/hypercore/test/conflicts.js`) surfaces a forking writer
+as a `'conflict'` event emitted **during replication**: peer `b` replicates from both a writer `a`
+(`[a,b,c,d,e]`) and a second core `c` sharing `a`'s keypair (`[a,b,c,d,f,e]`); when the two signed
+trees disagree at a length, `b`/`c` emit `conflict` and sessions close. That test is replication- and
+session-driven (and is itself `test.skip`ed upstream for a lifecycle flake), so the *mechanism* —
+swarm, streams, `'conflict'` events, session teardown — is out of scope per the relevance filter
+(networking / sessions). The *behaviour under test* — proving a single writer signed two incompatible
+logs — is a pure L1 property and very much in scope for a "secure append-only log substrate".
+**Decision:** Reimplement the **detection behaviour** as two self-contained, content-blind primitives
+over our existing signed head + Merkle inclusion proof + identity, with no networking and no events:
+- `conflicting_heads(public, a, b)` — proof-free: two heads of **equal length but different root**,
+  each verifying under the author's key, are a fork (the head at a given length is a deterministic
+  pure function of the first `length` blocks, so two roots at one length ⇒ two histories). This is how
+  a verifier first *notices* a fork — two contradictory heads at one length.
+- `ForkProof { index, head_a/b, data_a/b, proof_a/b }` with `verify(public)` — pins the disagreement
+  to a **shared block index**: both sides must be signed by `public` and prove their block at `index`
+  (reusing `verify_block`), and the two blocks must differ. Works across heads of **different**
+  lengths (truncate-and-rewrite forks), where `conflicting_heads` deliberately abstains. Soundness
+  rests on leaf collision-resistance (different bytes ⇒ a different committed leaf) — the same
+  assumption the whole Merkle scheme already rests on.
+**Consequence:** Fork detection is green and host-safe under `just verify` (no swarm, no Chrome). We
+**defer** the replication-time plumbing that produces these inputs in a live system (peer streams, the
+`'conflict'` event, session close) — it returns with networking (Iroh, ADR-0003). `conflicts.js` stays
+`[~]`: the L1 detection behaviour is ported; the replication/session mechanism is out of scope.
+Different-length *honest* extensions and different-author logs are correctly **not** flagged.
