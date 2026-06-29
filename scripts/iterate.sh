@@ -61,6 +61,21 @@ code-editing subagents or delegate any edit -- make every change yourself.
 Stop after one iteration.
 EOF
 
+# Scoped permissions for the headless agent, passed on the CLI so they are honored
+# even when the workspace is untrusted (headless ignores .claude/settings.json
+# there). Build / test / commit only — no push, no rm, no host node/npm.
+ALLOW=(
+  Read Grep Glob Edit Write MultiEdit TodoWrite
+  "Bash(cargo:*)" "Bash(rustup:*)" "Bash(rustc:*)" "Bash(just:*)" "Bash(wasm-pack:*)"
+  "Bash(scripts/node-sandbox.sh:*)"
+  "Bash(git add:*)" "Bash(git commit:*)" "Bash(git status:*)" "Bash(git diff:*)"
+  "Bash(git log:*)" "Bash(git restore:*)" "Bash(mkdir:*)" "Bash(ls:*)" "Bash(cat:*)"
+)
+DENY=(
+  "Bash(git push:*)" "Bash(rm:*)" "Bash(curl:*)" "Bash(wget:*)"
+  "Bash(npm:*)" "Bash(npx:*)" "Bash(node:*)"
+)
+
 tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
 
 for ((i = FROM; i <= TO; i++)); do
@@ -71,12 +86,13 @@ Use \"iter ${i}: \" as the commit message prefix.
 
 ${BODY}"
 
-  # acceptEdits auto-applies file edits; all Bash is constrained by the scoped
-  # allowlist in .claude/settings.json (cargo / just / wasm / sandboxed node /
-  # non-push git). No blanket bypass; subagents are not allowlisted (single writer).
+  # acceptEdits auto-applies file edits; Bash is constrained by the explicit
+  # allow/deny lists below. No blanket bypass; subagents are not allowlisted
+  # (single writer).
   args=( -p "$PROMPT" --permission-mode "${HC_PERM:-acceptEdits}" )
   [ -n "${HC_MODEL:-}" ]  && args+=( --model "$HC_MODEL" )
   [ -n "${HC_BUDGET:-}" ] && args+=( --max-budget-usd "$HC_BUDGET" )
+  args+=( --allowedTools "${ALLOW[@]}" --disallowedTools "${DENY[@]}" )
 
   : > "$tmp"
   set +e
