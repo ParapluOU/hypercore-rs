@@ -1991,3 +1991,23 @@ the new path is shown ≥ as safe.
 **Next**
 - Stage 2: port `_strictlyNewer` / `_acks` / `_isMerge` / `_indexerTails` over the clock layer (with
   worked-example tests), still alongside the conservative baseline.
+
+---
+
+## 2026-06-30 — autobase: faithful `consensus.js` port, stage 2 (DAG predicates)
+
+**Did**
+- Ported the four DAG predicates over the stage-1 clock layer, each parameterised by a `removed` clock
+  (the confirmed-prefix watermark; empty = from-scratch): `is_merge` (an indexer node joins > 1
+  independent branch — a size->1 antichain of its per-indexer heads), `indexer_tails` (the minimal
+  un-confirmed frontier), `strictly_newer` (the fork-ambiguity guard — `parent` sees `object` and its
+  extra knowledge contains nothing concurrent to `object`), and `acks` (the indexer nodes voting for a
+  target). `removed`-empty derivations hand-checked, then asserted.
+- 4 tests on a `chain` + a `fork_merge` DAG: `is_merge` flags only the join `c1`; `indexer_tails` =
+  `{a0}` (chain) / `{a0,b0}` (fork); `acks(a0)` = all three indexers; `strictly_newer` basics +
+  the `strictly_newer ⇒ sees` invariant over every node pair. Marked the predicates `allow(dead_code)`
+  until stage 3 consumes them (0 warnings). Conservative `finalized()` still untouched. Gate **195**.
+
+**Next**
+- Stage 3: `confirms` / `_isConfirmed` / `_isConfirmableAt` / `_ackedAt` on top of `acks` +
+  `strictly_newer`, validated against the DESIGN single-/double-quorum examples.

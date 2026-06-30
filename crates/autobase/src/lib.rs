@@ -328,6 +328,162 @@ impl Linearizer {
         clock
     }
 
+    // ------------------------------------------------------------------------------
+    // Faithful `consensus.js` port, stage 2 — the DAG predicates.
+    //
+    // Reimplemented over our DAG + [`Clock`] (not upstream's stateful BufferMap/Clock
+    // machine), parameterised by `removed`: the per-writer length already confirmed
+    // out of the prefix (upstream's `removed` clock + each writer's `indexed`/`offset`
+    // watermark). An **empty** `removed` is the from-scratch base case. These feed the
+    // confirmation predicates (stage 3). ADR-0042.
+    // ------------------------------------------------------------------------------
+
+    /// Whether indexer node `node` is a **merge**: it causally joins more than one
+    /// independent indexer branch (upstream `_isMerge`). For each indexer we take the
+    /// latest of its nodes that `node` saw (its own previous node for `node`'s own
+    /// writer), skip any already-confirmed, and ask whether ≥ 2 of those heads are
+    /// mutually independent (an antichain of size > 1).
+    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
+    fn is_merge(&self, node: &NodeId, removed: &Clock) -> bool {
+        let Some(indexers) = self.indexers.as_ref() else {
+            return false;
+        };
+        if !indexers.contains(&node.key) {
+            return false;
+        }
+        let clk = self.clock(node);
+        let mut heads: Vec<NodeId> = Vec::new();
+        for &idx in indexers {
+            // seq = (latest length of idx seen) - 1, minus one more for node's own writer.
+            let seq = clk.get(&idx) as i64 - 1 - if idx == node.key { 1 } else { 0 };
+            if seq < 0 {
+                continue;
+            }
+            let head = NodeId::new(idx, seq as u64);
+            if !self.contains(&head) || removed.includes(&idx, seq as u64 + 1) {
+                continue;
+            }
+            heads.push(head);
+        }
+        // Count the maximal heads — those no other head sees (older heads are
+        // subsumed). > 1 mutually-independent maximal head ⇒ a merge.
+        let maximal = heads
+            .iter()
+            .filter(|h| !heads.iter().any(|o| *o != **h && self.sees(o, h)))
+            .count();
+        maximal > 1
+    }
+
+    /// The **indexer tails**: the oldest not-yet-confirmed node of each indexer,
+    /// reduced to the minimal antichain (upstream `_indexerTails`). These are the
+    /// frontier the confirmation machine tries to yield next.
+    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
+    fn indexer_tails(&self, removed: &Clock) -> BTreeSet<NodeId> {
+        let Some(indexers) = self.indexers.as_ref() else {
+            return BTreeSet::new();
+        };
+        let mut tails: Vec<NodeId> = Vec::new();
+        for &idx in indexers {
+            let length = removed.get(&idx); // first un-confirmed node of this indexer
+            let head = NodeId::new(idx, length);
+            if !self.contains(&head) || removed.includes(&head.key, head.seq + 1) {
+                continue;
+            }
+            let mut is_tail = true;
+            let mut remove: Vec<NodeId> = Vec::new();
+            for &t in &tails {
+                if self.sees(&head, &t) {
+                    is_tail = false; // head is newer than an existing tail ⇒ not minimal
+                    break;
+                }
+                if self.sees(&t, &head) {
+                    remove.push(t); // existing tail is newer than head ⇒ head supersedes it
+                }
+            }
+            tails.retain(|t| !remove.contains(t));
+            if is_tail {
+                tails.push(head);
+            }
+        }
+        tails.into_iter().collect()
+    }
+
+    /// Whether `parent` is **strictly newer** than `object` (upstream
+    /// `_strictlyNewer`): `parent` sees `object`, and every writer `parent` saw
+    /// beyond `object` did so only through nodes that themselves acknowledge
+    /// `object` — i.e. `parent`'s extra knowledge contains nothing concurrent to
+    /// `object`. This is the ambiguity guard that keeps a vote from being
+    /// double-counted across a fork.
+    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
+    fn strictly_newer(&self, object: &NodeId, parent: &NodeId, removed: &Clock) -> bool {
+        if !self.sees(parent, object) {
+            return false;
+        }
+        let pclk = self.clock(parent);
+        let oclk = self.clock(object);
+        for (key, latest) in pclk.iter() {
+            let oldest = removed.get(&key);
+            if latest <= oldest {
+                continue;
+            }
+            let length = oclk.get(&key).max(oldest);
+            if latest < length {
+                return false; // sanity — can't happen once parent sees object
+            }
+            if latest == length {
+                continue; // both saw the same amount of this writer
+            }
+            // parent saw strictly more of `key` than object: the next node object
+            // didn't see must itself already acknowledge object, else it's ambiguous.
+            let next = NodeId::new(key, length);
+            if !self.contains(&next) {
+                continue; // confirmed away / doesn't exist
+            }
+            if self.sees(&next, object) {
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
+    /// The **acks** of `target` (upstream `_acks`): the indexer nodes that vote for
+    /// it — `target` itself if its writer is an indexer, plus, for each other
+    /// indexer, the first of its nodes that did *not* see `target` already but whose
+    /// node at `target`'s frontier sees `target` and is [`strictly_newer`]. The
+    /// majority test for confirmation counts these.
+    ///
+    /// [`strictly_newer`]: Self::strictly_newer
+    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
+    fn acks(&self, target: &NodeId, removed: &Clock) -> Vec<NodeId> {
+        let Some(indexers) = self.indexers.as_ref() else {
+            return Vec::new();
+        };
+        let mut acks: Vec<NodeId> = Vec::new();
+        if indexers.contains(&target.key) {
+            acks.push(*target);
+        }
+        let tclk = self.clock(target);
+        for &idx in indexers {
+            if idx == target.key {
+                continue;
+            }
+            let next = tclk.get(&idx).max(removed.get(&idx));
+            let node = NodeId::new(idx, next);
+            if !self.contains(&node) {
+                continue;
+            }
+            if !self.sees(&node, target) {
+                continue;
+            }
+            if !self.strictly_newer(target, &node, removed) {
+                continue;
+            }
+            acks.push(node);
+        }
+        acks
+    }
+
     /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
     ///
     /// A **vote** is a reference from an indexer to a node (at most one per
@@ -614,6 +770,100 @@ mod tests {
         assert_eq!(c.writers(), 0);
         assert_eq!(c.get(&wk(A)), 0);
         assert!(!c.includes(&wk(A), 1));
+    }
+
+    // ---- consensus.js predicates (stage 2) ----------------------------------
+
+    fn empty() -> Clock {
+        Clock::default()
+    }
+
+    // a0,b0 concurrent (a fork); c0 sees a0; a1 sees c0; c1 merges c0 & b0; b1 sees c1.
+    fn fork_merge() -> Linearizer {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[]);
+        add(&mut lin, n(C, 0), &[n(A, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+        add(&mut lin, n(C, 1), &[n(B, 0)]); // pred c0 + cross-ref b0 → a merge
+        add(&mut lin, n(B, 1), &[n(C, 1)]);
+        lin
+    }
+
+    fn chain() -> Linearizer {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]);
+        add(&mut lin, n(C, 0), &[n(B, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+        lin
+    }
+
+    #[test]
+    fn is_merge_identifies_the_fork_join_only() {
+        let lin = fork_merge();
+        assert!(lin.is_merge(&n(C, 1), &empty()), "c1 joins the b-branch and the a/c-branch");
+        for node in [n(A, 0), n(B, 0), n(C, 0), n(A, 1), n(B, 1)] {
+            assert!(!lin.is_merge(&node, &empty()), "{node:?} is not a merge");
+        }
+        let c = chain();
+        for node in [n(A, 0), n(B, 0), n(C, 0), n(A, 1)] {
+            assert!(!c.is_merge(&node, &empty()), "no merges in a linear chain");
+        }
+    }
+
+    #[test]
+    fn indexer_tails_are_the_minimal_frontier() {
+        assert_eq!(
+            chain().indexer_tails(&empty()),
+            BTreeSet::from([n(A, 0)]),
+            "a single tail in a chain"
+        );
+        assert_eq!(
+            fork_merge().indexer_tails(&empty()),
+            BTreeSet::from([n(A, 0), n(B, 0)]),
+            "two tails across a fork"
+        );
+    }
+
+    #[test]
+    fn acks_of_a_chain_tail_are_all_indexers() {
+        let lin = chain();
+        let mut acks = lin.acks(&n(A, 0), &empty());
+        acks.sort();
+        assert_eq!(
+            acks,
+            vec![n(A, 0), n(B, 0), n(C, 0)],
+            "a0 is acked by itself (a) and the strictly-newer b0, c0"
+        );
+    }
+
+    #[test]
+    fn strictly_newer_basics_and_invariant() {
+        let lin = chain();
+        assert!(
+            lin.strictly_newer(&n(A, 0), &n(C, 0), &empty()),
+            "c0 is strictly newer than a0"
+        );
+        assert!(
+            lin.strictly_newer(&n(A, 0), &n(A, 0), &empty()),
+            "reflexive: a node is strictly newer than itself"
+        );
+
+        let fm = fork_merge();
+        assert!(
+            !fm.strictly_newer(&n(B, 0), &n(A, 0), &empty()),
+            "a0 doesn't even see b0, so it can't be strictly newer"
+        );
+        // invariant: strictly_newer(object, parent) ⇒ sees(parent, object).
+        let nodes = fm.order();
+        for o in &nodes {
+            for p in &nodes {
+                if fm.strictly_newer(o, p, &empty()) {
+                    assert!(fm.sees(p, o), "strictly_newer({o:?}, {p:?}) but !sees");
+                }
+            }
+        }
     }
 
     /// Every dependency must appear before its dependent in `order`.
