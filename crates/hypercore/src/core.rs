@@ -141,6 +141,39 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         Ok(())
     }
 
+    /// Append every value in `values` atomically, under a single signed head — the
+    /// bulk-write form of upstream `append([...])` / `createWriteStream`. Returns the
+    /// new length. (For incremental streaming, drive [`append`](Self::append) or a
+    /// [`batch`](Self::batch) directly.)
+    pub fn append_all(&mut self, values: &[T]) -> Result<u64, Error<S::Error>> {
+        if values.is_empty() {
+            return Ok(self.len());
+        }
+        let mut batch = self.batch();
+        for v in values {
+            self.stage(&mut batch, v);
+        }
+        self.commit(batch)?;
+        Ok(self.len())
+    }
+
+    /// **Mark-and-sweep GC** (upstream `startMarking`/`markBlock`/`sweep`): drop the
+    /// bytes of every *present* block for which `keep(index)` is `false`, returning the
+    /// number swept. Like [`clear`](Self::clear), swept blocks stay authenticated (the
+    /// Merkle tree is untouched), so a holder can re-fetch them; physical space
+    /// reclamation is the storage backend's job (the log-structured store compacts).
+    pub fn sweep(&mut self, keep: impl Fn(u64) -> bool) -> Result<u64, Error<S::Error>> {
+        let mut swept = 0;
+        for i in 0..self.tree.len() {
+            if self.presence.get(i) && !keep(i) {
+                self.store.delete(i).map_err(Error::Storage)?;
+                self.presence.set(i, false);
+                swept += 1;
+            }
+        }
+        Ok(swept)
+    }
+
     /// The truncation performed by the immediately preceding operation, or `None`
     /// if the last operation was an append/commit (which clears it).
     pub fn last_truncation(&self) -> Option<Truncation> {

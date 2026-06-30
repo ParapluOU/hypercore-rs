@@ -18,7 +18,7 @@ consumer's L2, JS session/event machinery).
 | Atomic batch | `append([...])` | `batch`/`stage`/`commit`/`batch_get` | ✅ |
 | Read | `get`, `has`, `length`, `byteLength`, `contiguousLength` | `get`, `block`, `has`, `len`, `byte_length`, `contiguous_length` | ✅ |
 | Streams | `createReadStream`, `createByteStream` | `read_stream`, `byte_stream` | ✅ |
-| `createWriteStream` | ✔ | — | ✗ |
+| `createWriteStream` / bulk append | ✔ | `append_all` (atomic bulk, one head) | ✅ |
 | Seek | `seek` | `seek`, `byte_stream` | ✅ |
 | Proofs / verify | `proof`, `applyProof`, `treeHash`, `signable`, `missingNodes` | `proof`, `upgrade_proof`, `verify_block`/`_head`/`_upgrade`/`_reorg`, `root_hash` | ✅ |
 | Fork detection | fork counter + proofs | `conflicting_heads`, `ForkProof` | ✅ |
@@ -27,7 +27,8 @@ consumer's L2, JS session/event machinery).
 | Move-to / key rotation | `lib/move-to` | `prologue_at`/`with_prologue`/`copy_prologue`/`verify_prologue` | ✅ |
 | Persistence | storage/disk | `persist`/`open` (over `Store`, incl. OPFS) | ✅ |
 | `purge` | ✔ | `purge` | ✅ |
-| mark-&-sweep GC / `compact` | ✔ | sparse `clear` only | ✗ |
+| mark-&-sweep GC | `startMarking`/`markBlock`/`sweep` | `sweep(keep)` (+ sparse `clear`) | ✅ |
+| `compact` (physical reclaim) | ✔ | storage backend's job (log-structured store compacts) | ◑ |
 | `setUserData` / `getUserData` | ✔ | `set_user_data` / `get_user_data` | ✅ |
 | Sessions | `session`, `transferSession`, `commit` | `snapshot` covers read-isolation | ◑ |
 | Replication **transport** | `replicate`, `peers`, `download`, `update` | — | ⛔ |
@@ -75,9 +76,9 @@ consumer's L2, JS session/event machinery).
   snapshots/multisig/move-to/persistence/user-data/purge + replication *logic*; hyperbee
   ordered-KV with checkout, sub-databases, atomic batch, diff, peek and CAS; autobase
   ordering + consensus + finality.
-- **Remaining in-scope gaps:** hypercore write-stream object and mark-&-sweep GC /
-  `compact`; autobase dynamic indexer reconfiguration. (`diff`/`history` stay eager —
-  they are inherently whole-set operations, not streaming.)
+- **Remaining in-scope gaps:** autobase dynamic indexer reconfiguration (the indexer
+  set is currently passed in / external). Physical `compact` is delegated to the
+  storage backend; `diff`/`history` stay eager (inherently whole-set, not streaming).
 - **Deliberately out (not gaps):** networking/wire/replication-transport (→ Iroh),
   encryption, the domain `apply` fold (→ the consumer's L2), watch/live (needs the
   networking layer), JS session/event machinery, the hyperbee header block, and

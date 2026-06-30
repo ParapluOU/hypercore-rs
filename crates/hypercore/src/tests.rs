@@ -2148,3 +2148,45 @@ fn purge_clears_blocks_and_metadata() {
     core.append(&blk("fresh")).unwrap();
     assert_eq!(core.get(0).unwrap(), Some(blk("fresh")));
 }
+
+#[test]
+fn append_all_bulk_appends_under_one_head() {
+    let mut core = Hypercore::<Vec<u8>, _, _>::new(author(79), Bytes, MemoryStore::new());
+    assert_eq!(core.append_all(&[blk("a"), blk("b"), blk("c")]).unwrap(), 3);
+    assert_eq!(core.len(), 3);
+    for (i, v) in ["a", "b", "c"].iter().enumerate() {
+        assert_eq!(core.get(i as u64).unwrap(), Some(blk(v)));
+    }
+    // every block verifies against the single head the bulk append produced
+    let pk = core.public_key();
+    let head = core.head().unwrap().clone();
+    for (i, v) in ["a", "b", "c"].iter().enumerate() {
+        let proof = core.proof(i as u64).unwrap();
+        assert!(verify_block(&pk, &head, i as u64, &Bytes.encode(&blk(v)), &proof));
+    }
+    assert_eq!(core.append_all(&[]).unwrap(), 3); // empty = no-op
+}
+
+#[test]
+fn sweep_drops_unmarked_blocks_keeping_them_authenticated() {
+    let mut core = Hypercore::<Vec<u8>, _, _>::new(author(80), Bytes, MemoryStore::new());
+    for v in ["a", "b", "c", "d", "e"] {
+        core.append(&blk(v)).unwrap();
+    }
+    let pk = core.public_key();
+    let head = core.head().unwrap().clone();
+
+    // keep only the even indices; sweep the odd ones (1, 3)
+    let swept = core.sweep(|i| i % 2 == 0).unwrap();
+    assert_eq!(swept, 2);
+    assert!(!core.has(1) && !core.has(3));
+    assert!(core.has(0) && core.has(2) && core.has(4));
+    assert_eq!(core.get(1).unwrap(), None);
+
+    // a swept block's bytes are gone, but it's still authenticated (re-fetchable)
+    let proof = core.proof(1).expect("swept block still proves");
+    assert!(verify_block(&pk, &head, 1, &Bytes.encode(&blk("b")), &proof));
+
+    // sweeping again is a no-op (already absent)
+    assert_eq!(core.sweep(|i| i % 2 == 0).unwrap(), 0);
+}
