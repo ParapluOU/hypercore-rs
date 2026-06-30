@@ -3336,4 +3336,42 @@ mod tests {
             Err(Error::Corrupt)
         ));
     }
+
+    #[test]
+    fn persist_and_open_over_the_log_structured_store() {
+        // The real browser backend is `LogStore<OpfsFile>`; `LogStore<MemFile>` is
+        // its native twin. Prove persist/open round-trips over the *log-structured*
+        // store (append + replay), not just the in-memory map — including the
+        // reserved high keys flowing through it and a true file-replay reopen.
+        use storage::{LogStore, MemFile};
+
+        let store = LogStore::open(MemFile::new()).expect("fresh log store");
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(75), Bytes, store);
+        for v in ["aa", "bb", "ccc", "d"] {
+            core.append(&blk(v)).unwrap();
+        }
+        core.clear(2, 3).unwrap(); // sparse, to exercise the presence map too
+        core.persist().unwrap();
+
+        let len = core.len();
+        let root = core.head().unwrap().root;
+
+        // Simulate a process restart: pull the raw file bytes, rebuild the store
+        // (which replays the log), then reopen the core over it.
+        let bytes = core.store.into_file().bytes().to_vec();
+        let store2 = LogStore::open(MemFile::from_bytes(bytes)).expect("replays");
+        let reopened = Hypercore::<Vec<u8>, _, _>::open(author(75), Bytes, store2).unwrap();
+
+        assert_eq!(reopened.len(), len);
+        assert_eq!(reopened.head().unwrap().root, root);
+        assert!(reopened.verify_head());
+        assert!(!reopened.has(2), "cleared block stays cleared across reopen");
+        assert_eq!(reopened.get(2).unwrap(), None);
+        assert_eq!(reopened.get(0).unwrap(), Some(blk("aa")));
+        assert_eq!(reopened.get(3).unwrap(), Some(blk("d")));
+
+        let pk = author(75).public();
+        let proof = reopened.proof(2).expect("cleared block still proves");
+        assert!(verify_block(&pk, reopened.head().unwrap(), 2, &Bytes.encode(&blk("ccc")), &proof));
+    }
 }

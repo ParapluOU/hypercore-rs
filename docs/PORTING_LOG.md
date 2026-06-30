@@ -1898,6 +1898,10 @@ thin OPFS binding still needs a browser.
   bitfield 3 (round-trip every query, zero-page skipping, malformed reject); hypercore 5 (full round-trip
   + live-append-after-open, sparse round-trip keeps cleared blocks authenticated, wrong-key→Corrupt,
   unpersisted→NotPersisted, tampered-metadata→Corrupt). Full gate **183**; wasm compiles.
+- Follow-up: a 12th test proves persist/open round-trips over `LogStore<MemFile>` — the native twin of
+  the real `LogStore<OpfsFile>` browser backend — via a true file-replay reopen (`into_file().bytes()` →
+  `from_bytes` → `LogStore::open`), so the reserved high keys + sparse presence survive the log-structured
+  store, not just `MemoryStore`. Gate **184**.
 
 **Decisions** — ADR-0041 (persist/open; reserved-key layout in the flat `u64` store; head re-verified
 against the caller's key on open).
