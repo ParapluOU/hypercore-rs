@@ -21,8 +21,9 @@ Repo-relative paths only — no private or personal data (this repo is public).
   upstream tests; never commit private/personal data.
 
 **Lessons**
-- We have something verovio did not: upstream **test suites** to port as behavioural specs —
-  enumerated in `docs/UPSTREAM_TEST_MAP.md`. This is the closest thing to a deterministic oracle.
+- Unlike a from-scratch clean-room with no reference, we have upstream **test suites** to port as
+  behavioural specs — enumerated in `docs/UPSTREAM_TEST_MAP.md`. This is the closest thing to a
+  deterministic oracle.
 
 **Next**
 - First red item: `merkle` (tree + inclusion/range proofs + tamper-rejection), porting
