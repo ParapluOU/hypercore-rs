@@ -25,8 +25,9 @@ Every **relevant** upstream test file becomes a passing Rust test. Tracking + re
 
 1. **WASM compile** — `just wasm` (`cargo build --target wasm32-unknown-unknown` for `hypercore`,
    `autobase`, `storage`). Always in `verify`.
-2. **WASM runtime** — `just wasm-test`: create a hypercore, persist to IndexedDB, reload, verify,
-   in headless Chrome. Proves the WASM-*first* goal, not just compilation.
+2. **WASM runtime** — `just wasm-test`, in real Chrome: (a) `storage::opfs` raw-KV round-trip, and
+   (b) a full `Hypercore` append→`persist`→close→reopen over `OpfsStore`, verifying head/blocks/sparse
+   proof. Proves the WASM-*first* **and local-first** goal, not just compilation.
 3. **Convergence simulation** — `crates/autobase/tests/convergence.rs`: N writers, **seeded**
    random causal visibility (partitions, reordering); assert convergence + state-equality +
    finalized-prefix-never-reorders. Generic toy document — no domain types. (Model:
@@ -153,7 +154,10 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       partitioned/cooperative DAGs; order + state + finalized converge across delivery orders;
       finalized prefix monotone under cooperative growth (ADR-0016)
 - [ ] JS algorithmic-equivalence oracle (gate #4)
-- [x] WASM runtime / OPFS (gate #2) — `storage::opfs` worker test passes in real headless Chrome
+- [x] WASM runtime / OPFS (gate #2) — in **real Chrome 149**: `storage::opfs` raw-KV worker test **and** a
+      full `Hypercore` persist→reopen over `OpfsStore` (`hypercore::opfs_browser_tests`), each `... ok`.
+      Driven via the interactive `NO_HEADLESS` wasm-bindgen test server (no chromedriver) — see the
+      driver-free browser-test note in `docs/LESSONS.md`
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)
 - [~] `hyperbee` — v1 ordered KV B-tree over a hypercore: copy-on-write `put`/`get`/`range`
       (asc+desc, gt/gte/lt/lte/limit), order-9 split, multi-level; upstream `basic.js` **exhaustive

@@ -24,13 +24,16 @@ test:
 wasm:
     cargo build --target wasm32-unknown-unknown -p hypercore -p autobase -p storage -p hyperbee
 
-# WASM runtime test: IndexedDB persistence in headless Chrome. Requires wasm-pack + Chrome.
+# WASM runtime test: OPFS persistence in headless Chrome. Requires wasm-pack + Chrome.
 wasm-test:
-    # Runs the storage::opfs worker test in real headless Chrome. wasm-pack fetches the
-    # latest chromedriver, which must match the installed Chrome's MAJOR version; if Chrome
-    # lags, fetch a version-matched chromedriver and run cargo test via the matching
-    # wasm-bindgen-test-runner with CHROMEDRIVER set (wasm-pack ignores CHROMEDRIVER).
+    # Runs the OPFS worker tests in real headless Chrome: storage::opfs (raw KV) and
+    # hypercore::opfs_browser_tests (a full Hypercore persist→reopen over OpfsStore — the
+    # local-first payoff end-to-end). wasm-pack fetches the latest chromedriver, which must
+    # match the installed Chrome's MAJOR version; if Chrome lags, fetch a version-matched
+    # chromedriver and run cargo test via the matching wasm-bindgen-test-runner with
+    # CHROMEDRIVER set (wasm-pack ignores CHROMEDRIVER).
     RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome crates/storage --features opfs
+    RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome crates/hypercore --features opfs
 
 # JS algorithmic-equivalence oracle: compare our linearizer to reference/js/autobase.
 # Runs node ONLY inside a container via scripts/node-sandbox.sh (untrusted npm tree — see CLAUDE.md

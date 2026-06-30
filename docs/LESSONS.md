@@ -468,3 +468,15 @@ personal data** (this repo is public; use repo-relative paths).
   block bytes (`0..length`) and per-core metadata, put metadata at `u64::MAX`, `MAX-1`, … — a collision
   needs ~1.8e19 blocks. The clean-room single-store equivalent of upstream's separate per-section files
   (ADR-0041). And keep each type's serialization *in its own crate* so private layouts stay encapsulated.
+- **Run wasm browser tests without chromedriver: the `NO_HEADLESS` interactive server.** When the
+  installed Chrome's major version outruns the chromedriver `wasm-pack` fetches (the recurring SIGKILL/404
+  that masquerades as a sandbox problem), skip the driver entirely. The `wasm-bindgen-test-runner` serves
+  an interactive page when `NO_HEADLESS` is set: `NO_HEADLESS=1 WASM_BINDGEN_TEST_ADDRESS=127.0.0.1:8000
+  CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=<runner matching the wasm-bindgen MAJOR.MINOR.PATCH in
+  Cargo.lock> RUSTFLAGS=--cfg=web_sys_unstable_apis cargo test --target wasm32-unknown-unknown -p <crate>
+  --features opfs`. It prints `http://127.0.0.1:8000`; open that in any browser to run the tests (a worker
+  + `127.0.0.1` is a secure context, so OPFS works). The runner version **must** match the locked
+  `wasm-bindgen` version exactly or you get a "schema version" error — build the matching runner from the
+  cached crate with `cargo install wasm-bindgen-cli --version <X> --root <tmp>` if absent. To read the
+  verdict from the page, use the raw page text (`document.body.innerText`), not the accessibility tree —
+  the a11y label truncates the result line mid-word.

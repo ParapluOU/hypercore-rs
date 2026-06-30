@@ -9,3 +9,13 @@ codec = { path = "../codec" }
 merkle = { path = "../merkle" }
 identity = { path = "../identity" }
 storage = { path = "../storage" }
+
+# Pull in the storage crate's OPFS backend so the end-to-end browser persistence
+# test can run a real Hypercore over OpfsStore. wasm + Web Worker only; needs
+# RUSTFLAGS=--cfg=web_sys_unstable_apis. Never enabled on native or the default
+# wasm build.
+[features]
+opfs = ["storage/opfs"]
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

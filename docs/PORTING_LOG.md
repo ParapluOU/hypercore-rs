@@ -1915,3 +1915,28 @@ top-of-keyspace keys for metadata in a flat `u64` store.
   a fresh `OpfsStore` → verify); incremental/dirty persistence; `ManifestCore` persistence. Then the
   larger tail: JS oracle / fork-merge consensus; `Hypercore`/`ManifestCore` unification; `hyperbee`
   del/sub.
+
+---
+
+## 2026-06-30 — End-to-end OPFS persist/open in **real Chrome** (gate #2 extended)
+
+**Did**
+- Closed the persistence thread in a real browser: `hypercore::opfs_browser_tests`
+  (`#[wasm_bindgen_test]`, `run_in_dedicated_worker`) creates a `Hypercore<Vec<u8>, Bytes, OpfsStore>`,
+  appends, clears a block (sparse), `persist()`, drops it, **reopens a fresh `OpfsStore` over the same
+  OPFS file**, `Hypercore::open`, and verifies length/head/blocks + a cleared-block proof. Added a
+  hypercore `opfs` feature (`= ["storage/opfs"]`) + wasm `wasm-bindgen-test` dev-dep; `just wasm-test`
+  now runs storage **and** hypercore.
+- Ran it without chromedriver (Chrome 149 outran the driver `wasm-pack` fetches): the `NO_HEADLESS`
+  interactive `wasm-bindgen-test` server on `127.0.0.1:8000`, driven through the Claude-in-Chrome
+  integration. Result in real Chrome 149: `test result: ok. 1 passed; 0 failed` (0.37s). Needed a runner
+  matching the locked `wasm-bindgen` 0.2.126 (built from the cached crate; the stock `~/.cargo/bin` one is
+  0.2.100 → schema mismatch).
+
+**Lessons** (→ LESSONS.md) — driver-free wasm browser testing via the `NO_HEADLESS` server + runner-version
+matching; read the verdict from `document.body.innerText`, not the truncating a11y tree.
+
+**Next**
+- Incremental/dirty persistence (today `persist` rewrites all three blobs); auto-persist hook;
+  `ManifestCore` persistence. Then the larger tail: JS oracle / fork-merge consensus;
+  `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.
