@@ -1,5 +1,5 @@
 use super::*;
-use codec::{Bytes, U64};
+use codec::{Bytes, Codec, U64};
 use storage::MemoryStore;
 
 fn author(seed: u8) -> SecretKey {
