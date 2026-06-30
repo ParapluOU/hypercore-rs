@@ -807,3 +807,22 @@ the sync access handle); `OpfsStore = LogStore<OpfsFile>`.
 `MemFile` (contract, persistence-across-reopen, compaction-reclaims-space, partial-tail-dropped) — no
 browser needed — and the OPFS binding is re-verified in real headless Chrome. Supersedes ADR-0038's v1
 whole-file rewrite. Deferred: compaction tuning; wiring OPFS persistence into bitfield/snapshots.
+
+## ADR-0040 — (Speculative; NOT adopted, no work planned) Succinct-proof readiness
+**Status:** Idea only, recorded so we don't foreclose it. Nothing here is built or scheduled.
+**Observation:** A single-writer core is *already* light-verifiable — the signed head signs the Merkle
+root, so "block N exists with this content-hash, authored by key K" is one signature check plus an
+O(log n) inclusion path. What is **not** succinct is a multiwriter **linearized view**: trusting it today
+means pulling every input log and replaying the deterministic fold (linearize → apply). That replay is a
+natural candidate for **succinct verifiable computation** — a recursive SNARK / folding scheme (the fold
+is a uniform repeated step, which suits IVC/folding à la Nova), or a zkVM run over the *existing*
+deterministic Rust fold (minimal new code, high proving cost). The view could then be verified from
+`{head, proof, writer public keys}` without replay.
+**Guardrails (cheap, worth honouring now):**
+- Keep the linearization/apply a **deterministic pure function** of the signed inputs (already a goal) —
+  this is the precondition any such proof needs.
+- Keep the **hash and signature behind traits**, so a future native-circuit path could swap to
+  SNARK-friendly primitives without a rewrite (the current BLAKE3 + ed25519 are deliberately *not*
+  circuit-friendly). No swap now.
+**Non-goal:** privacy/ZK of op contents — attribution is meant to be public; the property of interest is
+succinctness (the "S" in SNARK), not zero-knowledge.
