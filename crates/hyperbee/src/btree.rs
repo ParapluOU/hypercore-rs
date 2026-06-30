@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use hypercore::{Error as HcError, Hypercore};
 use identity::SecretKey;
 use storage::Store;
@@ -306,6 +308,41 @@ impl<S: Store> Hyperbee<S> {
                 }
                 (None, None) => unreachable!(),
             }
+        }
+        Ok(out)
+    }
+
+    /// The **history** of operations (upstream `createHistoryStream`), oldest first, as
+    /// `(key, value)` — `Some(v)` is a put, `None` a delete.
+    ///
+    /// Reconstructed without per-op records: in this copy-on-write layout each op's
+    /// **root block is referenced by no other block** (roots are never pointed at), so
+    /// the unreferenced blocks, in append order, are exactly the op boundaries — and
+    /// diffing consecutive root-versions yields each op's single change. Caveats: a
+    /// *redundant* put (same value) leaves no diff and is omitted; a no-op delete
+    /// appended nothing and never appears. Eager (`O(versions × tree)`), not streaming.
+    pub fn history(&self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, Error<S>> {
+        let len = self.version();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        // A block referenced as some node's child is an interior node, not an op root.
+        let mut referenced = BTreeSet::new();
+        for seq in 0..len {
+            for &c in &self.node(seq)?.children {
+                referenced.insert(c);
+            }
+        }
+        // The op-boundary roots, in append (op) order.
+        let roots: Vec<u64> = (0..len).filter(|s| !referenced.contains(s)).collect();
+        let mut out = Vec::new();
+        let mut prev = 0u64;
+        for &r in &roots {
+            let v = r + 1;
+            for (key, _old, new) in self.diff(prev, v)? {
+                out.push((key, new));
+            }
+            prev = v;
         }
         Ok(out)
     }

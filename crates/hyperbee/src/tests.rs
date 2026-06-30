@@ -516,3 +516,40 @@ fn batch_commits_atomically_and_drop_rolls_back() {
         assert_eq!(b.get(format!("k{i:02}").as_bytes()).unwrap().as_deref(), Some(&b"v"[..]));
     }
 }
+
+#[test]
+fn history_reconstructs_the_op_sequence() {
+    let mut b = bee();
+    b.put(b"a", b"1").unwrap();
+    b.put(b"b", b"2").unwrap();
+    b.put(b"a", b"11").unwrap(); // overwrite
+    b.del(b"b").unwrap();
+    b.put(b"c", b"3").unwrap();
+
+    assert_eq!(
+        b.history().unwrap(),
+        vec![
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+            (b"a".to_vec(), Some(b"11".to_vec())), // overwrite shows the new value
+            (b"b".to_vec(), None),                 // delete
+            (b"c".to_vec(), Some(b"3".to_vec())),
+        ]
+    );
+    assert!(bee().history().unwrap().is_empty());
+}
+
+#[test]
+fn history_over_splits_records_every_put() {
+    let key = |i: u32| format!("k{i:02}").into_bytes();
+    let mut b = bee();
+    for i in 0..20u32 {
+        b.put(&key(i), &key(i)).unwrap(); // forces multi-level splits (one op = many blocks)
+    }
+    let h = b.history().unwrap();
+    assert_eq!(h.len(), 20, "20 puts → 20 history entries despite COW splits");
+    for (i, (k, v)) in h.iter().enumerate() {
+        assert_eq!(*k, key(i as u32));
+        assert_eq!(v.as_deref(), Some(key(i as u32).as_slice()));
+    }
+}

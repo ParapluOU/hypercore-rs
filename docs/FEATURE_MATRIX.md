@@ -46,7 +46,7 @@ consumer's L2, JS session/event machinery).
 | Sub-databases | `sub(prefix)` | `sub` → `Sub` | ✅ |
 | Checkout / version | `checkout(v)`, `version` | `checkout` → `Checkout`, `get_at`/`range_at`, `version` | ✅ |
 | Diff | `createDiffStream` | `diff(old, new)` | ✅ |
-| History | `createHistoryStream` | — | ✗ (one-node-per-block layout records no per-op history) |
+| History | `createHistoryStream` | `history()` (op roots = unreferenced blocks, then diff consecutive) | ✅ |
 | `getBySeq` | ✔ | — | ⛔ (entry-block addressing — N/A to our format) |
 | Watch | `watch`, `getAndWatch` | — | ⛔ (needs the live/networking layer) |
 | Header / detection | `getHeader`, `isHyperbee` | — | ⛔ (no header — ADR-0030) |
@@ -75,9 +75,9 @@ consumer's L2, JS session/event machinery).
   snapshots/multisig/move-to/persistence/user-data/purge + replication *logic*; hyperbee
   ordered-KV with checkout, sub-databases, atomic batch, diff, peek and CAS; autobase
   ordering + consensus + finality.
-- **Remaining in-scope gaps:** hyperbee history; hypercore write-stream object and
-  mark-&-sweep GC / `compact`; lazy streaming iterators (a couple of eager `Vec`s);
-  autobase dynamic indexer reconfiguration.
+- **Remaining in-scope gaps:** hypercore write-stream object and mark-&-sweep GC /
+  `compact`; lazy streaming iterators (a couple of eager `Vec`s); autobase dynamic
+  indexer reconfiguration.
 - **Deliberately out (not gaps):** networking/wire/replication-transport (→ Iroh),
   encryption, the domain `apply` fold (→ the consumer's L2), watch/live (needs the
   networking layer), JS session/event machinery, the hyperbee header block, and
