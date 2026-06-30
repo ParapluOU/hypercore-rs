@@ -146,6 +146,15 @@ pub struct Checkout<'a, S> {
     version: u64,
 }
 
+/// A prefix-namespaced view of a [`Hyperbee`] (upstream `sub`). Keys live under
+/// `prefix` in the parent tree; `Sub` transparently prepends it on writes and strips
+/// it on reads, so many sub-databases share one underlying B-tree without colliding.
+/// Created by [`Hyperbee::sub`].
+pub struct Sub<'a, S> {
+    bee: &'a mut Hyperbee<S>,
+    prefix: Vec<u8>,
+}
+
 
 mod btree;
 

@@ -384,3 +384,59 @@ fn cas_put_and_del() {
     assert!(b.del_cas(b"k", Some(b"v2")).unwrap());
     assert_eq!(b.get(b"k").unwrap(), None);
 }
+
+#[test]
+fn sub_databases_namespace_and_isolate_keys() {
+    let mut b = bee();
+    {
+        let mut users = b.sub(b"users:");
+        users.put(b"alice", b"1").unwrap();
+        users.put(b"bob", b"2").unwrap();
+    }
+    {
+        let mut posts = b.sub(b"posts:");
+        posts.put(b"alice", b"hello").unwrap(); // same suffix, different namespace
+        posts.put(b"zed", b"x").unwrap();
+    }
+
+    // isolation + prefix-stripped, ordered range
+    let users = b.sub(b"users:");
+    assert_eq!(users.get(b"alice").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(users.get(b"zed").unwrap(), None);
+    assert_eq!(
+        users.range(&Range::default()).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec![b"alice".to_vec(), b"bob".to_vec()]
+    );
+    drop(users);
+
+    let posts = b.sub(b"posts:");
+    assert_eq!(posts.get(b"alice").unwrap().as_deref(), Some(&b"hello"[..]));
+    assert_eq!(
+        posts.range(&Range::default()).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec![b"alice".to_vec(), b"zed".to_vec()]
+    );
+    drop(posts);
+
+    // bounds are relative to the sub's keys
+    let users = b.sub(b"users:");
+    assert_eq!(
+        users
+            .range(&Range { gte: Some(b"b".to_vec()), ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>(),
+        vec![b"bob".to_vec()]
+    );
+    drop(users);
+
+    // del in one namespace leaves the other untouched
+    let mut users = b.sub(b"users:");
+    assert!(users.del(b"alice").unwrap());
+    drop(users);
+    assert_eq!(b.sub(b"posts:").get(b"alice").unwrap().as_deref(), Some(&b"hello"[..]));
+
+    // under the hood the parent tree holds the prefixed keys
+    let all: Vec<Vec<u8>> = b.range(&Range::default()).unwrap().into_iter().map(|(k, _)| k).collect();
+    assert!(all.contains(&b"posts:alice".to_vec()) && all.contains(&b"users:bob".to_vec()));
+}

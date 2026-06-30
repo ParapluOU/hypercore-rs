@@ -229,6 +229,13 @@ impl<S: Store> Hyperbee<S> {
         Checkout { bee: self, root: version.checked_sub(1), version }
     }
 
+    /// A **sub-database** namespaced under `prefix` (upstream `sub`). Reads/writes
+    /// through the returned [`Sub`] are transparently prefixed, so independent
+    /// sub-databases coexist in one B-tree.
+    pub fn sub(&mut self, prefix: &[u8]) -> Sub<'_, S> {
+        Sub { bee: self, prefix: prefix.to_vec() }
+    }
+
     /// In-order traversal (yields entries in sorted key order).
     fn collect(&self, seq: u64, out: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error<S>> {
         let node = self.node(seq)?;
@@ -454,4 +461,78 @@ impl<S: Store> Checkout<'_, S> {
     pub fn range(&self, bounds: &Range) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
         self.bee.range_from(self.root, bounds)
     }
+}
+
+impl<S: Store> Sub<'_, S> {
+    /// Put `key=value` in this sub-database (stored as `prefix ++ key`).
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error<S>> {
+        let k = [self.prefix.as_slice(), key].concat();
+        self.bee.put(&k, value)
+    }
+
+    /// The value for `key` in this sub-database, or `None`.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
+        let k = [self.prefix.as_slice(), key].concat();
+        self.bee.get(&k)
+    }
+
+    /// Delete `key` from this sub-database; returns whether it was present.
+    pub fn del(&mut self, key: &[u8]) -> Result<bool, Error<S>> {
+        let k = [self.prefix.as_slice(), key].concat();
+        self.bee.del(&k)
+    }
+
+    /// Entries within `bounds`, scoped to this sub-database — `bounds` are relative to
+    /// the sub-database's keys, and result keys have `prefix` stripped.
+    pub fn range(&self, bounds: &Range) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
+        let p = self.prefix.as_slice();
+        let pre = |b: &[u8]| [p, b].concat();
+        let lower_given = bounds.gt.is_some() || bounds.gte.is_some();
+        let upper_given = bounds.lt.is_some() || bounds.lte.is_some();
+        // The namespace is `[prefix, prefix_successor)`; the user's bounds (prefixed)
+        // tighten it. With no lower/upper bound, default to the namespace edge.
+        let full = Range {
+            gt: bounds.gt.as_deref().map(pre),
+            gte: bounds
+                .gte
+                .as_deref()
+                .map(pre)
+                .or_else(|| if lower_given { None } else { Some(p.to_vec()) }),
+            lt: bounds
+                .lt
+                .as_deref()
+                .map(pre)
+                .or_else(|| if upper_given { None } else { prefix_successor(p) }),
+            lte: bounds.lte.as_deref().map(pre),
+            reverse: bounds.reverse,
+            limit: bounds.limit,
+        };
+        let n = self.prefix.len();
+        Ok(self
+            .bee
+            .range(&full)?
+            .into_iter()
+            .map(|(k, v)| (k[n..].to_vec(), v))
+            .collect())
+    }
+
+    /// The parent tree's current version.
+    pub fn version(&self) -> u64 {
+        self.bee.version()
+    }
+}
+
+/// The smallest key strictly greater than every key beginning with `prefix` — i.e.
+/// the exclusive upper bound of the prefix's namespace. `None` if `prefix` is empty
+/// or all `0xff` (the namespace runs to the end of keyspace).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut p = prefix.to_vec();
+    while let Some(last) = p.last_mut() {
+        if *last < 0xff {
+            *last += 1;
+            return Some(p);
+        }
+        p.pop();
+    }
+    None
 }
