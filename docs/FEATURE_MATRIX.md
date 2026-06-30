@@ -19,15 +19,16 @@ consumer's L2, JS session/event machinery).
 | Read | `get`, `has`, `length`, `byteLength`, `contiguousLength` | `get`, `block`, `has`, `len`, `byte_length`, `contiguous_length` | ✅ |
 | Streams | `createReadStream`, `createByteStream` | `read_stream`, `byte_stream` | ✅ |
 | `createWriteStream` | ✔ | — | ✗ |
-| Seek | `seek` | exposed via `byte_stream`; `merkle::seek` | ◑ |
+| Seek | `seek` | `seek`, `byte_stream` | ✅ |
 | Proofs / verify | `proof`, `applyProof`, `treeHash`, `signable`, `missingNodes` | `proof`, `upgrade_proof`, `verify_block`/`_head`/`_upgrade`/`_reorg`, `root_hash` | ✅ |
 | Fork detection | fork counter + proofs | `conflicting_heads`, `ForkProof` | ✅ |
 | Snapshots | `snapshot` | `snapshot`, `signed_length` | ✅ |
 | Multisig / manifest | `manifest`, multisig | `ManifestCore`, `verify_manifest_block` | ✅ |
 | Move-to / key rotation | `lib/move-to` | `prologue_at`/`with_prologue`/`copy_prologue`/`verify_prologue` | ✅ |
 | Persistence | storage/disk | `persist`/`open` (over `Store`, incl. OPFS) | ✅ |
-| `purge` / mark-&-sweep GC / `compact` | ✔ | sparse `clear` only | ✗ |
-| `setUserData` / `getUserData` | ✔ | — | ✗ |
+| `purge` | ✔ | `purge` | ✅ |
+| mark-&-sweep GC / `compact` | ✔ | sparse `clear` only | ✗ |
+| `setUserData` / `getUserData` | ✔ | `set_user_data` / `get_user_data` | ✅ |
 | Sessions | `session`, `transferSession`, `commit` | `snapshot` covers read-isolation | ◑ |
 | Replication **transport** | `replicate`, `peers`, `download`, `update` | — | ⛔ |
 | Replication **logic** | proof apply / upgrade / reorg | `Replica::add_block`/`verify_upgrade`/`reorg` | ✅ |
@@ -39,12 +40,14 @@ consumer's L2, JS session/event machinery).
 |---|---|---|---|
 | put / get / del | `put`, `get`, `del` | `put`, `get`, `del` | ✅ |
 | Range | `createRangeIterator` (lazy), `peek` | `range` (eager `Vec`; gt/gte/lt/lte/reverse/limit) | ◑ |
-| Compare-and-swap | `put`/`del` `{cas}` | — | ✗ |
-| `getBySeq` / `peek` | ✔ | — | ✗ |
-| Batch | `batch` | — | ✗ |
-| Sub-databases | `sub(prefix)` | — | ✗ |
-| Checkout / snapshot / version | `checkout(v)`, `snapshot`, `version` | `version` | ✗ (COW substrate exists) |
-| Diff / history | `createDiffStream`, `createHistoryStream` | — | ✗ |
+| Compare-and-swap | `put`/`del` `{cas}` | `put_cas` / `del_cas` | ✅ |
+| Peek | `peek` | `peek` | ✅ |
+| Batch | `batch` | `batch` → `BeeBatch` (stage / commit / drop-rollback) | ✅ |
+| Sub-databases | `sub(prefix)` | `sub` → `Sub` | ✅ |
+| Checkout / version | `checkout(v)`, `version` | `checkout` → `Checkout`, `get_at`/`range_at`, `version` | ✅ |
+| Diff | `createDiffStream` | `diff(old, new)` | ✅ |
+| History | `createHistoryStream` | — | ✗ (one-node-per-block layout records no per-op history) |
+| `getBySeq` | ✔ | — | ⛔ (entry-block addressing — N/A to our format) |
 | Watch | `watch`, `getAndWatch` | — | ⛔ (needs the live/networking layer) |
 | Header / detection | `getHeader`, `isHyperbee` | — | ⛔ (no header — ADR-0030) |
 | Replication | `replicate` | via hypercore | ⛔ |
@@ -68,12 +71,14 @@ consumer's L2, JS session/event machinery).
 
 ## Summary
 
-- **At parity (the L1 substrate, the deliverable):** hypercore write/read/proofs/
-  snapshots/multisig/move-to/persistence + replication *logic*; hyperbee ordered-KV;
-  autobase ordering + consensus + finality.
-- **In-scope gaps (the backlog):** hyperbee batch / sub-databases / checkout /
-  diff-history; hypercore write-stream / purge-GC / setUserData; autobase dynamic
-  reconfiguration; lazy streaming iterators (a couple of eager `Vec`s).
+- **At parity (the L1 substrate, the deliverable):** hypercore write/read/seek/proofs/
+  snapshots/multisig/move-to/persistence/user-data/purge + replication *logic*; hyperbee
+  ordered-KV with checkout, sub-databases, atomic batch, diff, peek and CAS; autobase
+  ordering + consensus + finality.
+- **Remaining in-scope gaps:** hyperbee history; hypercore write-stream object and
+  mark-&-sweep GC / `compact`; lazy streaming iterators (a couple of eager `Vec`s);
+  autobase dynamic indexer reconfiguration.
 - **Deliberately out (not gaps):** networking/wire/replication-transport (→ Iroh),
   encryption, the domain `apply` fold (→ the consumer's L2), watch/live (needs the
-  networking layer), JS session/event machinery, the hyperbee header block.
+  networking layer), JS session/event machinery, the hyperbee header block, and
+  `getBySeq` (entry-block addressing our format does not use).
