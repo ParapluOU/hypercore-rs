@@ -854,3 +854,26 @@ authenticated — the persisted tree still produces a verifying proof though the
 tests cover full round-trip, sparse round-trip, wrong-key, unpersisted, and tampered-metadata. Deferred:
 incremental/dirty-tracked persistence (today `persist` rewrites all three blobs); auto-persist hooks;
 `ManifestCore` persistence.
+
+## ADR-0042 — Faithful `consensus.js` port (staged); conservative `finalized()` stays the baseline
+**Context:** ADR-0015 deferred the fork/merge competition + 2-degree-lead caveat, leaving `finalized()`
+as the conservative snapshot / no-active-fork prefix. Revisiting it surfaced two facts. (1) The
+conservative rule is not merely a stopgap — it is **safe and correct for a complete DAG**: when two fork
+arms each reach a double quorum (DESIGN.md "Consistent Ordering" `a0`/`b0`, both verified degree 2), the
+correct behaviour is to wait for the merge before locking, exactly what we do; the famous "writer `a`
+locks `a0` with just `a1`" is a *local, pre-sync* view. (2) A naive "2-degree-lead" refinement is wrong
+both ways: a plain degree ≥ 2 rule is **unsafe** (an unseen lower-keyed contender with its own double
+quorum reorders an already-finalized node via the deterministic tiebreak), and "lead every incomparable
+node by 2" is **too conservative** (fails the `a0` example). The genuinely-correct rule is upstream's
+incremental confirmation machine, and DESIGN.md's "Tails, Forks and Merges" is itself `// todo`.
+**Decision:** Port `consensus.js` **faithfully** — its *behaviour*, reimplemented over our DAG (clean-room
+per CLAUDE.md, not the stateful BufferMap/Clock machine) — in committed green **stages**, keeping the
+existing safe `finalized()` as the baseline until the new machine passes the worked DESIGN examples, the
+existing quorum/finality tests, and the convergence sim (gate #3). Stages: **(1) vector clocks** over the
+DAG — `Clock` + `Linearizer::clock` (DONE); (2) DAG predicates `_strictlyNewer` / `_acks` /
+`_indexerTails` / `_isMerge`; (3) `confirms` / `_isConfirmed` / `_isConfirmableAt` / `_ackedAt`; (4) the
+`shift` / `_yieldNext` driver yielding the confirmed prefix, then swap `finalized()`/`indexed_view` onto
+it behind the same safety tests.
+**Consequence:** Each stage is independently testable; safety is never regressed — the conservative prefix
+stays live until the precise machine is proven at least as safe and strictly-or-equally as eager. Stage 1's
+clock layer is the substrate every later predicate reads.

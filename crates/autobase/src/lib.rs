@@ -53,6 +53,54 @@ impl NodeId {
     }
 }
 
+/// A **vector clock** over the DAG: for each writer, the number of that writer's
+/// nodes in some node's causal history (its `length` — highest `seq` seen + 1;
+/// absent ⇒ `0`).
+///
+/// This is the reachability form of upstream `consensus.js`'s per-node `clock`,
+/// which every confirmation predicate (`_strictlyNewer`, `_acks`, `confirms`, …)
+/// iterates. Because writers are append-only and gap-free, "saw `length` nodes of
+/// `key`" is exactly "sees `NodeId{key, length - 1}`" — so the clock is a faithful
+/// restatement of [`Linearizer::sees`], never a self-reported scalar. Built by
+/// [`Linearizer::clock`]. The L1 substrate for the faithful `consensus.js` port
+/// (ADR-0015); does not itself read a payload or a timestamp.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Clock {
+    lengths: BTreeMap<WriterKey, u64>,
+}
+
+impl Clock {
+    /// Nodes of `key` seen — the clock's `length` for `key` (`0` if unseen).
+    pub fn get(&self, key: &WriterKey) -> u64 {
+        self.lengths.get(key).copied().unwrap_or(0)
+    }
+
+    /// Has this clock seen at least `length` nodes of `key` (i.e. `NodeId{key,
+    /// length - 1}`)? `length == 0` is vacuously false — matches upstream
+    /// `clock.includes`.
+    pub fn includes(&self, key: &WriterKey, length: u64) -> bool {
+        length > 0 && self.get(key) >= length
+    }
+
+    /// Number of writers this clock has seen at least one node from.
+    pub fn writers(&self) -> usize {
+        self.lengths.len()
+    }
+
+    /// `(key, length)` pairs in ascending key order (upstream iterates `clock`).
+    pub fn iter(&self) -> impl Iterator<Item = (WriterKey, u64)> + '_ {
+        self.lengths.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// Raise `key`'s length to at least `length` (monotone join).
+    fn raise(&mut self, key: WriterKey, length: u64) {
+        let e = self.lengths.entry(key).or_insert(0);
+        if length > *e {
+            *e = length;
+        }
+    }
+}
+
 /// Why a node could not be added. Each variant is a violation of **causal
 /// delivery** — the L1 guarantee that a node arrives only after everything it
 /// references. With it upheld, the DAG is always acyclic and causally closed, so
@@ -248,6 +296,36 @@ impl Linearizer {
             }
         }
         false
+    }
+
+    /// The **vector [`Clock`]** of `node`: for every writer, the count of its nodes
+    /// in `node`'s causal history (inclusive of `node` itself). The clock form of
+    /// [`sees`](Self::sees) — `self.clock(node).includes(k, len)` is exactly
+    /// `self.sees(node, NodeId{k, len - 1})`. Returns an empty clock for an unknown
+    /// node. This is the substrate the faithful `consensus.js` port reads from
+    /// (ADR-0015); like `sees`, it is computed from DAG shape alone.
+    pub fn clock(&self, node: &NodeId) -> Clock {
+        let mut clock = Clock::default();
+        if !self.deps.contains_key(node) {
+            return clock;
+        }
+        // Walk the causal closure, recording the max seq (+1 = length) per writer.
+        // Append-only deps guarantee the closure contains every lower seq of each
+        // writer it reaches, so the max alone gives the correct length.
+        let mut stack = vec![*node];
+        let mut visited: BTreeSet<NodeId> = BTreeSet::new();
+        visited.insert(*node);
+        while let Some(v) = stack.pop() {
+            clock.raise(v.key, v.seq + 1);
+            if let Some(ds) = self.deps.get(&v) {
+                for d in ds {
+                    if visited.insert(*d) {
+                        stack.push(*d);
+                    }
+                }
+            }
+        }
+        clock
     }
 
     /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
@@ -464,6 +542,78 @@ mod tests {
 
     fn add(lin: &mut Linearizer, node: NodeId, heads: &[NodeId]) {
         lin.add(node, heads).expect("causal add must succeed");
+    }
+
+    // ---- vector clocks (consensus.js port, stage 1) -------------------------
+
+    // The clock is the reachability form of `sees`: over a fork+merge DAG, for
+    // every node, `clock.includes(k, len)` must agree with `sees(.., NodeId{k,
+    // len-1})`, and `clock.get(k)` must equal 1 + the highest seq of `k` it sees.
+    #[test]
+    fn clock_includes_agrees_with_sees_over_a_fork_merge_dag() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[]); // a0, b0 concurrent (a fork)
+        add(&mut lin, n(C, 0), &[n(A, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+        add(&mut lin, n(C, 1), &[n(B, 0)]); // c1: pred c0 + cross-ref b0 → a merge
+        add(&mut lin, n(B, 1), &[n(C, 1)]);
+
+        let nodes = lin.order();
+        for a in &nodes {
+            let clk = lin.clock(a);
+            for b in &nodes {
+                assert_eq!(
+                    clk.includes(&b.key, b.seq + 1),
+                    lin.sees(a, b),
+                    "clock/sees disagree: {a:?} sees {b:?}?"
+                );
+            }
+            for &tag in &[A, B, C] {
+                let key = wk(tag);
+                let expected = nodes
+                    .iter()
+                    .filter(|m| m.key == key && lin.sees(a, m))
+                    .map(|m| m.seq + 1)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(clk.get(&key), expected, "clock.get({tag}) at {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clock_on_the_design_chain() {
+        // a0 - b0 - c0 - a1, each seeing the previous.
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(A, 0)]);
+        add(&mut lin, n(C, 0), &[n(B, 0)]);
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+
+        // a1 sees {a0,a1}, b0, c0.
+        let c = lin.clock(&n(A, 1));
+        assert_eq!(c.get(&wk(A)), 2);
+        assert_eq!(c.get(&wk(B)), 1);
+        assert_eq!(c.get(&wk(C)), 1);
+        assert_eq!(c.writers(), 3);
+        assert!(c.includes(&wk(A), 2) && c.includes(&wk(B), 1) && c.includes(&wk(C), 1));
+        assert!(!c.includes(&wk(A), 3), "a1 hasn't seen a2");
+        assert!(!c.includes(&wk(A), 0), "length 0 is vacuously not-included");
+
+        // b0 sees only a0, b0 — never c.
+        let cb = lin.clock(&n(B, 0));
+        assert_eq!((cb.get(&wk(A)), cb.get(&wk(B)), cb.get(&wk(C))), (1, 1, 0));
+        assert!(!cb.includes(&wk(C), 1));
+    }
+
+    #[test]
+    fn clock_of_unknown_node_is_empty() {
+        let lin = indexed(&[A, B, C]);
+        let c = lin.clock(&n(A, 0));
+        assert_eq!(c.writers(), 0);
+        assert_eq!(c.get(&wk(A)), 0);
+        assert!(!c.includes(&wk(A), 1));
     }
 
     /// Every dependency must appear before its dependent in `order`.

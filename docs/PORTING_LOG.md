@@ -1966,3 +1966,28 @@ assertions after *every* op catches rebalancing bugs a few hand-written cases wo
 **Next**
 - `hyperbee` sub-databases / header(`isHyperbee`) / diff-history-watch (still deferred). Then incremental
   persistence; JS oracle / fork-merge consensus; `Hypercore`/`ManifestCore` unification.
+
+---
+
+## 2026-06-30 — autobase: faithful `consensus.js` port, stage 1 (vector clocks)
+
+**Did**
+- Began the faithful port of upstream `consensus.js` (ADR-0015's deferred fork/merge finalization), chosen
+  over a quick `finalized()` tweak after finding the naive 2-degree-lead rule is wrong both ways (unsafe
+  if too eager; fails the DESIGN `a0` example if too strict) and the conservative `finalized()` is in fact
+  safe + correct for complete DAGs. See **ADR-0042** for the analysis + the 4-stage plan.
+- **Stage 1 — the vector-clock layer** every consensus predicate reads: a `Clock` type
+  (`get`/`includes`/`iter`/`writers`) + `Linearizer::clock(node)` (a causal-closure fold), the clock form
+  of `sees`. 3 tests: clock/`sees` agreement + per-writer length correctness over a fork+merge DAG; the
+  design chain; the empty/unknown clock. The existing safe `finalized()`/`quorum_degree` are untouched.
+  Gate **191**.
+
+**Decisions** — ADR-0042 (faithful staged port; conservative `finalized()` stays the baseline).
+
+**Lessons** — when a "small refinement" to a safety-critical rule turns out subtly wrong, port the
+upstream machine faithfully in green stages rather than guessing; keep the proven-safe baseline live until
+the new path is shown ≥ as safe.
+
+**Next**
+- Stage 2: port `_strictlyNewer` / `_acks` / `_isMerge` / `_indexerTails` over the clock layer (with
+  worked-example tests), still alongside the conservative baseline.
