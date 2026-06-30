@@ -101,6 +101,17 @@ impl Clock {
     }
 }
 
+/// How an indexer's view relates to a confirmation target (upstream `consensus.js`
+/// `UNSEEN`/`NEWER`/`ACKED`): `Unseen` = no strictly-newer node of this indexer;
+/// `Newer` = it has a strictly-newer node but it does not yet see a majority of the
+/// acks; `Acked` = it has a strictly-newer node that sees a majority of the acks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Confirm {
+    Unseen,
+    Newer,
+    Acked,
+}
+
 /// Why a node could not be added. Each variant is a violation of **causal
 /// delivery** — the L1 guarantee that a node arrives only after everything it
 /// references. With it upheld, the DAG is always acyclic and causally closed, so
@@ -484,6 +495,184 @@ impl Linearizer {
         acks
     }
 
+    // ------------------------------------------------------------------------------
+    // Faithful `consensus.js` port, stage 3 — the confirmation predicates.
+    // ADR-0042. Still alongside the conservative `finalized()`; stage 4 wires the
+    // `shift` driver and swaps the public confirmed prefix onto this machine.
+    // ------------------------------------------------------------------------------
+
+    /// Number of nodes writer `key` has (`indexer.length` upstream) — the next
+    /// expected seq.
+    #[allow(dead_code)]
+    fn indexer_length(&self, key: &WriterKey) -> u64 {
+        self.next_seq.get(key).copied().unwrap_or(0)
+    }
+
+    /// How `indexer` (scanning its nodes below `length`) relates to confirming
+    /// `target` given `acks` (upstream `confirms`). Walks the indexer's nodes
+    /// newest-first for one that is [`strictly_newer`](Self::strictly_newer) than
+    /// `target` and sees a majority of `acks`. The bisect *optimisation* upstream
+    /// uses to skip the non-strictly-newer cluster is omitted — scanning every node
+    /// is behaviour-identical.
+    #[allow(dead_code)]
+    fn confirms(
+        &self,
+        indexer: WriterKey,
+        target: &NodeId,
+        acks: &[NodeId],
+        length: u64,
+        removed: &Clock,
+    ) -> Confirm {
+        let Some(majority) = self.majority() else {
+            return Confirm::Unseen;
+        };
+        if length == 0 || removed.get(&indexer) >= length {
+            return Confirm::Unseen;
+        }
+        let mut newer = true;
+        let mut i = length as i64 - 1;
+        while i >= 0 {
+            let head = NodeId::new(indexer, i as u64);
+            if !self.contains(&head) {
+                return Confirm::Unseen;
+            }
+            let mut seen = 0usize;
+            for a in acks {
+                if self.sees(&head, a) {
+                    seen += 1;
+                    if seen >= majority {
+                        break;
+                    }
+                }
+            }
+            if !newer && seen < majority {
+                break;
+            }
+            if !self.strictly_newer(target, &head, removed) {
+                newer = false;
+                i -= 1;
+                continue;
+            } else if seen < majority {
+                return Confirm::Newer;
+            }
+            return Confirm::Acked;
+        }
+        Confirm::Unseen
+    }
+
+    /// Whether a majority of `acks` are seen by `parent` (upstream `_ackedAt`).
+    #[allow(dead_code)]
+    fn acked_at(&self, acks: &[NodeId], parent: &NodeId) -> bool {
+        let Some(majority) = self.majority() else {
+            return false;
+        };
+        let mut seen = 0usize;
+        let mut missing = acks.len();
+        for node in acks {
+            missing -= 1;
+            if !self.sees(parent, node) {
+                if seen + missing < majority {
+                    return false;
+                }
+                continue;
+            }
+            seen += 1;
+            if seen >= majority {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `target` is **confirmed** (upstream `_isConfirmed`): it has a
+    /// majority of acks and either a majority of indexers `Acked`-confirm it, or —
+    /// at the top level (`parent == None`) — every indexer is at least `Newer`
+    /// (none `Unseen`). With a `parent`, defers to
+    /// [`is_confirmable_at`](Self::is_confirmable_at) (used by the stage-4 merge
+    /// walk). This is the precise rule the conservative `finalized()` approximates.
+    #[allow(dead_code)]
+    fn is_confirmed(&self, target: &NodeId, parent: Option<&NodeId>, removed: &Clock) -> bool {
+        let Some(majority) = self.majority() else {
+            return false;
+        };
+        let indexers = self.indexers.as_ref().expect("majority ⇒ indexers");
+        let acks = self.acks(target, removed);
+        if acks.len() < majority {
+            return false;
+        }
+        let mut confs: BTreeSet<WriterKey> = BTreeSet::new();
+        let mut all_newer = true;
+        for &indexer in indexers {
+            let length = match parent {
+                // parent.length - 1 for its own writer, else what parent saw of it
+                Some(p) if p.key == indexer => p.seq,
+                Some(p) => self.clock(p).get(&indexer),
+                None => self.indexer_length(&indexer),
+            };
+            match self.confirms(indexer, target, &acks, length, removed) {
+                Confirm::Acked => {
+                    confs.insert(indexer);
+                    if confs.len() >= majority {
+                        return true;
+                    }
+                }
+                Confirm::Unseen => all_newer = false,
+                Confirm::Newer => {}
+            }
+        }
+        match parent {
+            Some(p) => self.is_confirmable_at(target, p, &acks, &confs, removed),
+            None => all_newer,
+        }
+    }
+
+    /// Whether `target` can still be confirmed *relative to a parent* given the
+    /// indexers that already `confs` it (upstream `_isConfirmableAt`): the acks are
+    /// acked at `parent`, and enough not-yet-confirming indexers remain that could
+    /// still confirm it (those `target` already saw, or whose next node is
+    /// strictly-newer).
+    #[allow(dead_code)]
+    fn is_confirmable_at(
+        &self,
+        target: &NodeId,
+        parent: &NodeId,
+        acks: &[NodeId],
+        confs: &BTreeSet<WriterKey>,
+        removed: &Clock,
+    ) -> bool {
+        let Some(majority) = self.majority() else {
+            return false;
+        };
+        let indexers = self.indexers.as_ref().expect("majority ⇒ indexers");
+        if !self.acked_at(acks, parent) {
+            return false;
+        }
+        let mut potential = confs.len();
+        let pclk = self.clock(parent);
+        let tclk = self.clock(target);
+        for &indexer in indexers {
+            if confs.contains(&indexer) {
+                continue;
+            }
+            let length = pclk.get(&indexer);
+            let is_seen = tclk.includes(&indexer, length);
+            if !is_seen && length >= 1 {
+                let head = NodeId::new(indexer, length - 1);
+                if self.contains(&head)
+                    && !removed.includes(&head.key, head.seq + 1)
+                    && !self.strictly_newer(target, &head, removed)
+                {
+                    continue;
+                }
+            }
+            potential += 1;
+            if potential >= majority {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
     ///
     /// A **vote** is a reference from an indexer to a node (at most one per
@@ -863,6 +1052,64 @@ mod tests {
                     assert!(fm.sees(p, o), "strictly_newer({o:?}, {p:?}) but !sees");
                 }
             }
+        }
+    }
+
+    // ---- consensus.js confirmation (stage 3) --------------------------------
+
+    // On a fork-free DAG the precise `is_confirmed` set must coincide exactly with
+    // the conservative `finalized()` prefix — the strongest available cross-check.
+    #[test]
+    fn is_confirmed_matches_double_quorum_on_a_chain() {
+        let lin = chain();
+        let fin: BTreeSet<NodeId> = lin.finalized().into_iter().collect();
+        for node in lin.order() {
+            assert_eq!(
+                lin.is_confirmed(&node, None, &empty()),
+                fin.contains(&node),
+                "is_confirmed vs finalized disagree for {node:?} (fork-free ⇒ equal)"
+            );
+        }
+        assert!(lin.is_confirmed(&n(A, 0), None, &empty()));
+        assert!(lin.is_confirmed(&n(B, 0), None, &empty()));
+        assert!(!lin.is_confirmed(&n(C, 0), None, &empty()), "c0 only single-quorum");
+        assert!(!lin.is_confirmed(&n(A, 1), None, &empty()));
+    }
+
+    // DESIGN "Condition for Consistency": competing single quorums never confirm.
+    #[test]
+    fn is_confirmed_rejects_competing_single_quorums() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(C, 0), &[]);
+        add(&mut lin, n(C, 1), &[n(A, 0)]);
+        add(&mut lin, n(B, 0), &[n(C, 0)]);
+        assert!(!lin.is_confirmed(&n(A, 0), None, &empty()));
+        assert!(!lin.is_confirmed(&n(C, 0), None, &empty()));
+    }
+
+    // DESIGN "Higher Quorums": the double quorum over c0 confirms it; b0 (single) not.
+    #[test]
+    fn is_confirmed_on_the_higher_quorum_example() {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(C, 0), &[]);
+        add(&mut lin, n(B, 0), &[n(C, 0)]);
+        add(&mut lin, n(C, 1), &[n(B, 0)]);
+        assert!(lin.is_confirmed(&n(C, 0), None, &empty()), "double quorum confirms c0");
+        assert!(!lin.is_confirmed(&n(B, 0), None, &empty()), "b0 only single-quorum");
+    }
+
+    // The precise machine is never *less* eager than the conservative baseline:
+    // everything `finalized()` commits, `is_confirmed` also confirms — even across a
+    // fork.
+    #[test]
+    fn finalized_is_a_subset_of_confirmed_across_a_fork() {
+        let lin = fork_merge();
+        for node in lin.finalized() {
+            assert!(
+                lin.is_confirmed(&node, None, &empty()),
+                "{node:?} finalized ⇒ confirmed"
+            );
         }
     }
 

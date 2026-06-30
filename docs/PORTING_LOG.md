@@ -2011,3 +2011,26 @@ the new path is shown ≥ as safe.
 **Next**
 - Stage 3: `confirms` / `_isConfirmed` / `_isConfirmableAt` / `_ackedAt` on top of `acks` +
   `strictly_newer`, validated against the DESIGN single-/double-quorum examples.
+
+---
+
+## 2026-06-30 — autobase: faithful `consensus.js` port, stage 3 (confirmation)
+
+**Did**
+- Ported the confirmation predicates over stage 2: a `Confirm` enum (`Unseen`/`Newer`/`Acked`) +
+  `confirms` (scan an indexer's nodes newest-first for one strictly-newer than the target that sees a
+  majority of the acks; bisect optimisation omitted as behaviour-identical), `acked_at` (majority of acks
+  seen by a parent), `is_confirmed` (majority of acks + either a majority of indexers `Acked` or, at top
+  level, every indexer ≥ `Newer`), and `is_confirmable_at` (the parent-relative form the stage-4 merge
+  walk will use).
+- 4 tests, with a strong cross-check: on a **fork-free** chain the precise `is_confirmed` set coincides
+  **exactly** with the conservative `finalized()` prefix (asserted node-by-node); competing single quorums
+  are rejected (DESIGN "Condition for Consistency"); the higher-quorum example confirms `c0` not `b0`; and
+  `finalized() ⊆ is_confirmed` even across a fork (precise is never *less* eager). All confirmation values
+  hand-derived from `consensus.js`, then asserted. Conservative `finalized()` still the live baseline.
+  Gate **199**, 0 warnings.
+
+**Next**
+- Stage 4: the `shift` / `_yieldNext` driver — iterate confirmed tails/merges into the indexed sequence,
+  threading the growing `removed` clock; then swap `finalized()`/`indexed_view` onto it behind the worked
+  examples + the convergence sim (gate #3), and drop the stage-2/3 `allow(dead_code)`.
