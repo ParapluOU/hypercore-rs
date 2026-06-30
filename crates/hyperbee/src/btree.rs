@@ -32,10 +32,14 @@ impl<S: Store> Hyperbee<S> {
 
     /// The value for `key`, or `None`.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
-        let mut seq = match self.root_seq() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+        match self.root_seq() {
+            Some(r) => self.get_from(r, key),
+            None => Ok(None),
+        }
+    }
+
+    /// Descend the subtree rooted at `seq` looking up `key`.
+    fn get_from(&self, mut seq: u64, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
         loop {
             let node = self.node(seq)?;
             match node.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
@@ -48,6 +52,46 @@ impl<S: Store> Hyperbee<S> {
                 }
             }
         }
+    }
+
+    /// The root block seq for a hyperbee `version` (a value from [`version`](Self::version)
+    /// or a prior op — i.e. an op boundary, where the latest block *is* the root).
+    /// `version 0` ⇒ empty; clamped to the current version.
+    fn root_at(&self, version: u64) -> Option<u64> {
+        version.min(self.version()).checked_sub(1)
+    }
+
+    /// [`get`](Self::get) as of a past `version` (upstream `checkout(v).get`).
+    pub fn get_at(&self, version: u64, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
+        match self.root_at(version) {
+            Some(r) => self.get_from(r, key),
+            None => Ok(None),
+        }
+    }
+
+    /// Put `key=value` **only if** its current value equals `expected` (`None` = the
+    /// key is currently absent) — a value-equality compare-and-swap (upstream
+    /// `put(k, v, { cas })`). Returns whether it applied.
+    pub fn put_cas(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        expected: Option<&[u8]>,
+    ) -> Result<bool, Error<S>> {
+        if self.get(key)?.as_deref() != expected {
+            return Ok(false);
+        }
+        self.put(key, value)?;
+        Ok(true)
+    }
+
+    /// Delete `key` **only if** its current value equals `expected` — a
+    /// compare-and-swap delete. Returns whether it applied.
+    pub fn del_cas(&mut self, key: &[u8], expected: Option<&[u8]>) -> Result<bool, Error<S>> {
+        if self.get(key)?.as_deref() != expected {
+            return Ok(false);
+        }
+        self.del(key)
     }
 
     /// Insert or overwrite `key`.
@@ -130,11 +174,38 @@ impl<S: Store> Hyperbee<S> {
 
     /// All entries in key order within `bounds` (honouring reverse + limit).
     pub fn range(&self, bounds: &Range) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
+        self.range_from(self.root_seq(), bounds)
+    }
+
+    /// [`range`](Self::range) as of a past `version` (upstream `checkout(v)` range).
+    pub fn range_at(
+        &self,
+        version: u64,
+        bounds: &Range,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
+        self.range_from(self.root_at(version), bounds)
+    }
+
+    /// The first entry within `bounds` (in iteration order), or `None` — upstream
+    /// `peek`. Honours `reverse` (so reverse-peek yields the last entry).
+    pub fn peek(&self, bounds: &Range) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error<S>> {
+        Ok(self
+            .range_from(self.root_seq(), &Range { limit: Some(1), ..bounds.clone() })?
+            .into_iter()
+            .next())
+    }
+
+    /// All entries under `root` (the current root if `None`), filtered and ordered by
+    /// `bounds` (bytewise).
+    fn range_from(
+        &self,
+        root: Option<u64>,
+        bounds: &Range,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
         let mut out = Vec::new();
-        if let Some(root) = self.root_seq() {
-            self.collect(root, &mut out)?;
+        if let Some(r) = root {
+            self.collect(r, &mut out)?;
         }
-        // Filter by bounds (bytewise).
         out.retain(|(k, _)| {
             let k = k.as_slice();
             bounds.gt.as_deref().map_or(true, |g| k > g)
@@ -149,6 +220,13 @@ impl<S: Store> Hyperbee<S> {
             out.truncate(limit);
         }
         Ok(out)
+    }
+
+    /// A read-only view of the tree as of a past `version` (upstream `checkout`). The
+    /// `version` is a value from [`version`](Self::version) or a prior op.
+    pub fn checkout(&self, version: u64) -> Checkout<'_, S> {
+        let version = version.min(self.version());
+        Checkout { bee: self, root: version.checked_sub(1), version }
     }
 
     /// In-order traversal (yields entries in sorted key order).
@@ -355,5 +433,25 @@ impl<S: Store> Hyperbee<S> {
             node = self.node(c)?;
         }
         Ok(node.entries.len())
+    }
+}
+
+impl<S: Store> Checkout<'_, S> {
+    /// The version this view is anchored at.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The value for `key` as of this version, or `None`.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
+        match self.root {
+            Some(r) => self.bee.get_from(r, key),
+            None => Ok(None),
+        }
+    }
+
+    /// All entries within `bounds` as of this version (bytewise order).
+    pub fn range(&self, bounds: &Range) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error<S>> {
+        self.bee.range_from(self.root, bounds)
     }
 }

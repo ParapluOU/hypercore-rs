@@ -134,6 +134,18 @@ pub struct Hyperbee<S> {
     core: Hypercore<Node, NodeCodec, S>,
 }
 
+/// A read-only view of a [`Hyperbee`] as of a past version (upstream `checkout`).
+/// Created by [`Hyperbee::checkout`]; offers [`get`](Checkout::get) and
+/// [`range`](Checkout::range) against the tree as it was at that version. Because
+/// the tree is copy-on-write, every historic root block is still present, so a
+/// checkout is just a read anchored at that root — no copy.
+pub struct Checkout<'a, S> {
+    bee: &'a Hyperbee<S>,
+    /// Root block seq of the checked-out version (`None` for the empty version 0).
+    root: Option<u64>,
+    version: u64,
+}
+
 
 mod btree;
 

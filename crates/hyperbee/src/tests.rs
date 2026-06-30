@@ -316,3 +316,71 @@ fn del_then_get_and_range_stay_consistent_under_reinsert() {
         all
     );
 }
+
+// ---- checkout / get_at / range_at / peek / cas (gap-fill) -----------------
+
+#[test]
+fn checkout_reads_a_historic_version() {
+    let mut b = bee();
+    b.put(b"a", b"1").unwrap();
+    b.put(b"b", b"2").unwrap();
+    let v = b.version(); // an op-boundary version
+    b.put(b"c", b"3").unwrap();
+    b.put(b"a", b"updated").unwrap();
+
+    // current sees all + the overwrite
+    assert_eq!(b.get(b"a").unwrap().as_deref(), Some(&b"updated"[..]));
+    assert_eq!(b.get(b"c").unwrap().as_deref(), Some(&b"3"[..]));
+
+    // the checkout sees the tree as it was: a=1, b=2, no c
+    let co = b.checkout(v);
+    assert_eq!(co.version(), v);
+    assert_eq!(co.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(co.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(co.get(b"c").unwrap(), None);
+    let keys: Vec<Vec<u8>> = co.range(&Range::default()).unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+
+    // get_at / range_at convenience, and version 0 = empty
+    assert_eq!(b.get_at(v, b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(b.get_at(v, b"c").unwrap(), None);
+    assert_eq!(b.range_at(v, &Range::default()).unwrap().len(), 2);
+    assert_eq!(b.checkout(0).get(b"a").unwrap(), None);
+}
+
+#[test]
+fn peek_returns_first_or_last_within_bounds() {
+    let key = |i: u32| format!("k{i:02}").into_bytes();
+    let mut b = bee();
+    for i in (0..10u32).rev() {
+        b.put(&key(i), &key(i)).unwrap();
+    }
+    assert_eq!(b.peek(&Range::default()).unwrap(), Some((key(0), key(0))));
+    assert_eq!(
+        b.peek(&Range { reverse: true, ..Default::default() }).unwrap(),
+        Some((key(9), key(9)))
+    );
+    assert_eq!(
+        b.peek(&Range { gte: Some(key(5)), ..Default::default() }).unwrap(),
+        Some((key(5), key(5)))
+    );
+    assert_eq!(bee().peek(&Range::default()).unwrap(), None);
+}
+
+#[test]
+fn cas_put_and_del() {
+    let mut b = bee();
+    // expected-absent applies once, then fails (key now present)
+    assert!(b.put_cas(b"k", b"v1", None).unwrap());
+    assert!(!b.put_cas(b"k", b"v2", None).unwrap());
+    assert_eq!(b.get(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
+    // matching value swaps; mismatching value is a no-op
+    assert!(b.put_cas(b"k", b"v2", Some(b"v1")).unwrap());
+    assert!(!b.put_cas(b"k", b"v3", Some(b"WRONG")).unwrap());
+    assert_eq!(b.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+    // del only on a value match
+    assert!(!b.del_cas(b"k", Some(b"WRONG")).unwrap());
+    assert!(b.get(b"k").unwrap().is_some());
+    assert!(b.del_cas(b"k", Some(b"v2")).unwrap());
+    assert_eq!(b.get(b"k").unwrap(), None);
+}
