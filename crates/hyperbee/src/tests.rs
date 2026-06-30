@@ -440,3 +440,37 @@ fn sub_databases_namespace_and_isolate_keys() {
     let all: Vec<Vec<u8>> = b.range(&Range::default()).unwrap().into_iter().map(|(k, _)| k).collect();
     assert!(all.contains(&b"posts:alice".to_vec()) && all.contains(&b"users:bob".to_vec()));
 }
+
+#[test]
+fn diff_between_versions_reports_add_change_delete() {
+    let mut b = bee();
+    b.put(b"a", b"1").unwrap();
+    b.put(b"b", b"2").unwrap();
+    b.put(b"c", b"3").unwrap();
+    let v1 = b.version();
+    b.put(b"b", b"22").unwrap(); // change
+    b.put(b"d", b"4").unwrap(); // add
+    b.del(b"a").unwrap(); // delete
+    let v2 = b.version();
+
+    // changes from v1 -> v2, in key order; unchanged `c` is omitted
+    assert_eq!(
+        b.diff(v1, v2).unwrap(),
+        vec![
+            (b"a".to_vec(), Some(b"1".to_vec()), None),
+            (b"b".to_vec(), Some(b"2".to_vec()), Some(b"22".to_vec())),
+            (b"d".to_vec(), None, Some(b"4".to_vec())),
+        ]
+    );
+    // a version against itself has no diff
+    assert!(b.diff(v2, v2).unwrap().is_empty());
+    // reversed diff swaps old/new
+    assert_eq!(
+        b.diff(v2, v1).unwrap(),
+        vec![
+            (b"a".to_vec(), None, Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"22".to_vec()), Some(b"2".to_vec())),
+            (b"d".to_vec(), Some(b"4".to_vec()), None),
+        ]
+    );
+}

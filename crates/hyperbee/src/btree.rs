@@ -236,6 +236,51 @@ impl<S: Store> Hyperbee<S> {
         Sub { bee: self, prefix: prefix.to_vec() }
     }
 
+    /// The **diff** between two versions (upstream `createDiffStream`): every key whose
+    /// value changed going from `old` to `new`, as `(key, old_value, new_value)` in key
+    /// order. `old_value == None` ⇒ the key was added; `new_value == None` ⇒ it was
+    /// deleted; both `Some` (and unequal) ⇒ changed. Unchanged keys are omitted.
+    pub fn diff(
+        &self,
+        old: u64,
+        new: u64,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>, Error<S>> {
+        // Both sides come back sorted by key, so a linear merge finds the differences.
+        let a = self.range_at(old, &Range::default())?;
+        let b = self.range_at(new, &Range::default())?;
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() || j < b.len() {
+            match (a.get(i), b.get(j)) {
+                (Some((ka, va)), Some((kb, vb))) => {
+                    if ka < kb {
+                        out.push((ka.clone(), Some(va.clone()), None));
+                        i += 1;
+                    } else if ka > kb {
+                        out.push((kb.clone(), None, Some(vb.clone())));
+                        j += 1;
+                    } else {
+                        if va != vb {
+                            out.push((ka.clone(), Some(va.clone()), Some(vb.clone())));
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                }
+                (Some((ka, va)), None) => {
+                    out.push((ka.clone(), Some(va.clone()), None));
+                    i += 1;
+                }
+                (None, Some((kb, vb))) => {
+                    out.push((kb.clone(), None, Some(vb.clone())));
+                    j += 1;
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        Ok(out)
+    }
+
     /// In-order traversal (yields entries in sorted key order).
     fn collect(&self, seq: u64, out: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error<S>> {
         let node = self.node(seq)?;
