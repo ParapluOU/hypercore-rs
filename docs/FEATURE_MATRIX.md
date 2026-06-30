@@ -39,7 +39,7 @@ consumer's L2, JS session/event machinery).
 | Capability | upstream | port | |
 |---|---|---|---|
 | put / get / del | `put`, `get`, `del` | `put`, `get`, `del` | ✅ |
-| Range | `createRangeIterator` (lazy), `peek` | `range` (eager `Vec`; gt/gte/lt/lte/reverse/limit) | ◑ |
+| Range | `createRangeIterator` (lazy) | `range` (eager) + **`iter` → `RangeIter`** (lazy, on-demand, early-stop); gt/gte/lt/lte/reverse/limit | ✅ |
 | Compare-and-swap | `put`/`del` `{cas}` | `put_cas` / `del_cas` | ✅ |
 | Peek | `peek` | `peek` | ✅ |
 | Batch | `batch` | `batch` → `BeeBatch` (stage / commit / drop-rollback) | ✅ |
@@ -76,8 +76,8 @@ consumer's L2, JS session/event machinery).
   ordered-KV with checkout, sub-databases, atomic batch, diff, peek and CAS; autobase
   ordering + consensus + finality.
 - **Remaining in-scope gaps:** hypercore write-stream object and mark-&-sweep GC /
-  `compact`; lazy streaming iterators (a couple of eager `Vec`s); autobase dynamic
-  indexer reconfiguration.
+  `compact`; autobase dynamic indexer reconfiguration. (`diff`/`history` stay eager —
+  they are inherently whole-set operations, not streaming.)
 - **Deliberately out (not gaps):** networking/wire/replication-transport (→ Iroh),
   encryption, the domain `apply` fold (→ the consumer's L2), watch/live (needs the
   networking layer), JS session/event machinery, the hyperbee header block, and

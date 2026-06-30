@@ -167,6 +167,26 @@ pub struct Sub<'a, S> {
     prefix: Vec<u8>,
 }
 
+/// A **lazy** in-order iterator over a [`Hyperbee`]'s entries within a [`Range`]
+/// (upstream `createRangeIterator` / `createReadStream`). Yields `Result<(key,
+/// value), _>` on demand via an explicit traversal stack — no full `Vec` is
+/// materialized — so it honours `limit` and supports **early termination**
+/// (`take` / `break`), reading only the nodes it visits. Created by
+/// [`Hyperbee::iter`].
+pub struct RangeIter<'a, S> {
+    bee: &'a Hyperbee<S>,
+    /// Traversal stack of `(node, next slot)`. For an internal node, even slots are
+    /// children (descend) and odd slots are entries (emit); both mirrored when
+    /// `bounds.reverse`.
+    stack: Vec<(Node, usize)>,
+    /// Root block to seed the stack with on the first `next` (so construction reads
+    /// nothing and a root-read error surfaces from the iterator).
+    start: Option<u64>,
+    bounds: Range,
+    remaining: Option<usize>,
+    done: bool,
+}
+
 
 mod btree;
 

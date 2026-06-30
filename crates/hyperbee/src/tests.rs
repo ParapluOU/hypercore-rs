@@ -553,3 +553,45 @@ fn history_over_splits_records_every_put() {
         assert_eq!(v.as_deref(), Some(key(i as u32).as_slice()));
     }
 }
+
+#[test]
+fn lazy_iter_matches_eager_range_and_terminates_early() {
+    let key = |i: u32| format!("k{i:02}").into_bytes();
+    let mut b = bee();
+    for i in (0..20u32).rev() {
+        b.put(&key(i), &key(i)).unwrap(); // multi-level tree
+    }
+
+    // forward + reverse full traversal
+    let fwd: Vec<Vec<u8>> = b.iter(&Range::default()).map(|e| e.unwrap().0).collect();
+    assert_eq!(fwd, (0..20).map(key).collect::<Vec<_>>());
+    let rev: Vec<Vec<u8>> = b
+        .iter(&Range { reverse: true, ..Default::default() })
+        .map(|e| e.unwrap().0)
+        .collect();
+    assert_eq!(rev, (0..20).rev().map(key).collect::<Vec<_>>());
+
+    // bounded + limit
+    let mid: Vec<Vec<u8>> = b
+        .iter(&Range { gte: Some(key(5)), lt: Some(key(15)), limit: Some(3), ..Default::default() })
+        .map(|e| e.unwrap().0)
+        .collect();
+    assert_eq!(mid, vec![key(5), key(6), key(7)]);
+
+    // agrees with eager range() across several bound shapes
+    for bounds in [
+        Range::default(),
+        Range { gt: Some(key(3)), lte: Some(key(8)), reverse: true, ..Default::default() },
+        Range { gte: Some(key(10)), limit: Some(4), ..Default::default() },
+        Range { lt: Some(key(2)), ..Default::default() },
+    ] {
+        let lazy: Vec<_> = b.iter(&bounds).map(|e| e.unwrap()).collect();
+        assert_eq!(lazy, b.range(&bounds).unwrap(), "lazy iter must match eager range");
+    }
+
+    // early termination + degenerate cases
+    let two: Vec<Vec<u8>> = b.iter(&Range::default()).take(2).map(|e| e.unwrap().0).collect();
+    assert_eq!(two, vec![key(0), key(1)]);
+    assert_eq!(b.iter(&Range { limit: Some(0), ..Default::default() }).count(), 0);
+    assert_eq!(bee().iter(&Range::default()).count(), 0);
+}

@@ -226,6 +226,22 @@ impl<S: Store> Hyperbee<S> {
             .next())
     }
 
+    /// A **lazy** in-order iterator over the entries within `bounds` (upstream
+    /// `createRangeIterator` / `createReadStream`). Unlike [`range`](Self::range) — which
+    /// materializes a `Vec` — this reads nodes on demand and stops early under `limit`
+    /// or when the consumer stops pulling (e.g. `.iter(b).take(n)` / `break`). Each item
+    /// is a `Result`, since a node read can fail.
+    pub fn iter(&self, bounds: &Range) -> RangeIter<'_, S> {
+        RangeIter {
+            bee: self,
+            stack: Vec::new(),
+            start: self.root_seq(),
+            bounds: bounds.clone(),
+            remaining: bounds.limit,
+            done: false,
+        }
+    }
+
     /// All entries under `root` (the current root if `None`), filtered and ordered by
     /// `bounds` (bytewise).
     fn range_from(
@@ -688,5 +704,97 @@ impl<S> Drop for BeeBatch<'_, S> {
     fn drop(&mut self) {
         // An uncommitted batch discards its staged writes — nothing reached the core.
         self.bee.pending = None;
+    }
+}
+
+impl<S: Store> RangeIter<'_, S> {
+    fn in_bounds(&self, k: &[u8]) -> bool {
+        let b = &self.bounds;
+        b.gt.as_deref().map_or(true, |g| k > g)
+            && b.gte.as_deref().map_or(true, |g| k >= g)
+            && b.lt.as_deref().map_or(true, |l| k < l)
+            && b.lte.as_deref().map_or(true, |l| k <= l)
+    }
+
+    fn dec_limit(&mut self) {
+        if let Some(r) = self.remaining.as_mut() {
+            *r -= 1;
+            if *r == 0 {
+                self.done = true;
+            }
+        }
+    }
+}
+
+impl<S: Store> Iterator for RangeIter<'_, S> {
+    type Item = Result<(Vec<u8>, Vec<u8>), Error<S>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.remaining == Some(0) {
+            self.done = true;
+            return None;
+        }
+        // Seed the root lazily on the first pull, surfacing any read error here.
+        if let Some(root) = self.start.take() {
+            match self.bee.node(root) {
+                Ok(n) => self.stack.push((n, 0)),
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        let reverse = self.bounds.reverse;
+        loop {
+            let Some(frame) = self.stack.len().checked_sub(1) else {
+                self.done = true;
+                return None;
+            };
+            let is_leaf = self.stack[frame].0.is_leaf();
+            let n = self.stack[frame].0.entries.len();
+            let slot = self.stack[frame].1;
+            if is_leaf {
+                if slot >= n {
+                    self.stack.pop();
+                    continue;
+                }
+                self.stack[frame].1 += 1;
+                let idx = if reverse { n - 1 - slot } else { slot };
+                let (k, v) = self.stack[frame].0.entries[idx].clone();
+                if self.in_bounds(&k) {
+                    self.dec_limit();
+                    return Some(Ok((k, v)));
+                }
+            } else if slot > 2 * n {
+                self.stack.pop();
+            } else {
+                self.stack[frame].1 += 1;
+                if slot % 2 == 0 {
+                    // even slot ⇒ descend a child
+                    let k = slot / 2;
+                    let child_idx = if reverse { n - k } else { k };
+                    let cs = self.stack[frame].0.children[child_idx];
+                    match self.bee.node(cs) {
+                        Ok(child) => self.stack.push((child, 0)),
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    }
+                } else {
+                    // odd slot ⇒ emit an entry
+                    let k = slot / 2;
+                    let idx = if reverse { n - 1 - k } else { k };
+                    let (key, val) = self.stack[frame].0.entries[idx].clone();
+                    if self.in_bounds(&key) {
+                        self.dec_limit();
+                        return Some(Ok((key, val)));
+                    }
+                }
+            }
+        }
     }
 }
