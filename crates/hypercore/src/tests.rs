@@ -2084,3 +2084,21 @@ fn persist_and_open_over_the_log_structured_store() {
     let proof = reopened.proof(2).expect("cleared block still proves");
     assert!(verify_block(&pk, reopened.head().unwrap(), 2, &Bytes.encode(&blk("ccc")), &proof));
 }
+
+#[test]
+fn seek_locates_the_block_for_a_byte_offset() {
+    let mut core = Hypercore::<Vec<u8>, _, _>::new(author(76), Bytes, MemoryStore::new());
+    for v in ["aa", "bbb", "c", "dddd"] {
+        core.append(&blk(v)).unwrap();
+    }
+    // the start byte of each block (over encoded sizes) seeks to (i, 0)
+    assert_eq!(core.seek(0), (0, 0));
+    let mut offset = 0u64;
+    for i in 0..4u64 {
+        assert_eq!(core.seek(offset), (i, 0), "start of block {i}");
+        offset += core.block(i).unwrap().unwrap().len() as u64;
+    }
+    // at the end → (len, 0); past the end → (len, leftover bytes)
+    assert_eq!(core.seek(core.byte_length()), (4, 0));
+    assert_eq!(core.seek(core.byte_length() + 100), (4, 100));
+}

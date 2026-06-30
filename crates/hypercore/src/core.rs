@@ -93,6 +93,13 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         self.tree.byte_length()
     }
 
+    /// Locate the block containing byte offset `byte_offset` (over the *encoded*
+    /// blocks): returns `(block_index, offset_within_block)`, tree-accelerated
+    /// (upstream `seek`). An offset at or past the end returns `(len, 0)`.
+    pub fn seek(&self, byte_offset: u64) -> (u64, u64) {
+        self.tree.seek(byte_offset)
+    }
+
     /// The truncation performed by the immediately preceding operation, or `None`
     /// if the last operation was an append/commit (which clears it).
     pub fn last_truncation(&self) -> Option<Truncation> {
