@@ -2034,3 +2034,26 @@ the new path is shown ≥ as safe.
 - Stage 4: the `shift` / `_yieldNext` driver — iterate confirmed tails/merges into the indexed sequence,
   threading the growing `removed` clock; then swap `finalized()`/`indexed_view` onto it behind the worked
   examples + the convergence sim (gate #3), and drop the stage-2/3 `allow(dead_code)`.
+
+---
+
+## 2026-06-30 — autobase: faithful `consensus.js` port, stage 4 (the `shift` driver)
+
+**Did**
+- Ported the `shift` / `_yieldNext` driver: `merge_nodes` / `tails_seen` / `tails_and_merges_seen` /
+  `yield_next` / `shift_once`, plus `confirmed_prefix` — which drives `shift` from scratch (a `removed`
+  clock that grows as nodes confirm) until nothing more confirms, accumulating the indexed sequence. This
+  is now the **whole machine**, end to end. `confirmed_prefix` being `pub` and using every stage-2/3
+  predicate, the `allow(dead_code)` scaffolding is **gone** (0 warnings).
+- 3 tests: `confirmed_prefix` == `finalized()` on a fork-free chain (and both empty on competing single
+  quorums); causal closure (every confirmed node's deps appear strictly earlier) over chain / fork_merge /
+  a deep merged fork; and — the headline — on a **merged-and-double-quorum'd fork** the machine confirms
+  the merged arms `{a0,b0,c0}` and the prefix is **strictly longer** than the conservative `finalized()`,
+  exercising the merge-resolving `yield_next`. The conservative `finalized()` is still the live baseline.
+  Gate **202**.
+
+**Next (the swap — the closing step)**
+- Make `finalized()` / `indexed_view` delegate to `confirmed_prefix`, then re-validate against the
+  convergence sim (gate #3, the finality-stability safety net) and reconcile with `order()` (confirmed
+  order vs the priority-Kahn linearization on fork arms). Deliberate, behaviour-changing — done as its own
+  focused pass, not rushed.

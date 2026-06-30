@@ -354,7 +354,6 @@ impl Linearizer {
     /// latest of its nodes that `node` saw (its own previous node for `node`'s own
     /// writer), skip any already-confirmed, and ask whether ≥ 2 of those heads are
     /// mutually independent (an antichain of size > 1).
-    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
     fn is_merge(&self, node: &NodeId, removed: &Clock) -> bool {
         let Some(indexers) = self.indexers.as_ref() else {
             return false;
@@ -388,7 +387,6 @@ impl Linearizer {
     /// The **indexer tails**: the oldest not-yet-confirmed node of each indexer,
     /// reduced to the minimal antichain (upstream `_indexerTails`). These are the
     /// frontier the confirmation machine tries to yield next.
-    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
     fn indexer_tails(&self, removed: &Clock) -> BTreeSet<NodeId> {
         let Some(indexers) = self.indexers.as_ref() else {
             return BTreeSet::new();
@@ -425,7 +423,6 @@ impl Linearizer {
     /// `object` — i.e. `parent`'s extra knowledge contains nothing concurrent to
     /// `object`. This is the ambiguity guard that keeps a vote from being
     /// double-counted across a fork.
-    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
     fn strictly_newer(&self, object: &NodeId, parent: &NodeId, removed: &Clock) -> bool {
         if !self.sees(parent, object) {
             return false;
@@ -465,7 +462,6 @@ impl Linearizer {
     /// majority test for confirmation counts these.
     ///
     /// [`strictly_newer`]: Self::strictly_newer
-    #[allow(dead_code)] // consumed by the stage-3 confirmation machine (ADR-0042)
     fn acks(&self, target: &NodeId, removed: &Clock) -> Vec<NodeId> {
         let Some(indexers) = self.indexers.as_ref() else {
             return Vec::new();
@@ -503,7 +499,6 @@ impl Linearizer {
 
     /// Number of nodes writer `key` has (`indexer.length` upstream) — the next
     /// expected seq.
-    #[allow(dead_code)]
     fn indexer_length(&self, key: &WriterKey) -> u64 {
         self.next_seq.get(key).copied().unwrap_or(0)
     }
@@ -514,7 +509,6 @@ impl Linearizer {
     /// `target` and sees a majority of `acks`. The bisect *optimisation* upstream
     /// uses to skip the non-strictly-newer cluster is omitted — scanning every node
     /// is behaviour-identical.
-    #[allow(dead_code)]
     fn confirms(
         &self,
         indexer: WriterKey,
@@ -561,7 +555,6 @@ impl Linearizer {
     }
 
     /// Whether a majority of `acks` are seen by `parent` (upstream `_ackedAt`).
-    #[allow(dead_code)]
     fn acked_at(&self, acks: &[NodeId], parent: &NodeId) -> bool {
         let Some(majority) = self.majority() else {
             return false;
@@ -590,7 +583,6 @@ impl Linearizer {
     /// (none `Unseen`). With a `parent`, defers to
     /// [`is_confirmable_at`](Self::is_confirmable_at) (used by the stage-4 merge
     /// walk). This is the precise rule the conservative `finalized()` approximates.
-    #[allow(dead_code)]
     fn is_confirmed(&self, target: &NodeId, parent: Option<&NodeId>, removed: &Clock) -> bool {
         let Some(majority) = self.majority() else {
             return false;
@@ -631,7 +623,6 @@ impl Linearizer {
     /// acked at `parent`, and enough not-yet-confirming indexers remain that could
     /// still confirm it (those `target` already saw, or whose next node is
     /// strictly-newer).
-    #[allow(dead_code)]
     fn is_confirmable_at(
         &self,
         target: &NodeId,
@@ -671,6 +662,117 @@ impl Linearizer {
             }
         }
         false
+    }
+
+    // ------------------------------------------------------------------------------
+    // Faithful `consensus.js` port, stage 4 — the `shift` driver.
+    //
+    // `confirmed_prefix` drives `shift` from scratch (an empty `removed` clock that
+    // grows as nodes are confirmed) until nothing more confirms, accumulating the
+    // indexed sequence. This is the precise form of `finalized()`; the *swap* onto
+    // it (reconciling with `order()` + re-validating the convergence sim) is the
+    // closing step. ADR-0042.
+    // ------------------------------------------------------------------------------
+
+    /// The currently-unconfirmed indexer **merge** nodes, in deterministic
+    /// ([`NodeId`]) order (upstream's `merges` set, recomputed).
+    fn merge_nodes(&self, removed: &Clock) -> Vec<NodeId> {
+        let Some(indexers) = self.indexers.as_ref() else {
+            return Vec::new();
+        };
+        self.deps
+            .keys()
+            .filter(|n| indexers.contains(&n.key) && !removed.includes(&n.key, n.seq + 1))
+            .filter(|n| self.is_merge(n, removed))
+            .copied()
+            .collect()
+    }
+
+    /// The tails (from `tails`) that `node` causally sees (upstream `_tails`).
+    fn tails_seen(&self, node: &NodeId, tails: &BTreeSet<NodeId>) -> Vec<NodeId> {
+        tails.iter().filter(|t| self.sees(node, t)).copied().collect()
+    }
+
+    /// `_tailsAndMerges`: the seen tails plus any other merge node `node` sees.
+    fn tails_and_merges_seen(
+        &self,
+        node: &NodeId,
+        tails: &BTreeSet<NodeId>,
+        removed: &Clock,
+    ) -> Vec<NodeId> {
+        let mut all = self.tails_seen(node, tails);
+        for m in self.merge_nodes(removed) {
+            if m != *node && self.sees(node, &m) && !all.contains(&m) {
+                all.push(m);
+            }
+        }
+        all
+    }
+
+    /// Resolve a confirmed merge down to the next node(s) to yield (upstream
+    /// `_yieldNext`): walk toward the tails, descending into whichever sub-arm is
+    /// confirmed *relative to the current node*; when none is, yield every tail
+    /// below it; on reaching a tail, yield it.
+    fn yield_next(&self, mut node: NodeId, tails: &BTreeSet<NodeId>, removed: &mut Clock) -> Vec<NodeId> {
+        while !tails.contains(&node) {
+            let mut next = None;
+            for t in self.tails_and_merges_seen(&node, tails, removed) {
+                if self.is_confirmed(&t, Some(&node), removed) {
+                    next = Some(t);
+                    break;
+                }
+            }
+            if let Some(t) = next {
+                node = t;
+                continue;
+            }
+            let arm = self.tails_seen(&node, tails);
+            for t in &arm {
+                removed.raise(t.key, t.seq + 1);
+            }
+            return arm;
+        }
+        removed.raise(node.key, node.seq + 1);
+        vec![node]
+    }
+
+    /// One `shift`: yield the next confirmed tail, or resolve a confirmed merge, or
+    /// nothing. Mutates `removed` for the nodes it yields.
+    fn shift_once(&self, removed: &mut Clock) -> Vec<NodeId> {
+        let tails = self.indexer_tails(removed);
+        for tail in &tails {
+            if self.is_confirmed(tail, None, removed) {
+                removed.raise(tail.key, tail.seq + 1);
+                return vec![*tail];
+            }
+        }
+        for merge in self.merge_nodes(removed) {
+            if self.is_confirmed(&merge, None, removed) {
+                return self.yield_next(merge, &tails, removed);
+            }
+        }
+        Vec::new()
+    }
+
+    /// The **confirmed (indexed) prefix** via the faithful `consensus.js` machine:
+    /// drive [`shift`](Self::shift_once) from scratch until nothing more confirms.
+    /// The precise form of [`finalized`](Self::finalized) — equal on fork-free DAGs,
+    /// but able to commit a merge-resolved fork arm the conservative rule defers.
+    /// Not yet the live finalization (ADR-0042 stage 4 swap pending).
+    pub fn confirmed_prefix(&self) -> Vec<NodeId> {
+        if self.majority().is_none() {
+            return Vec::new();
+        }
+        let mut removed = Clock::default();
+        let mut out = Vec::new();
+        loop {
+            let batch = self.shift_once(&mut removed);
+            if batch.is_empty() {
+                break;
+            }
+            out.extend(batch);
+        }
+        out
     }
 
     /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
@@ -1111,6 +1213,77 @@ mod tests {
                 "{node:?} finalized ⇒ confirmed"
             );
         }
+    }
+
+    // ---- consensus.js shift driver (stage 4) --------------------------------
+
+    // A fork merged and double-quorum'd: a0,b0 → merged at c0; a1,b1,c1 ack c0;
+    // a2 witnesses the double quorum. Exercises the merge-resolving `yield_next`.
+    fn deep_fork_merge() -> Linearizer {
+        let mut lin = indexed(&[A, B, C]);
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(B, 0), &[]);
+        add(&mut lin, n(C, 0), &[n(A, 0), n(B, 0)]); // merge of a0 & b0
+        add(&mut lin, n(A, 1), &[n(C, 0)]);
+        add(&mut lin, n(B, 1), &[n(C, 0)]);
+        add(&mut lin, n(C, 1), &[n(C, 0)]);
+        add(&mut lin, n(A, 2), &[n(A, 1), n(B, 1), n(C, 1)]);
+        lin
+    }
+
+    #[test]
+    fn confirmed_prefix_equals_finalized_on_fork_free() {
+        let lin = chain();
+        assert_eq!(lin.confirmed_prefix(), lin.finalized());
+        assert_eq!(lin.confirmed_prefix(), vec![n(A, 0), n(B, 0)]);
+
+        let mut sq = indexed(&[A, B, C]);
+        add(&mut sq, n(A, 0), &[]);
+        add(&mut sq, n(C, 0), &[]);
+        add(&mut sq, n(C, 1), &[n(A, 0)]);
+        add(&mut sq, n(B, 0), &[n(C, 0)]);
+        assert!(sq.confirmed_prefix().is_empty(), "competing single quorums confirm nothing");
+        assert_eq!(sq.confirmed_prefix(), sq.finalized());
+    }
+
+    #[test]
+    fn confirmed_prefix_is_causally_closed() {
+        for lin in [chain(), fork_merge(), deep_fork_merge()] {
+            let prefix = lin.confirmed_prefix();
+            let pos: BTreeMap<NodeId, usize> =
+                prefix.iter().enumerate().map(|(i, nd)| (*nd, i)).collect();
+            for (i, node) in prefix.iter().enumerate() {
+                for dep in lin.deps.get(node).into_iter().flatten() {
+                    let di = pos.get(dep).copied();
+                    assert!(
+                        di.is_some() && di.unwrap() < i,
+                        "dep {dep:?} of {node:?} must be confirmed strictly earlier"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_prefix_supersets_finalized_and_resolves_a_merge() {
+        for lin in [chain(), fork_merge(), deep_fork_merge()] {
+            let cp: BTreeSet<NodeId> = lin.confirmed_prefix().into_iter().collect();
+            for node in lin.finalized() {
+                assert!(cp.contains(&node), "{node:?} finalized ⇒ in confirmed_prefix");
+            }
+        }
+        // The merged fork: the conservative rule defers around the unresolved fork,
+        // but the precise machine confirms the merged arms — strictly more eager.
+        let dfm = deep_fork_merge();
+        let cp = dfm.confirmed_prefix();
+        assert!(cp.contains(&n(A, 0)) && cp.contains(&n(B, 0)) && cp.contains(&n(C, 0)),
+            "the merged fork (a0,b0,c0) is confirmed: {cp:?}");
+        assert!(
+            cp.len() > dfm.finalized().len(),
+            "precise prefix ({}) outpaces conservative ({})",
+            cp.len(),
+            dfm.finalized().len()
+        );
     }
 
     /// Every dependency must appear before its dependent in `order`.
