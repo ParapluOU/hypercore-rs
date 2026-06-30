@@ -1,28 +1,24 @@
-//! OPFS browser backend — synchronous, persistent storage in the browser.
+//! OPFS browser backend — a [`SyncFile`] over the Origin Private File System's
+//! synchronous access handle, composed with [`LogStore`] for a persistent,
+//! log-structured `u64`-keyed [`Store`](crate::Store).
 //!
-//! Uses the Origin Private File System's `FileSystemSyncAccessHandle`, whose
-//! read/write/getSize/truncate/flush are **synchronous**, so this fits the sync
-//! [`Store`] trait with no async plumbing — exactly what the local-first,
-//! browser-is-the-writer model needs (this is what SQLite-WASM uses).
+//! `FileSystemSyncAccessHandle` read/write/getSize/truncate/flush are
+//! **synchronous**, so it slots straight into [`SyncFile`] — the local-first,
+//! browser-is-the-writer primitive (what SQLite-WASM uses). The log-structured
+//! KV + compaction logic lives in [`crate::log`] and is tested natively; this
+//! module is only the thin OPFS file binding.
 //!
-//! Constraints:
-//! - Worker-only: `createSyncAccessHandle()` is unavailable on the main thread.
-//! - Requires `RUSTFLAGS=--cfg=web_sys_unstable_apis` and the `opfs` feature.
-//!
-//! v1 design: the store is held in memory and mirrored to a single OPFS file —
-//! every mutation re-serializes the map and rewrites the file (O(n) per write).
-//! Simple and correct; a log-structured/append layout is a follow-up.
-
-use std::collections::BTreeMap;
+//! Constraints: worker-only (`createSyncAccessHandle()` is unavailable on the main
+//! thread), and requires `RUSTFLAGS=--cfg=web_sys_unstable_apis` + the `opfs` feature.
 
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions,
-    FileSystemSyncAccessHandle, WorkerGlobalScope,
+    FileSystemReadWriteOptions, FileSystemSyncAccessHandle, WorkerGlobalScope,
 };
 
-use crate::Store;
+use crate::log::{LogStore, SyncFile};
 
 /// An OPFS operation failure (a stringified `JsValue` or a context message).
 #[derive(Debug, Clone)]
@@ -34,15 +30,13 @@ impl From<JsValue> for OpfsError {
     }
 }
 
-/// A `u64`-keyed [`Store`] persisted to one OPFS file.
-pub struct OpfsStore {
-    map: BTreeMap<u64, Vec<u8>>,
+/// An OPFS file presented as a synchronous [`SyncFile`].
+pub struct OpfsFile {
     handle: FileSystemSyncAccessHandle,
 }
 
-impl OpfsStore {
-    /// Open (creating if absent) the OPFS file `name` and load its contents.
-    /// Must be called from a Web Worker.
+impl OpfsFile {
+    /// Open (creating if absent) the OPFS file `name`. Must run in a Web Worker.
     pub async fn open(name: &str) -> Result<Self, OpfsError> {
         let scope: WorkerGlobalScope = js_sys::global()
             .dyn_into()
@@ -67,118 +61,91 @@ impl OpfsStore {
             .dyn_into()
             .map_err(|_| OpfsError("createSyncAccessHandle failed".into()))?;
 
-        // Load existing contents synchronously.
-        let size = handle.get_size()? as usize;
-        let mut buf = vec![0u8; size];
-        if size > 0 {
-            handle.read_with_u8_array(&mut buf)?;
-        }
-        Ok(Self {
-            map: decode_map(&buf),
-            handle,
-        })
+        Ok(Self { handle })
+    }
+}
+
+impl SyncFile for OpfsFile {
+    type Error = OpfsError;
+
+    fn size(&self) -> Result<u64, OpfsError> {
+        Ok(self.handle.get_size()? as u64)
     }
 
-    /// Re-serialize the map and rewrite the OPFS file.
-    fn persist(&self) -> Result<(), OpfsError> {
-        let buf = encode_map(&self.map);
-        self.handle.truncate_with_f64(0.0)?;
-        self.handle.write_with_u8_array(&buf)?;
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), OpfsError> {
+        let opts = FileSystemReadWriteOptions::new();
+        opts.set_at(offset as f64);
+        self.handle.read_with_u8_array_and_options(buf, &opts)?;
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), OpfsError> {
+        let opts = FileSystemReadWriteOptions::new();
+        opts.set_at(offset as f64);
+        self.handle.write_with_u8_array_and_options(buf, &opts)?;
+        Ok(())
+    }
+
+    fn truncate(&mut self, size: u64) -> Result<(), OpfsError> {
+        self.handle.truncate_with_f64(size as f64)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), OpfsError> {
         self.handle.flush()?;
         Ok(())
     }
 }
 
-impl Store for OpfsStore {
-    type Error = OpfsError;
-
-    fn put(&mut self, key: u64, value: &[u8]) -> Result<(), OpfsError> {
-        self.map.insert(key, value.to_vec());
-        self.persist()
-    }
-
-    fn get(&self, key: u64) -> Result<Option<Vec<u8>>, OpfsError> {
-        Ok(self.map.get(&key).cloned())
-    }
-
-    fn delete(&mut self, key: u64) -> Result<(), OpfsError> {
-        self.map.remove(&key);
-        self.persist()
-    }
-
-    fn len(&self) -> Result<u64, OpfsError> {
-        Ok(self.map.len() as u64)
-    }
-}
-
-impl Drop for OpfsStore {
+impl Drop for OpfsFile {
     fn drop(&mut self) {
         // Release the exclusive sync access handle so the file can be reopened.
         self.handle.close();
     }
 }
 
+/// A persistent, log-structured browser store backed by OPFS.
+pub type OpfsStore = LogStore<OpfsFile>;
+
+/// Open (creating if absent) an OPFS-backed store named `name`, replaying its log
+/// to rebuild the index. Worker-only.
+pub async fn open(name: &str) -> Result<OpfsStore, OpfsError> {
+    LogStore::open(OpfsFile::open(name).await?)
+}
+
 #[cfg(test)]
 mod browser_tests {
     use super::*;
+    use crate::Store;
     use wasm_bindgen_test::*;
 
     // OPFS sync access handles are worker-only, so run the tests in a worker.
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     #[wasm_bindgen_test]
-    async fn opfs_store_roundtrip_and_persists_across_reopen() {
-        let name = "hc-opfs-roundtrip";
-        let mut s = OpfsStore::open(name).await.expect("open");
+    async fn opfs_log_store_roundtrip_and_persists_across_reopen() {
+        let name = "hc-opfs-log";
+        let mut s = open(name).await.expect("open");
 
         // Reset the keys this test uses (the OPFS file persists across runs).
         for k in [1u64, 2, 7] {
             s.delete(k).unwrap();
         }
-        assert_eq!(s.get(1).unwrap(), None);
-
         s.put(1, b"one").unwrap();
         s.put(2, b"two").unwrap();
-        assert_eq!(s.get(1).unwrap().as_deref(), Some(&b"one"[..]));
         s.put(1, b"ONE").unwrap(); // overwrite
-        assert_eq!(s.get(1).unwrap().as_deref(), Some(&b"ONE"[..]));
         s.delete(2).unwrap();
+        assert_eq!(s.get(1).unwrap().as_deref(), Some(&b"ONE"[..]));
         assert_eq!(s.get(2).unwrap(), None);
 
-        // Close (Drop) then reopen: the value must survive — real persistence.
+        // Close (Drop) then reopen: the log replays and the value survives.
         drop(s);
-        let mut s2 = OpfsStore::open(name).await.expect("reopen");
+        let mut s2 = open(name).await.expect("reopen");
         assert_eq!(
             s2.get(1).unwrap().as_deref(),
             Some(&b"ONE"[..]),
-            "value persisted across a close+reopen via OPFS"
+            "value persisted across close+reopen via the OPFS log"
         );
-        s2.delete(1).unwrap(); // leave it clean
+        s2.delete(1).unwrap();
     }
-}
-
-/// `[key: u64 LE][len: u32 LE][bytes]` per entry, in key order.
-fn encode_map(map: &BTreeMap<u64, Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (k, v) in map {
-        out.extend_from_slice(&k.to_le_bytes());
-        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-        out.extend_from_slice(v);
-    }
-    out
-}
-
-fn decode_map(mut b: &[u8]) -> BTreeMap<u64, Vec<u8>> {
-    let mut map = BTreeMap::new();
-    while b.len() >= 12 {
-        let k = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let len = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
-        b = &b[12..];
-        if b.len() < len {
-            break;
-        }
-        map.insert(k, b[..len].to_vec());
-        b = &b[len..];
-    }
-    map
 }

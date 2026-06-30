@@ -81,7 +81,8 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `storage` — **OPFS browser backend** (wasm): sync `FileSystemSyncAccessHandle`, persistent;
       behind the `opfs` feature + `--cfg web_sys_unstable_apis`; worker-only. **Verified in real headless
       Chrome** — put/get/overwrite/delete + persistence across close+reopen (ADR-0038). (IndexedDB has no
-      sync API; rejected in favour of OPFS.)
+      sync API; rejected in favour of OPFS.) **Log-structured** — append + replay + `compact()` via a
+      `SyncFile` abstraction whose KV/compaction logic is tested natively against `MemFile` (ADR-0039).
 - [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +
       **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019) +

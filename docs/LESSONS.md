@@ -454,3 +454,8 @@ personal data** (this repo is public; use repo-relative paths).
   wasm-bindgen used to build>` + `CHROMEDRIVER=<that chromedriver>` (the runner honors `CHROMEDRIVER`;
   a mismatched runner gives a "schema version" error). A `webdriver.json` with `--no-sandbox` /
   `--disable-dev-shm-usage` helps in restricted environments.
+- **Abstract browser-only I/O behind a trait so the real logic stays natively testable.** OPFS handles
+  only work in a worker in a browser, but a log-structured store's complexity (record framing, replay,
+  compaction, partial-tail recovery) is target-agnostic. Put it behind a `SyncFile` trait and test
+  `LogStore<MemFile>` with plain `cargo test`; the browser run then only confirms the thin OPFS `SyncFile`
+  impl. Push platform code to the edges.

@@ -793,3 +793,17 @@ Worker-only (sync handles are unavailable on the main thread; tests use `run_in_
 put/get/overwrite/delete + **persistence across close+reopen**. Closes gate #2. `localStorage` (too small)
 and async-IndexedDB (a trait-wide async refactor) were rejected. Deferred: a log-structured/compacting
 layout; per-key files.
+
+## ADR-0039 — Log-structured OPFS via a `SyncFile` abstraction
+**Context:** The v1 OPFS store (ADR-0038) mirrored an in-memory map to one file and rewrote the *whole*
+file on every mutation — O(n) write amplification.
+**Decision:** Introduce a `SyncFile` trait (`size`/`read_at`/`write_at`/`truncate`/`flush`) and a
+`LogStore<F: SyncFile>`: each mutation **appends** a `[key][kind][len][value]` record (O(1) amortized);
+an in-memory index maps `key → (offset, len)`; a delete appends a tombstone; `open` replays the file to
+rebuild the index (dropping a partial trailing record); `compact()` rewrites with only the live records
+once dead bytes exceed half the file. OPFS becomes one `SyncFile` impl (`OpfsFile`, offset read/write via
+the sync access handle); `OpfsStore = LogStore<OpfsFile>`.
+**Consequence:** The log-structured KV + compaction logic is **tested natively** against an in-memory
+`MemFile` (contract, persistence-across-reopen, compaction-reclaims-space, partial-tail-dropped) — no
+browser needed — and the OPFS binding is re-verified in real headless Chrome. Supersedes ADR-0038's v1
+whole-file rewrite. Deferred: compaction tuning; wiring OPFS persistence into bitfield/snapshots.

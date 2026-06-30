@@ -1859,3 +1859,24 @@ ignores `CHROMEDRIVER`, so a lagging Chrome needs a version-matched chromedriver
 - OPFS log-structured/compacting layout (avoid O(n)-per-write) + wire OPFS into bitfield/snapshot
   open/flush persistence. Then the remaining tail: JS oracle / fork-merge consensus; the
   `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.
+
+---
+
+## 2026-06-30 — OPFS log-structured layout (`SyncFile` + `LogStore`)
+
+**Did**
+- Replaced the v1 whole-file-rewrite OPFS store with a **log-structured** one: a `SyncFile` trait +
+  `LogStore<F>` (append record + in-memory index + replay-on-open + `compact()` when >50% dead). OPFS is
+  now one `SyncFile` impl (`OpfsFile`, offset read/write); `OpfsStore = LogStore<OpfsFile>`.
+- The KV/compaction logic is **natively tested** via `MemFile` — 4 new tests (contract, persistence
+  across reopen, compaction reclaims space + preserves values, partial trailing record dropped). Storage
+  21 tests; full gate 172. Re-verified the OPFS binding in real headless Chrome.
+
+**Decisions** — ADR-0039 (SyncFile abstraction; append + compaction; supersedes the ADR-0038 v1 rewrite).
+
+**Lessons** — abstracting the file behind `SyncFile` moved the real complexity into native tests; only the
+thin OPFS binding still needs a browser.
+
+**Next**
+- Compaction tuning; wire OPFS persistence into the bitfield/snapshot open/flush. Then: JS oracle /
+  fork-merge consensus; `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.

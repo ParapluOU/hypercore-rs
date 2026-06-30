@@ -15,11 +15,15 @@ use std::fmt::Debug;
 pub mod bitfield;
 pub use bitfield::Bitfield;
 
+/// Log-structured `u64`-keyed store over a synchronous file (the OPFS backend builds on this).
+pub mod log;
+pub use log::{LogStore, MemFile, SyncFile};
+
 /// Browser OPFS backend (wasm + Web Worker; `opfs` feature). See [`opfs`].
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 pub mod opfs;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-pub use opfs::{OpfsError, OpfsStore};
+pub use opfs::{OpfsError, OpfsFile, OpfsStore};
 
 /// A `u64`-keyed byte store.
 pub trait Store {
