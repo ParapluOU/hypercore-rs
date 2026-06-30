@@ -877,3 +877,27 @@ it behind the same safety tests.
 **Consequence:** Each stage is independently testable; safety is never regressed — the conservative prefix
 stays live until the precise machine is proven at least as safe and strictly-or-equally as eager. Stage 1's
 clock layer is the substrate every later predicate reads.
+
+## ADR-0043 — Swapping `finalized()` onto the consensus machine is blocked on two pieces
+**Context:** The staged `consensus.js` port (ADR-0042) is complete through `consensus.shift`:
+`Linearizer::confirmed_prefix` drives it from scratch, reproduces upstream's confirmation — including
+committing a merge-resolved fork arm the conservative `finalized()` defers — and converges across delivery
+orders. Validating it against the convergence sim's 5-writer / 3-indexer **partitioned** DAGs surfaced two
+gaps that block making it the live finalization.
+**Findings.** (1) **`consensus.shift` confirms only *indexer* nodes.** Upstream weaves the non-indexer
+nodes into each indexed batch via `linearizer.js` `_yield` → `Topolist.add`; that is not yet ported, so
+`confirmed_prefix` omits a confirmed indexer node's non-indexer dependencies — it is causally closed only
+*among indexer nodes*, not the full indexed view. (All-indexer unit DAGs hid this; the sim caught it.)
+(2) **The consensus yield order ≠ our `order()` tiebreak.** `order()` is an independent priority-Kahn with
+a lowest-writer-key tiebreak (ADR-0014, chosen for *manifest* determinism); the consensus machine yields an
+arm once its quorum forms, picking a different concurrent node first. Both are valid causal linearizations,
+but the confirmed set is therefore **not a contiguous prefix of `order()`** — so `finalized() =
+confirmed_prefix()` would violate the `order ⊑ finalized` contract the sim enforces.
+**Decision:** Keep `finalized()`/`indexed_view` as the **order-aligned conservative prefix** (safe, an
+`order()` prefix) for now; ship `confirmed_prefix` as a **validated standalone** precise-confirmation API
+documenting both gaps. The swap requires (a) porting `_yield` (non-indexer interleaving) and (b)
+**reconciling `order()` with the consensus order** — a foundational call against ADR-0014: either align
+`order()`'s confirmed prefix to the consensus/topolist order (so the indexed view is a true prefix), or
+define the indexed view independently of the key-tiebreak `order()`. Deferred pending that decision.
+**Consequence:** No safety regression — the conservative prefix stays live. The consensus *core* is ported,
+proven, and converges; only the view assembly (`_yield`) + the ordering reconciliation remain.

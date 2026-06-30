@@ -2057,3 +2057,28 @@ the new path is shown ≥ as safe.
   convergence sim (gate #3, the finality-stability safety net) and reconcile with `order()` (confirmed
   order vs the priority-Kahn linearization on fork arms). Deliberate, behaviour-changing — done as its own
   focused pass, not rushed.
+
+---
+
+## 2026-06-30 — autobase: validated the consensus machine on the sim; swap blocked (ADR-0043)
+
+**Did**
+- Tried to validate `confirmed_prefix` for the swap by checking it is an `order()` prefix over the
+  convergence sim's 5-writer/3-indexer partitioned DAGs. It **failed — twice, informatively** — surfacing
+  the two real blockers (now ADR-0043): (1) `consensus.shift` confirms **indexer nodes only**; the
+  non-indexer interleaving (`linearizer.js` `_yield` → `Topolist.add`) is not ported, so the prefix omits
+  non-indexer deps; (2) the consensus **yield order ≠ our `order()` key tiebreak** (ADR-0014), so it isn't
+  a contiguous `order()` prefix. All-indexer unit DAGs had hidden both; the sim caught them.
+- Kept a corrected sim test (`confirmed_prefix_is_indexer_consensus_closed_and_converges`) asserting what
+  *is* true: indexer-only, causally closed **among indexers**, converges across delivery orders, and
+  covers the indexer portion of conservative `finalized()`. Updated `confirmed_prefix`'s doc to say it is
+  the consensus indexer sequence, not the full view. `finalized()` stays the safe live baseline. Gate
+  **203** (still green; no swap, no regression).
+
+**Lessons** — test the consensus machine on DAGs with **non-indexer writers** (the sim's regime), not just
+all-indexer toy DAGs — the `_yield` gap and the order divergence are invisible otherwise.
+
+**Next (needs a design call — ADR-0014)**
+- Port `_yield`/`Topolist.add` (weave non-indexer nodes into the indexed batch), and decide the
+  `order()` ↔ consensus-order reconciliation (align `order()`'s confirmed prefix to consensus, or define
+  the indexed view independently of key-tiebreak `order()`). Then the swap.

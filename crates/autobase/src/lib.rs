@@ -754,11 +754,19 @@ impl Linearizer {
         Vec::new()
     }
 
-    /// The **confirmed (indexed) prefix** via the faithful `consensus.js` machine:
+    /// The **confirmed indexer sequence** via the faithful `consensus.js` machine:
     /// drive [`shift`](Self::shift_once) from scratch until nothing more confirms.
-    /// The precise form of [`finalized`](Self::finalized) — equal on fork-free DAGs,
-    /// but able to commit a merge-resolved fork arm the conservative rule defers.
-    /// Not yet the live finalization (ADR-0042 stage 4 swap pending).
+    /// This is a complete port of `consensus.shift` — it confirms a merge-resolved
+    /// fork arm the conservative [`finalized`](Self::finalized) defers, and it
+    /// converges across delivery orders.
+    ///
+    /// It is **not yet the full indexed view**, and **not** the live finalization
+    /// (ADR-0043): (1) `consensus.shift` yields only **indexer** nodes — the
+    /// non-indexer nodes are woven in by upstream's `_yield`/`Topolist.add`, not yet
+    /// ported, so this omits non-indexer deps; and (2) its consensus *yield* order
+    /// differs from [`order`](Self::order)'s key tiebreak (ADR-0014), so it is not a
+    /// prefix of `order()`. Both are the remaining work before swapping `finalized`
+    /// onto the precise machine.
     pub fn confirmed_prefix(&self) -> Vec<NodeId> {
         if self.majority().is_none() {
             return Vec::new();

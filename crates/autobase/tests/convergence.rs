@@ -347,3 +347,77 @@ fn finalized_prefix_is_monotone_under_cooperative_growth() {
         "cooperative growth never finalized anything — quorum/finality is not being reached"
     );
 }
+
+/// Properties of `confirmed_prefix` — the faithful port of `consensus.shift`, i.e.
+/// the sequence of **indexer** nodes the consensus core confirms — over the
+/// partitioned regime: every element is an indexer node, it is **causally closed
+/// among indexer nodes**, it **converges** across delivery orders, and it covers the
+/// **indexer portion** of the conservative `finalized()` (never less eager there).
+///
+/// Two things it is deliberately NOT (the swap onto `finalized()` is blocked on
+/// them — see ADR-0043):
+/// 1. **Not the full indexed view.** `consensus.shift` confirms indexer nodes; the
+///    non-indexer nodes are woven in by upstream's `_yield`/`Topolist.add`, not yet
+///    ported — so `confirmed_prefix` omits non-indexer deps (not closed over *all*
+///    deps).
+/// 2. **Not a prefix of `order()`.** The consensus *yield* order differs from our
+///    `order()` tiebreak (lowest writer key first, ADR-0014); both are valid causal
+///    linearizations but pick different concurrent nodes first.
+#[test]
+fn confirmed_prefix_is_indexer_consensus_closed_and_converges() {
+    let n_writers = 5;
+    let n_indexers = 3;
+    let n_nodes = 30;
+    let replicas = 4;
+    let indexers: Vec<WriterKey> = (0..n_indexers).map(wkey).collect();
+    let idx_set: BTreeSet<WriterKey> = indexers.iter().copied().collect();
+
+    let mut total = 0usize;
+    for seed in 0..16u64 {
+        let mut rng = Rng::new(0xA11CE_000_0000_0001u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let (rn, rd) = if seed % 2 == 0 { (3, 5) } else { (17, 20) };
+        let dag = gen_partitioned(n_writers, n_nodes, rn, rd, &mut rng);
+        let deps = dag.deps();
+        let cross_by_node = dag.cross_by_node();
+
+        let r0 = deliver(&cross_by_node, &dag.creation_order(), &indexers);
+        let cp0 = r0.confirmed_prefix();
+        let cp_set: BTreeSet<NodeId> = cp0.iter().copied().collect();
+
+        let pos: BTreeMap<NodeId, usize> = cp0.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        for (i, node) in cp0.iter().enumerate() {
+            assert!(idx_set.contains(&node.key), "confirmed_prefix yields only indexer nodes");
+            // causally closed among *indexer* deps (non-indexer deps are _yield's job)
+            for d in deps.get(node).into_iter().flatten() {
+                if idx_set.contains(&d.key) {
+                    let di = pos.get(d).copied();
+                    assert!(
+                        di.is_some() && di.unwrap() < i,
+                        "indexer dep {d:?} of {node:?} must be confirmed earlier (seed {seed})"
+                    );
+                }
+            }
+        }
+        // the indexer portion of the conservative finalized prefix is covered
+        for node in r0.finalized() {
+            if idx_set.contains(&node.key) {
+                assert!(
+                    cp_set.contains(&node),
+                    "indexer-finalized {node:?} ⊆ confirmed_prefix (seed {seed})"
+                );
+            }
+        }
+        total += cp0.len();
+
+        for rep in 0..replicas {
+            let topo = random_topo(&deps, &mut rng);
+            let r = deliver(&cross_by_node, &topo, &indexers);
+            assert_eq!(
+                r.confirmed_prefix(),
+                cp0,
+                "confirmed_prefix converges across delivery orders (seed {seed} rep {rep})"
+            );
+        }
+    }
+    assert!(total > 0, "confirmed_prefix never confirmed anything — the path was not exercised");
+}
