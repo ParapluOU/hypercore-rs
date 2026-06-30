@@ -1940,3 +1940,29 @@ matching; read the verdict from `document.body.innerText`, not the truncating a1
 - Incremental/dirty persistence (today `persist` rewrites all three blobs); auto-persist hook;
   `ManifestCore` persistence. Then the larger tail: JS oracle / fork-merge consensus;
   `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.
+
+---
+
+## 2026-06-30 — `hyperbee` delete (COW del + rebalance)
+
+**Did**
+- Implemented `Hyperbee::del` (the main `[~]` gap): a recursive copy-on-write delete. A key in an internal
+  node is replaced by its in-order neighbour pulled from whichever boundary leaf has more keys (upstream
+  `setKeyToNearestLeaf`/`leafSize`); nodes that fall below `MIN_KEYS = (MAX_CHILDREN-1)/2 = 4` borrow from a
+  sibling with `> MIN_KEYS` or merge, bottom-up, and the root shrinks a level when it empties. A 404 delete
+  appends nothing and returns `false`.
+- 4 new tests incl. a **1200-op randomized `BTreeMap` oracle** that, after every op, asserts full
+  key+value equivalence and all B-tree structural invariants (per-node sorted, `[MIN_KEYS, MAX_CHILDREN-1]`
+  fill for non-root, `children == entries+1`, all leaves at equal depth) — exercising borrow-left,
+  borrow-right, merge and root-shrink. Plus a multi-level drain (delete all 80 keys, invariants after each)
+  and a delete-evens/reinsert-heals test. Gate **188**.
+
+**Decisions** — ADR-0037 amended (`del`+rebalance moved from Deferred to implemented; recursive COW
+analogue of upstream's stack-based rebalance).
+
+**Lessons** — for tree mutations, a randomized op-stream vs a `BTreeMap` oracle with structural-invariant
+assertions after *every* op catches rebalancing bugs a few hand-written cases would miss.
+
+**Next**
+- `hyperbee` sub-databases / header(`isHyperbee`) / diff-history-watch (still deferred). Then incremental
+  persistence; JS oracle / fork-merge consensus; `Hypercore`/`ManifestCore` unification.

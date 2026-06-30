@@ -777,8 +777,12 @@ new root is always the latest block. v1 = `put`/`get`/`range` (asc+desc, gt/gte/
 **Consequence:** Faithful to the ordered-KV behaviour — the upstream `basic.js` exhaustive range oracle
 (sizes 1..25 × {gt|gte}×{lt|lte}×reverse) passes and exercises multi-level splits. Trade-offs: a `put`
 appends one block per path node (vs upstream's one), and a key's bytes are re-encoded when its node is
-rewritten. **Deferred:** `del` + rebalance (borrow/merge), sub-databases, the header/`isHyperbee`
-detection, and diff/history/watch.
+rewritten. **`del` + rebalance now implemented** (2026-06-30): `MIN_KEYS = (MAX_CHILDREN-1)/2 = 4`; a key
+in an internal node is replaced by its in-order neighbour pulled from whichever boundary leaf has more
+keys (upstream `setKeyToNearestLeaf`/`leafSize`), then nodes below `MIN_KEYS` borrow from a sibling with
+`> MIN_KEYS` or merge, bottom-up, shrinking the root when it empties — a recursive COW analogue of
+upstream's stack-based `rebalance`. A 404 delete appends nothing. **Deferred:** sub-databases, the
+header/`isHyperbee` detection, and diff/history/watch.
 
 ## ADR-0038 — Browser persistence is OPFS sync-access-handle (verified in Chrome)
 **Context:** Local-first means the browser is the writer and must persist its hypercores locally.

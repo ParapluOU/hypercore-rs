@@ -159,9 +159,14 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       Driven via the interactive `NO_HEADLESS` wasm-bindgen test server (no chromedriver) — see the
       driver-free browser-test note in `docs/LESSONS.md`
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)
-- [~] `hyperbee` — v1 ordered KV B-tree over a hypercore: copy-on-write `put`/`get`/`range`
+- [~] `hyperbee` — ordered KV B-tree over a hypercore: copy-on-write `put`/`get`/`range`
       (asc+desc, gt/gte/lt/lte/limit), order-9 split, multi-level; upstream `basic.js` **exhaustive
-      range oracle** (sizes 1..25 × all bound combos × reverse) ported. Deferred: `del`+rebalance,
+      range oracle** (sizes 1..25 × all bound combos × reverse) ported. **`del` done** — COW delete with
+      in-order-neighbour replacement for internal keys (`leafSize`-style choice) + bottom-up rebalance
+      (borrow from a sibling with `> MIN_KEYS`, else merge) + root shrink (mirrors upstream
+      `del`/`rebalance`); validated by a **1200-op randomized `BTreeMap` oracle** asserting full key+value
+      equivalence **and** B-tree structural invariants (sorted, `[MIN_KEYS, MAX_CHILDREN-1]` fill,
+      equal leaf depth) after every op, plus a multi-level drain + reinsert-heals test. Deferred:
       sub-databases, header/`isHyperbee`, diff/history/watch (ADR-0037)
 
 ### Audit follow-ups (after iteration 21; see ADR-0029)
