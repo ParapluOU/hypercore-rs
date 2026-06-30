@@ -10,6 +10,7 @@ impl<S: Store> Hyperbee<S> {
     pub fn new(author: SecretKey, store: S) -> Self {
         Self {
             core: Hypercore::new(author, NodeCodec, store),
+            pending: None,
         }
     }
 
@@ -23,11 +24,39 @@ impl<S: Store> Hyperbee<S> {
     }
 
     pub(crate) fn node(&self, seq: u64) -> Result<Node, Error<S>> {
+        // During a batch, blocks at/beyond the batch base are staged, not yet in the
+        // core — read those back from the staging batch.
+        if let Some(b) = self.pending.as_ref() {
+            if seq >= b.base() {
+                return self.core.batch_get(b, seq)?.ok_or(HcError::Corrupt);
+            }
+        }
         self.core.get(seq)?.ok_or(HcError::Corrupt)
     }
 
     pub(crate) fn root_seq(&self) -> Option<u64> {
+        // The root is the latest block — a staged one mid-batch, else the core's.
+        if let Some(b) = self.pending.as_ref() {
+            let staged = b.staged() as u64;
+            if staged > 0 {
+                return Some(b.base() + staged - 1);
+            }
+        }
         self.core.len().checked_sub(1)
+    }
+
+    /// Append `node`, returning its block seq — **staged** into the in-progress batch
+    /// if one is open (so the whole batch lands under one head), else appended
+    /// directly. All copy-on-write writes go through here.
+    fn append_node(&mut self, node: &Node) -> Result<u64, Error<S>> {
+        if let Some(mut b) = self.pending.take() {
+            self.core.stage(&mut b, node);
+            let seq = b.base() + b.staged() as u64 - 1;
+            self.pending = Some(b);
+            Ok(seq)
+        } else {
+            self.core.append(node)
+        }
     }
 
     /// The value for `key`, or `None`.
@@ -102,7 +131,7 @@ impl<S: Store> Hyperbee<S> {
                     entries: vec![(key.to_vec(), value.to_vec())],
                     children: vec![],
                 };
-                self.core.append(&leaf)?;
+                self.append_node(&leaf)?;
                 return Ok(());
             }
             Some(s) => s,
@@ -115,7 +144,7 @@ impl<S: Store> Hyperbee<S> {
                 entries: vec![median],
                 children: vec![left, right],
             };
-            self.core.append(&new_root)?;
+            self.append_node(&new_root)?;
         }
         // (the `Down` case already appended the rewritten root last)
         Ok(())
@@ -127,7 +156,7 @@ impl<S: Store> Hyperbee<S> {
             // Key present at this node — overwrite the value (LWW), rewrite the node.
             Ok(i) => {
                 node.entries[i].1 = value.to_vec();
-                Ok(Ins::Down(self.core.append(&node)?))
+                Ok(Ins::Down(self.append_node(&node)?))
             }
             Err(i) => {
                 if node.is_leaf() {
@@ -137,7 +166,7 @@ impl<S: Store> Hyperbee<S> {
                     match self.insert(node.children[i], key, value)? {
                         Ins::Down(child) => {
                             node.children[i] = child;
-                            Ok(Ins::Down(self.core.append(&node)?))
+                            Ok(Ins::Down(self.append_node(&node)?))
                         }
                         Ins::Split { left, median, right } => {
                             node.children[i] = left;
@@ -154,7 +183,7 @@ impl<S: Store> Hyperbee<S> {
     /// Append `node`, splitting first if it now holds `MAX_CHILDREN` keys.
     fn finish(&mut self, mut node: Node) -> Result<Ins, Error<S>> {
         if node.entries.len() < MAX_CHILDREN {
-            return Ok(Ins::Down(self.core.append(&node)?));
+            return Ok(Ins::Down(self.append_node(&node)?));
         }
         // Split: median moves up, right half becomes a new sibling.
         let mid = node.entries.len() / 2;
@@ -167,8 +196,8 @@ impl<S: Store> Hyperbee<S> {
         if !node.is_leaf() {
             right.children = node.children.split_off(mid + 1);
         }
-        let left = self.core.append(&node)?;
-        let right = self.core.append(&right)?;
+        let left = self.append_node(&node)?;
+        let right = self.append_node(&right)?;
         Ok(Ins::Split { left, median, right })
     }
 
@@ -316,7 +345,7 @@ impl<S: Store> Hyperbee<S> {
                 let node = self.node(seq)?;
                 if node.entries.is_empty() && !node.is_leaf() {
                     let child = self.node(node.children[0])?;
-                    self.core.append(&child)?;
+                    self.append_node(&child)?;
                 }
                 Ok(true)
             }
@@ -333,7 +362,7 @@ impl<S: Store> Hyperbee<S> {
                 if node.is_leaf() {
                     node.entries.remove(i);
                     let under = node.entries.len() < MIN_KEYS;
-                    Ok(Del::Down { seq: self.core.append(&node)?, underflow: under })
+                    Ok(Del::Down { seq: self.append_node(&node)?, underflow: under })
                 } else {
                     // Replace the separator with an in-order neighbour pulled from a
                     // boundary leaf — from whichever side's boundary leaf has more
@@ -378,7 +407,7 @@ impl<S: Store> Hyperbee<S> {
             self.rebalance(&mut node, i)?;
         }
         let under = node.entries.len() < MIN_KEYS;
-        Ok(Del::Down { seq: self.core.append(&node)?, underflow: under })
+        Ok(Del::Down { seq: self.append_node(&node)?, underflow: under })
     }
 
     /// Restore [`MIN_KEYS`] for the under-full child `node.children[i]` by borrowing
@@ -397,8 +426,8 @@ impl<S: Store> Hyperbee<S> {
                     child.children.insert(0, moved);
                 }
                 node.entries[i - 1] = left.entries.pop().expect("left has spare keys");
-                node.children[i - 1] = self.core.append(&left)?;
-                node.children[i] = self.core.append(&child)?;
+                node.children[i - 1] = self.append_node(&left)?;
+                node.children[i] = self.append_node(&child)?;
                 return Ok(());
             }
         }
@@ -413,8 +442,8 @@ impl<S: Store> Hyperbee<S> {
                     child.children.push(moved);
                 }
                 node.entries[i] = right.entries.remove(0);
-                node.children[i] = self.core.append(&child)?;
-                node.children[i + 1] = self.core.append(&right)?;
+                node.children[i] = self.append_node(&child)?;
+                node.children[i + 1] = self.append_node(&right)?;
                 return Ok(());
             }
         }
@@ -426,7 +455,7 @@ impl<S: Store> Hyperbee<S> {
         left.entries.push(node.entries[li].clone());
         left.entries.extend(right.entries.iter().cloned());
         left.children.extend(right.children.iter().cloned());
-        let merged = self.core.append(&left)?;
+        let merged = self.append_node(&left)?;
         node.entries.remove(li);
         node.children.remove(ri);
         node.children[li] = merged;
@@ -440,7 +469,7 @@ impl<S: Store> Hyperbee<S> {
         if node.is_leaf() {
             let min = node.entries.remove(0);
             let under = node.entries.len() < MIN_KEYS;
-            Ok((min, self.core.append(&node)?, under))
+            Ok((min, self.append_node(&node)?, under))
         } else {
             let (min, new_child, child_under) = self.delete_min(node.children[0])?;
             node.children[0] = new_child;
@@ -448,7 +477,7 @@ impl<S: Store> Hyperbee<S> {
                 self.rebalance(&mut node, 0)?;
             }
             let under = node.entries.len() < MIN_KEYS;
-            Ok((min, self.core.append(&node)?, under))
+            Ok((min, self.append_node(&node)?, under))
         }
     }
 
@@ -459,7 +488,7 @@ impl<S: Store> Hyperbee<S> {
         if node.is_leaf() {
             let max = node.entries.pop().expect("non-empty leaf");
             let under = node.entries.len() < MIN_KEYS;
-            Ok((max, self.core.append(&node)?, under))
+            Ok((max, self.append_node(&node)?, under))
         } else {
             let last = node.children.len() - 1;
             let (max, new_child, child_under) = self.delete_max(node.children[last])?;
@@ -468,7 +497,7 @@ impl<S: Store> Hyperbee<S> {
                 self.rebalance(&mut node, last)?;
             }
             let under = node.entries.len() < MIN_KEYS;
-            Ok((max, self.core.append(&node)?, under))
+            Ok((max, self.append_node(&node)?, under))
         }
     }
 
@@ -580,4 +609,47 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         p.pop();
     }
     None
+}
+
+impl<S: Store> Hyperbee<S> {
+    /// Begin an **atomic batch** (upstream `batch`): `put`/`del` on the returned
+    /// [`BeeBatch`] stage their copy-on-write writes; [`commit`](BeeBatch::commit)
+    /// lands them all under one signed head. Dropping without committing discards
+    /// them (the tree is unchanged).
+    pub fn batch(&mut self) -> BeeBatch<'_, S> {
+        self.pending = Some(self.core.batch());
+        BeeBatch { bee: self }
+    }
+}
+
+impl<S: Store> BeeBatch<'_, S> {
+    /// Stage a put into the batch.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error<S>> {
+        self.bee.put(key, value)
+    }
+
+    /// Stage a delete; returns whether the key was present (in the batched view).
+    pub fn del(&mut self, key: &[u8]) -> Result<bool, Error<S>> {
+        self.bee.del(key)
+    }
+
+    /// The value for `key`, reflecting the batch's staged writes so far.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S>> {
+        self.bee.get(key)
+    }
+
+    /// Apply all staged writes atomically, under a single head.
+    pub fn commit(self) -> Result<(), Error<S>> {
+        if let Some(b) = self.bee.pending.take() {
+            self.bee.core.commit(b)?;
+        }
+        Ok(())
+    }
+}
+
+impl<S> Drop for BeeBatch<'_, S> {
+    fn drop(&mut self) {
+        // An uncommitted batch discards its staged writes — nothing reached the core.
+        self.bee.pending = None;
+    }
 }

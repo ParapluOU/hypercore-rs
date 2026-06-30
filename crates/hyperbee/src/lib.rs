@@ -25,7 +25,7 @@
 //! `del` + rebalance, sub-databases, the header, diff/history/watch.
 
 use codec::{varint, Codec};
-use hypercore::{Error as HcError, Hypercore};
+use hypercore::{Batch, Error as HcError, Hypercore};
 use storage::Store;
 
 /// A node splits once it would hold this many keys (upstream `MAX_CHILDREN`).
@@ -132,6 +132,18 @@ enum Del {
 /// An ordered key/value store: a copy-on-write B-tree over a `hypercore`.
 pub struct Hyperbee<S> {
     core: Hypercore<Node, NodeCodec, S>,
+    /// Staging batch for an in-progress atomic [`batch`](Hyperbee::batch): while set,
+    /// node writes are *staged* here (read back via `batch_get`) and only land in the
+    /// core — under a single signed head — on `commit`, or are discarded on drop.
+    pending: Option<Batch<Node>>,
+}
+
+/// An atomic multi-operation batch (upstream `batch`). Created by
+/// [`Hyperbee::batch`]; `put`/`del` stage their copy-on-write block writes, and
+/// [`commit`](BeeBatch::commit) applies them all under one head. Dropping without
+/// committing discards the staged writes (the tree is unchanged).
+pub struct BeeBatch<'a, S> {
+    bee: &'a mut Hyperbee<S>,
 }
 
 /// A read-only view of a [`Hyperbee`] as of a past version (upstream `checkout`).

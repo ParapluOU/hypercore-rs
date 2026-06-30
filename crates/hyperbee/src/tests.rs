@@ -474,3 +474,45 @@ fn diff_between_versions_reports_add_change_delete() {
         ]
     );
 }
+
+#[test]
+fn batch_commits_atomically_and_drop_rolls_back() {
+    let mut b = bee();
+    b.put(b"x", b"0").unwrap();
+
+    // a committed batch applies every op and the staged writes are visible within it
+    {
+        let mut batch = b.batch();
+        batch.put(b"a", b"1").unwrap();
+        batch.put(b"b", b"2").unwrap();
+        assert!(batch.del(b"x").unwrap());
+        assert_eq!(batch.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(batch.get(b"x").unwrap(), None);
+        batch.commit().unwrap();
+    }
+    assert_eq!(b.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(b.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(b.get(b"x").unwrap(), None);
+
+    // a dropped (uncommitted) batch changes nothing
+    let before = b.version();
+    {
+        let mut batch = b.batch();
+        batch.put(b"c", b"3").unwrap();
+        batch.put(b"d", b"4").unwrap();
+        // no commit() — dropped here
+    }
+    assert_eq!(b.version(), before, "rolled-back batch leaves version unchanged");
+    assert_eq!(b.get(b"c").unwrap(), None);
+    assert_eq!(b.get(b"a").unwrap().as_deref(), Some(&b"1"[..]), "committed data intact");
+
+    // a larger batch (forces multi-node rewrites) commits as one unit
+    let mut batch = b.batch();
+    for i in 0..30u32 {
+        batch.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+    }
+    batch.commit().unwrap();
+    for i in 0..30u32 {
+        assert_eq!(b.get(format!("k{i:02}").as_bytes()).unwrap().as_deref(), Some(&b"v"[..]));
+    }
+}
