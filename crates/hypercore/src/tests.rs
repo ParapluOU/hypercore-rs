@@ -2102,3 +2102,49 @@ fn seek_locates_the_block_for_a_byte_offset() {
     assert_eq!(core.seek(core.byte_length()), (4, 0));
     assert_eq!(core.seek(core.byte_length() + 100), (4, 100));
 }
+
+#[test]
+fn user_data_round_trips_and_persists() {
+    let mut core = Hypercore::<Vec<u8>, _, _>::new(author(77), Bytes, MemoryStore::new());
+    assert_eq!(core.get_user_data(b"name").unwrap(), None);
+    core.set_user_data(b"name", b"score-42").unwrap();
+    core.set_user_data(b"lang", b"abc").unwrap();
+    core.set_user_data(b"name", b"renamed").unwrap(); // overwrite
+    assert_eq!(core.get_user_data(b"name").unwrap().as_deref(), Some(&b"renamed"[..]));
+    assert_eq!(core.get_user_data(b"lang").unwrap().as_deref(), Some(&b"abc"[..]));
+
+    // survives persist/open
+    core.append(&blk("x")).unwrap();
+    core.persist().unwrap();
+    let store = core.store.clone();
+    let reopened = Hypercore::<Vec<u8>, _, _>::open(author(77), Bytes, store).unwrap();
+    assert_eq!(reopened.get_user_data(b"name").unwrap().as_deref(), Some(&b"renamed"[..]));
+}
+
+#[test]
+fn purge_clears_blocks_and_metadata() {
+    let mut core = Hypercore::<Vec<u8>, _, _>::new(author(78), Bytes, MemoryStore::new());
+    for v in ["a", "b", "c"] {
+        core.append(&blk(v)).unwrap();
+    }
+    core.set_user_data(b"k", b"v").unwrap();
+    core.persist().unwrap();
+    assert_eq!(core.len(), 3);
+
+    core.purge().unwrap();
+    assert_eq!(core.len(), 0);
+    assert!(core.head().is_none());
+    assert_eq!(core.get(0).unwrap(), None);
+    assert_eq!(core.get_user_data(b"k").unwrap(), None);
+
+    // the store no longer holds a persisted core
+    let store = core.store.clone();
+    assert!(matches!(
+        Hypercore::<Vec<u8>, _, _>::open(author(78), Bytes, store),
+        Err(Error::NotPersisted)
+    ));
+
+    // and it is usable again from empty
+    core.append(&blk("fresh")).unwrap();
+    assert_eq!(core.get(0).unwrap(), Some(blk("fresh")));
+}

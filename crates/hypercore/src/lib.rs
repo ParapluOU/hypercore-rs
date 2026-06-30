@@ -31,6 +31,7 @@ const HEAD_DOMAIN: u8 = 0xC0;
 const KEY_META: u64 = u64::MAX; // fork + signed head + prologue
 const KEY_TREE: u64 = u64::MAX - 1; // serialized MerkleTree
 const KEY_PRESENCE: u64 = u64::MAX - 2; // serialized presence Bitfield
+const KEY_USERDATA: u64 = u64::MAX - 3; // app metadata map (set_user_data/get_user_data)
 
 fn head_message(fork: u64, length: u64, root: &Hash) -> Vec<u8> {
     let mut m = Vec::with_capacity(1 + 8 + 8 + 32);

@@ -95,9 +95,50 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
 
     /// Locate the block containing byte offset `byte_offset` (over the *encoded*
     /// blocks): returns `(block_index, offset_within_block)`, tree-accelerated
-    /// (upstream `seek`). An offset at or past the end returns `(len, 0)`.
+    /// (upstream `seek`). An offset at or past the end returns `(len, leftover)`.
     pub fn seek(&self, byte_offset: u64) -> (u64, u64) {
         self.tree.seek(byte_offset)
+    }
+
+    /// Store app-defined metadata under `key` (upstream `setUserData`). Persisted in
+    /// the core's `Store` under a reserved key, so it survives `persist`/`open`.
+    pub fn set_user_data(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error<S::Error>> {
+        let mut map = self.load_user_data()?;
+        map.insert(key.to_vec(), value.to_vec());
+        self.store
+            .put(KEY_USERDATA, &encode_user_data(&map))
+            .map_err(Error::Storage)
+    }
+
+    /// Read app-defined metadata for `key` (upstream `getUserData`), or `None`.
+    pub fn get_user_data(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error<S::Error>> {
+        Ok(self.load_user_data()?.remove(key))
+    }
+
+    fn load_user_data(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Error<S::Error>> {
+        match self.store.get(KEY_USERDATA).map_err(Error::Storage)? {
+            Some(bytes) => decode_user_data(&bytes).ok_or(Error::Corrupt),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// **Purge**: delete this core's blocks and metadata from the `Store` and reset it
+    /// to empty (upstream `purge`). Physical reclamation is the backend's job (the
+    /// log-structured store compacts); this removes the logical data.
+    pub fn purge(&mut self) -> Result<(), Error<S::Error>> {
+        for i in 0..self.tree.len() {
+            self.store.delete(i).map_err(Error::Storage)?;
+        }
+        for k in [KEY_META, KEY_TREE, KEY_PRESENCE, KEY_USERDATA] {
+            self.store.delete(k).map_err(Error::Storage)?;
+        }
+        self.tree = MerkleTree::new();
+        self.presence = Bitfield::new();
+        self.head = None;
+        self.fork = 0;
+        self.prologue = None;
+        self.last_truncation = None;
+        Ok(())
     }
 
     /// The truncation performed by the immediately preceding operation, or `None`
@@ -626,4 +667,52 @@ impl<T, C: Codec<T> + Clone, S: Store> Hypercore<T, C, S> {
             _t: PhantomData,
         })
     }
+}
+
+/// Encode the user-data map: `[count]` then per entry `[klen][k][vlen][v]`, all
+/// little-endian. (Internal to `set_user_data`/`get_user_data`.)
+fn encode_user_data(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(map.len() as u64).to_le_bytes());
+    for (k, v) in map {
+        out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+/// Inverse of [`encode_user_data`]; `None` on a malformed/truncated buffer.
+fn decode_user_data(bytes: &[u8]) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
+    fn u64_at(b: &mut &[u8]) -> Option<u64> {
+        if b.len() < 8 {
+            return None;
+        }
+        let (h, r) = b.split_at(8);
+        *b = r;
+        Some(u64::from_le_bytes(h.try_into().ok()?))
+    }
+    fn bytes_at(b: &mut &[u8], n: usize) -> Option<Vec<u8>> {
+        if b.len() < n {
+            return None;
+        }
+        let (h, r) = b.split_at(n);
+        *b = r;
+        Some(h.to_vec())
+    }
+    let mut b = bytes;
+    let count = u64_at(&mut b)? as usize;
+    let mut map = BTreeMap::new();
+    for _ in 0..count {
+        let kl = u64_at(&mut b)? as usize;
+        let k = bytes_at(&mut b, kl)?;
+        let vl = u64_at(&mut b)? as usize;
+        let v = bytes_at(&mut b, vl)?;
+        map.insert(k, v);
+    }
+    if !b.is_empty() {
+        return None;
+    }
+    Some(map)
 }
