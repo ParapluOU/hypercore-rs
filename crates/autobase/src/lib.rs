@@ -783,6 +783,86 @@ impl Linearizer {
         out
     }
 
+    /// The **full indexed view**: [`confirmed_prefix`](Self::confirmed_prefix) with the
+    /// non-indexer nodes woven in — the faithful port of `linearizer.js`'s `_yield`.
+    ///
+    /// Each `shift` confirms a batch of indexer nodes; this expands every batch to its
+    /// newly-covered causal closure (so a confirmed indexer node's non-indexer
+    /// dependencies are included) and emits that closure in our key-tiebreak
+    /// topological order (upstream's `Topolist` uses the *same* lowest-key tiebreak,
+    /// `cmpUnlinked`). Batches only ever append, so the result is **monotone** under
+    /// growth and is **causally closed over all deps** — the prefix that
+    /// [`order`](Self::order) is being aligned to (ADR-0043 / the swap).
+    pub fn confirmed_view(&self) -> Vec<NodeId> {
+        if self.majority().is_none() {
+            return Vec::new();
+        }
+        let mut removed = Clock::default();
+        let mut emitted: BTreeSet<NodeId> = BTreeSet::new();
+        let mut out: Vec<NodeId> = Vec::new();
+        loop {
+            let batch = self.shift_once(&mut removed);
+            if batch.is_empty() {
+                break;
+            }
+            // The newly-covered nodes: the causal closure of this batch not yet emitted.
+            let mut fresh: BTreeSet<NodeId> = BTreeSet::new();
+            let mut stack = batch;
+            while let Some(n) = stack.pop() {
+                if emitted.contains(&n) || !fresh.insert(n) {
+                    continue;
+                }
+                if let Some(ds) = self.deps.get(&n) {
+                    for d in ds {
+                        if !emitted.contains(d) {
+                            stack.push(*d);
+                        }
+                    }
+                }
+            }
+            // Emit the batch in key-tiebreak topological order (deps already emitted
+            // count as satisfied), then mark them emitted.
+            for node in self.topo_key_order(&fresh, &emitted) {
+                emitted.insert(node);
+                out.push(node);
+            }
+        }
+        out
+    }
+
+    /// Priority-Kahn (lowest [`NodeId`] first) over the node subset `nodes`, treating
+    /// any dependency already in `emitted` as satisfied. The within-batch ordering for
+    /// [`confirmed_view`](Self::confirmed_view) — the same tiebreak as
+    /// [`order`](Self::order).
+    fn topo_key_order(&self, nodes: &BTreeSet<NodeId>, emitted: &BTreeSet<NodeId>) -> Vec<NodeId> {
+        let mut indeg: BTreeMap<NodeId, usize> = nodes
+            .iter()
+            .map(|n| {
+                let unmet = self
+                    .deps
+                    .get(n)
+                    .map(|ds| ds.iter().filter(|d| nodes.contains(d) && !emitted.contains(d)).count())
+                    .unwrap_or(0);
+                (*n, unmet)
+            })
+            .collect();
+        let mut frontier: BTreeSet<NodeId> =
+            indeg.iter().filter(|(_, d)| **d == 0).map(|(n, _)| *n).collect();
+        let mut out = Vec::with_capacity(nodes.len());
+        while let Some(node) = frontier.pop_first() {
+            out.push(node);
+            for dep in self.dependents.get(&node).into_iter().flatten() {
+                if let Some(d) = indeg.get_mut(dep) {
+                    *d -= 1;
+                    if *d == 0 {
+                        frontier.insert(*dep);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The **quorum degree** achieved over `target` (DESIGN.md "Quorums").
     ///
     /// A **vote** is a reference from an indexer to a node (at most one per

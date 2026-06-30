@@ -421,3 +421,56 @@ fn confirmed_prefix_is_indexer_consensus_closed_and_converges() {
     }
     assert!(total > 0, "confirmed_prefix never confirmed anything — the path was not exercised");
 }
+
+/// `confirmed_view` (the `_yield` port: `confirmed_prefix` + woven-in non-indexer
+/// nodes) must be **fully causally closed** (every dep, indexer *or* non-indexer,
+/// appears strictly earlier — the property `confirmed_prefix` lacked), include every
+/// confirmed indexer node, and **converge** across delivery orders. This is the
+/// prefix `order()` will be aligned to.
+#[test]
+fn confirmed_view_is_fully_causally_closed_and_converges() {
+    let n_writers = 5;
+    let n_indexers = 3;
+    let n_nodes = 30;
+    let replicas = 4;
+    let indexers: Vec<WriterKey> = (0..n_indexers).map(wkey).collect();
+
+    let mut total = 0usize;
+    for seed in 0..16u64 {
+        let mut rng = Rng::new(0xB00C_0000_0000_0001u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let (rn, rd) = if seed % 2 == 0 { (3, 5) } else { (17, 20) };
+        let dag = gen_partitioned(n_writers, n_nodes, rn, rd, &mut rng);
+        let deps = dag.deps();
+        let cross_by_node = dag.cross_by_node();
+
+        let r0 = deliver(&cross_by_node, &dag.creation_order(), &indexers);
+        let cv0 = r0.confirmed_view();
+        let pos: BTreeMap<NodeId, usize> = cv0.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+
+        for (i, node) in cv0.iter().enumerate() {
+            for d in deps.get(node).into_iter().flatten() {
+                let di = pos.get(d).copied();
+                assert!(
+                    di.is_some() && di.unwrap() < i,
+                    "confirmed_view not fully causally closed (seed {seed}): {d:?} before {node:?}"
+                );
+            }
+        }
+        let cv_set: BTreeSet<NodeId> = cv0.iter().copied().collect();
+        for n in r0.confirmed_prefix() {
+            assert!(cv_set.contains(&n), "confirmed_view ⊇ confirmed_prefix (seed {seed}): {n:?}");
+        }
+        total += cv0.len();
+
+        for rep in 0..replicas {
+            let topo = random_topo(&deps, &mut rng);
+            let r = deliver(&cross_by_node, &topo, &indexers);
+            assert_eq!(
+                r.confirmed_view(),
+                cv0,
+                "confirmed_view converges across delivery orders (seed {seed} rep {rep})"
+            );
+        }
+    }
+    assert!(total > 0, "confirmed_view never confirmed anything — the path was not exercised");
+}

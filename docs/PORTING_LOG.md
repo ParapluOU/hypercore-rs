@@ -2082,3 +2082,25 @@ all-indexer toy DAGs — the `_yield` gap and the order divergence are invisible
 - Port `_yield`/`Topolist.add` (weave non-indexer nodes into the indexed batch), and decide the
   `order()` ↔ consensus-order reconciliation (align `order()`'s confirmed prefix to consensus, or define
   the indexed view independently of key-tiebreak `order()`). Then the swap.
+
+---
+
+## 2026-06-30 — autobase: `_yield` ported (`confirmed_view`); user chose align-`order()`-to-consensus
+
+**Key discovery:** upstream's `Topolist` orders by `cmpUnlinked` = `compare(a.key, b.key)` then length —
+**the same lowest-key tiebreak as our `order()`**. So `_yield` emits the confirmed sub-DAG in *our* tiebreak
+order, batch by batch (each `shift` appends a sorted batch). That makes the alignment clean and monotone.
+
+**Did**
+- Ported `_yield` as `Linearizer::confirmed_view`: accumulate each `shift` batch, expand it to its
+  newly-covered causal closure (pulling in non-indexer deps), emit that closure in key-tiebreak topo order
+  (`topo_key_order`), batches only appending. Resolves blocker #1 — `confirmed_view` is **fully causally
+  closed over all deps** (the property `confirmed_prefix` lacked), includes every confirmed indexer node,
+  and converges across delivery orders (new sim test). Gate **204**.
+- User decision: **align `order()` to consensus** (ADR-0043 option A).
+
+**Next (the swap)**
+- Redefine `order()` = `confirmed_view()` ++ `topo_key_order(remaining)`; `finalized()` = `confirmed_view()`
+  (a true prefix by construction, monotone). Add a test-only conservative oracle, repurpose the staging
+  contrast tests onto it, and revalidate the whole convergence sim (order ⊑ finalized, convergence,
+  monotonicity).
