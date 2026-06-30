@@ -25,6 +25,14 @@ pub use manifest_core::{verify_manifest_block, ManifestCore, ManifestHead, Manif
 /// the author might sign).
 const HEAD_DOMAIN: u8 = 0xC0;
 
+/// Reserved [`Store`] keys for persisted core metadata (see [`Hypercore::persist`]
+/// / [`Hypercore::open`]). Block bytes occupy keys `0..length`; these live at the
+/// very top of the `u64` space, so a collision would need ~1.8e19 blocks — a clean
+/// divergence from upstream's separate per-section files (ADR-0041).
+const KEY_META: u64 = u64::MAX; // fork + signed head + prologue
+const KEY_TREE: u64 = u64::MAX - 1; // serialized MerkleTree
+const KEY_PRESENCE: u64 = u64::MAX - 2; // serialized presence Bitfield
+
 fn head_message(fork: u64, length: u64, root: &Hash) -> Vec<u8> {
     let mut m = Vec::with_capacity(1 + 8 + 8 + 32);
     m.push(HEAD_DOMAIN);
@@ -134,8 +142,14 @@ impl Default for ByteStreamOptions {
 pub enum Error<SE> {
     Storage(SE),
     Codec(codec::Error),
-    /// A stored block was missing where the tree says one exists.
+    /// A stored block was missing where the tree says one exists, or persisted
+    /// metadata was malformed / failed its self-consistency + signature check on
+    /// [`open`](Hypercore::open).
     Corrupt,
+    /// [`open`](Hypercore::open) found no persisted core in the store (a required
+    /// metadata key is absent — the store was never [`persist`](Hypercore::persist)ed,
+    /// or holds a different kind of data).
+    NotPersisted,
     /// [`copy_prologue`](Hypercore::copy_prologue) was called on a core that
     /// carries no [`Prologue`] commitment to satisfy.
     NoPrologue,
@@ -633,6 +647,154 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
                     && self.public.verify(&head_message(h.fork, h.length, &h.root), &h.sig)
             }
         }
+    }
+
+    /// Encode the in-memory authenticated *metadata* (the part not already in the
+    /// block store): `fork`, the optional `SignedHead`, and the optional
+    /// `Prologue`. Layout (little-endian): `[fork u64]`, then a head tag — `0` for
+    /// none or `1` followed by `[fork u64][length u64][root 32B][sig 64B]` — then a
+    /// prologue tag — `0` for none or `1` followed by `[length u64][hash 32B]`.
+    /// The transient `last_truncation` guard is deliberately not persisted.
+    fn encode_meta(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 1 + 112 + 1 + 40);
+        out.extend_from_slice(&self.fork.to_le_bytes());
+        match &self.head {
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(&h.fork.to_le_bytes());
+                out.extend_from_slice(&h.length.to_le_bytes());
+                out.extend_from_slice(&h.root);
+                out.extend_from_slice(&h.sig.to_bytes());
+            }
+            None => out.push(0),
+        }
+        match &self.prologue {
+            Some(p) => {
+                out.push(1);
+                out.extend_from_slice(&p.length.to_le_bytes());
+                out.extend_from_slice(&p.hash);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    /// Inverse of [`encode_meta`](Self::encode_meta). `None` on any malformed or
+    /// truncated buffer (including trailing bytes).
+    fn decode_meta(bytes: &[u8]) -> Option<(u64, Option<SignedHead>, Option<Prologue>)> {
+        let mut off = 0usize;
+        let take = |off: &mut usize, n: usize| -> Option<&[u8]> {
+            let s = bytes.get(*off..*off + n)?;
+            *off += n;
+            Some(s)
+        };
+        let u64_at = |off: &mut usize| -> Option<u64> {
+            Some(u64::from_le_bytes(take(off, 8)?.try_into().ok()?))
+        };
+
+        let fork = u64_at(&mut off)?;
+
+        let head = match take(&mut off, 1)?[0] {
+            0 => None,
+            1 => {
+                let h_fork = u64_at(&mut off)?;
+                let length = u64_at(&mut off)?;
+                let mut root: Hash = [0u8; 32];
+                root.copy_from_slice(take(&mut off, 32)?);
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes.copy_from_slice(take(&mut off, 64)?);
+                Some(SignedHead {
+                    fork: h_fork,
+                    length,
+                    root,
+                    sig: Sig::from_bytes(&sig_bytes),
+                })
+            }
+            _ => return None,
+        };
+
+        let prologue = match take(&mut off, 1)?[0] {
+            0 => None,
+            1 => {
+                let length = u64_at(&mut off)?;
+                let mut hash: Hash = [0u8; 32];
+                hash.copy_from_slice(take(&mut off, 32)?);
+                Some(Prologue { length, hash })
+            }
+            _ => return None,
+        };
+
+        if off != bytes.len() {
+            return None; // trailing garbage
+        }
+        Some((fork, head, prologue))
+    }
+
+    /// Persist this core's authenticated state to its [`Store`] so it can be
+    /// reconstituted later with [`open`](Self::open) — the local-first payoff: a
+    /// browser (OPFS) writer survives a reload. Block bytes are already written on
+    /// [`append`](Self::append); this flushes the parts that otherwise live only in
+    /// memory — the Merkle tree, the presence map, the signed head, the fork, and
+    /// any prologue — under three reserved high keys ([`KEY_TREE`], [`KEY_PRESENCE`],
+    /// [`KEY_META`]) that no realistic block index can collide with.
+    ///
+    /// The author's **secret key is never written** — it belongs to the caller's
+    /// keyring, not the data store; `open` takes it back as a parameter.
+    pub fn persist(&mut self) -> Result<(), Error<S::Error>> {
+        let tree = self.tree.serialize();
+        let presence = self.presence.serialize();
+        let meta = self.encode_meta();
+        self.store.put(KEY_TREE, &tree).map_err(Error::Storage)?;
+        self.store.put(KEY_PRESENCE, &presence).map_err(Error::Storage)?;
+        self.store.put(KEY_META, &meta).map_err(Error::Storage)?;
+        Ok(())
+    }
+
+    /// Reconstitute a writable core from a [`Store`] previously written by
+    /// [`persist`](Self::persist), pairing the persisted log data with the
+    /// caller-supplied `author` key and `codec`. The loaded head is checked for
+    /// internal consistency *and* verified against `author`'s public key
+    /// ([`verify_head`](Self::verify_head)) — so opening a store under the wrong key,
+    /// or one carrying tampered metadata, fails with [`Error::Corrupt`] rather than
+    /// yielding a bogus core. [`Error::NotPersisted`] if the store was never
+    /// persisted.
+    pub fn open(author: SecretKey, codec: C, store: S) -> Result<Self, Error<S::Error>> {
+        let public = author.public();
+
+        let meta_bytes = store.get(KEY_META).map_err(Error::Storage)?;
+        let tree_bytes = store.get(KEY_TREE).map_err(Error::Storage)?;
+        let presence_bytes = store.get(KEY_PRESENCE).map_err(Error::Storage)?;
+        let (Some(meta_bytes), Some(tree_bytes), Some(presence_bytes)) =
+            (meta_bytes, tree_bytes, presence_bytes)
+        else {
+            return Err(Error::NotPersisted);
+        };
+
+        let tree = MerkleTree::deserialize(&tree_bytes).ok_or(Error::Corrupt)?;
+        let presence = Bitfield::deserialize(&presence_bytes).ok_or(Error::Corrupt)?;
+        let (fork, head, prologue) = Self::decode_meta(&meta_bytes).ok_or(Error::Corrupt)?;
+
+        let core = Self {
+            author,
+            public,
+            codec,
+            store,
+            tree,
+            presence,
+            head,
+            fork,
+            last_truncation: None,
+            prologue,
+            _t: PhantomData,
+        };
+
+        // The persisted head must be self-consistent with the persisted tree *and*
+        // signed by this author — catches a wrong key, a mismatched tree/head pair,
+        // or tampered metadata.
+        if !core.verify_head() {
+            return Err(Error::Corrupt);
+        }
+        Ok(core)
     }
 }
 
@@ -3056,5 +3218,122 @@ mod tests {
         assert!(m.verify_prologue());
         assert_eq!(m.get(0).unwrap(), Some(blk("a")));
         assert_eq!(m.get(1).unwrap(), Some(blk("b")));
+    }
+
+    #[test]
+    fn persist_and_open_round_trips_a_full_core() {
+        let values = ["aa", "bb", "ccc", "d", "eeeee"];
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(70), Bytes, MemoryStore::new());
+        for v in values {
+            core.append(&blk(v)).unwrap();
+        }
+        core.persist().unwrap();
+
+        let (len, fork, byte_len) = (core.len(), core.fork(), core.byte_length());
+        let root = core.head().unwrap().root;
+        let store = core.store.clone(); // private field, same crate — simulates a fresh process
+        drop(core);
+
+        let reopened = Hypercore::<Vec<u8>, _, _>::open(author(70), Bytes, store).unwrap();
+        assert_eq!(reopened.len(), len);
+        assert_eq!(reopened.fork(), fork);
+        assert_eq!(reopened.byte_length(), byte_len);
+        assert_eq!(reopened.head().unwrap().root, root);
+        assert!(reopened.verify_head());
+
+        let pk = author(70).public();
+        let head = reopened.head().unwrap();
+        for (i, v) in values.iter().enumerate() {
+            let i = i as u64;
+            assert_eq!(reopened.get(i).unwrap(), Some(blk(v)), "block {i} bytes survive");
+            // proofs authenticate the codec-*encoded* leaf, not the raw value
+            let encoded = reopened.block(i).unwrap().expect("encoded bytes");
+            let proof = reopened.proof(i).expect("proof");
+            assert!(verify_block(&pk, head, i, &encoded, &proof), "block {i} authenticated");
+        }
+        // and it keeps working as a live writer afterward
+        let mut reopened = reopened;
+        let idx = reopened.append(&blk("ffff")).unwrap();
+        assert_eq!(idx, len);
+        assert_eq!(reopened.get(idx).unwrap(), Some(blk("ffff")));
+    }
+
+    #[test]
+    fn persist_and_open_a_sparse_core_keeps_cleared_blocks_authenticated() {
+        let values = ["aa", "bb", "ccc", "d"];
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(71), Bytes, MemoryStore::new());
+        for v in values {
+            core.append(&blk(v)).unwrap();
+        }
+        assert_eq!(core.clear(1, 2).unwrap(), 1, "drops block 1's bytes");
+        core.persist().unwrap();
+        let store = core.store.clone();
+        drop(core);
+
+        let reopened = Hypercore::<Vec<u8>, _, _>::open(author(71), Bytes, store).unwrap();
+        // the cleared block's bytes are gone, but the tree still authenticates it
+        assert!(!reopened.has(1));
+        assert_eq!(reopened.get(1).unwrap(), None);
+        assert!(reopened.has(0) && reopened.has(2) && reopened.has(3));
+
+        let pk = author(71).public();
+        let head = reopened.head().unwrap();
+        let proof = reopened.proof(1).expect("cleared block still has a proof");
+        // the bytes are gone, so re-derive the encoded leaf the way append() did
+        let encoded_bb = Bytes.encode(&blk("bb"));
+        assert!(
+            verify_block(&pk, head, 1, &encoded_bb, &proof),
+            "an absent block is still authenticated for a later re-fetch"
+        );
+    }
+
+    #[test]
+    fn open_with_the_wrong_key_is_rejected() {
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(72), Bytes, MemoryStore::new());
+        core.append(&blk("x")).unwrap();
+        core.persist().unwrap();
+        let store = core.store.clone();
+
+        // a different author's key cannot open someone else's persisted core
+        let result = Hypercore::<Vec<u8>, _, _>::open(author(99), Bytes, store);
+        assert!(matches!(result, Err(Error::Corrupt)), "wrong key must be rejected");
+    }
+
+    #[test]
+    fn open_an_unpersisted_store_reports_not_persisted() {
+        // never persisted at all
+        let empty = Hypercore::<Vec<u8>, _, _>::open(author(73), Bytes, MemoryStore::new());
+        assert!(matches!(empty, Err(Error::NotPersisted)));
+
+        // appended (so block keys exist) but persist() was never called → still no metadata
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(73), Bytes, MemoryStore::new());
+        core.append(&blk("x")).unwrap();
+        let store = core.store.clone();
+        assert!(matches!(
+            Hypercore::<Vec<u8>, _, _>::open(author(73), Bytes, store),
+            Err(Error::NotPersisted)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_tampered_metadata() {
+        let mut core = Hypercore::<Vec<u8>, _, _>::new(author(74), Bytes, MemoryStore::new());
+        for v in ["aa", "bb", "ccc"] {
+            core.append(&blk(v)).unwrap();
+        }
+        core.persist().unwrap();
+        let mut store = core.store.clone();
+
+        // Flip a byte inside the last serialized tree node's hash: the tree still
+        // deserializes, but its root_hash no longer matches the signed head → Corrupt.
+        let mut tree = store.get(KEY_TREE).unwrap().unwrap();
+        let last = tree.len() - 1;
+        tree[last] ^= 0xff;
+        store.put(KEY_TREE, &tree).unwrap();
+
+        assert!(matches!(
+            Hypercore::<Vec<u8>, _, _>::open(author(74), Bytes, store),
+            Err(Error::Corrupt)
+        ));
     }
 }

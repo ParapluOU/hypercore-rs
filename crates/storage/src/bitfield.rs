@@ -285,6 +285,60 @@ impl Bitfield {
     pub fn last_unset(&self, position: u64) -> Option<u64> {
         self.find_last(false, position)
     }
+
+    /// Serialize the field for persistence (e.g. a hypercore's presence map; see
+    /// `hypercore::Hypercore::persist`). Only **non-zero** pages are emitted — an
+    /// all-`false` page is semantically identical to an absent one, so a cleared
+    /// page never bloats the snapshot. Layout: `[live_page_count u64]` then, per
+    /// page, `[page_index u64][WORDS_PER_PAGE × u64]`, all little-endian. Not
+    /// disk-compatible with upstream (ADR-0001 / ADR-0030's deferred persistence).
+    pub fn serialize(&self) -> Vec<u8> {
+        let live: Vec<(&u64, &Box<Page>)> = self
+            .pages
+            .iter()
+            .filter(|(_, p)| p.iter().any(|&w| w != 0))
+            .collect();
+        let mut out = Vec::with_capacity(8 + live.len() * (8 + WORDS_PER_PAGE * 8));
+        out.extend_from_slice(&(live.len() as u64).to_le_bytes());
+        for (idx, page) in live {
+            out.extend_from_slice(&idx.to_le_bytes());
+            for &word in page.iter() {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a field from [`serialize`](Self::serialize) output. Returns
+    /// `None` on a malformed buffer (truncated, or trailing bytes). The result is
+    /// semantically identical to the serialized field for every query, though its
+    /// page map omits any all-zero pages the original happened to retain.
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 8 {
+            return None;
+        }
+        let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+        const PAGE_BYTES: usize = WORDS_PER_PAGE * 8;
+        let mut pages = BTreeMap::new();
+        let mut off = 8usize;
+        for _ in 0..count {
+            if off + 8 + PAGE_BYTES > bytes.len() {
+                return None;
+            }
+            let idx = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
+            off += 8;
+            let mut page: Page = [0u64; WORDS_PER_PAGE];
+            for word in page.iter_mut() {
+                *word = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
+                off += 8;
+            }
+            pages.insert(idx, Box::new(page));
+        }
+        if off != bytes.len() {
+            return None; // trailing garbage — reject rather than silently ignore
+        }
+        Some(Bitfield { pages })
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +654,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn serialize_round_trip_preserves_every_query() {
+        let mut b = Bitfield::new();
+        // bits scattered across several sparse pages + a set range spanning a page edge
+        for i in [0u64, 1, 63, 64, 65, 32_767, 32_768, 100_000, 8_000_000_000] {
+            b.set(i, true);
+        }
+        b.set_range(500, 1200, true);
+
+        let restored = Bitfield::deserialize(&b.serialize()).expect("round-trips");
+
+        // every individual query agrees across a wide, page-boundary-crossing sweep
+        for i in (0..1300u64)
+            .chain([32_766, 32_767, 32_768, 32_769, 99_999, 100_000, 100_001])
+            .chain([7_999_999_999, 8_000_000_000, 8_000_000_001])
+        {
+            assert_eq!(b.get(i), restored.get(i), "get({i})");
+        }
+        for pos in [0u64, 100, 500, 1199, 1200, 32_768, 100_000, 8_000_000_000] {
+            for value in [true, false] {
+                assert_eq!(b.find_first(value, pos), restored.find_first(value, pos));
+                assert_eq!(b.find_last(value, pos), restored.find_last(value, pos));
+            }
+        }
+        assert_eq!(b.count(0, 9_000_000_000, true), restored.count(0, 9_000_000_000, true));
+    }
+
+    #[test]
+    fn serialize_skips_all_zero_pages_but_keeps_semantics() {
+        let mut b = Bitfield::new();
+        b.set(40_000, true); // materializes page 1
+        b.set(40_000, false); // page 1 is now all-zero but still in the map
+        b.set(5, true); // page 0 is genuinely live
+        // page 1 contributes 8 bytes of header it would otherwise carry: assert it's dropped
+        let one_live_page = 8 + (8 + WORDS_PER_PAGE * 8);
+        assert_eq!(b.serialize().len(), one_live_page, "the all-zero page is not emitted");
+        let restored = Bitfield::deserialize(&b.serialize()).unwrap();
+        assert!(restored.get(5));
+        assert!(!restored.get(40_000));
+        assert_eq!(restored.count(0, 100_000, true), 1);
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_buffers() {
+        assert!(Bitfield::deserialize(&[]).is_none()); // no header
+        assert!(Bitfield::deserialize(&[1, 0, 0, 0, 0, 0, 0, 0]).is_none()); // claims a page, has none
+        let mut b = Bitfield::new();
+        b.set(7, true);
+        let mut bytes = b.serialize();
+        bytes.push(0xff); // trailing garbage
+        assert!(Bitfield::deserialize(&bytes).is_none());
     }
 }

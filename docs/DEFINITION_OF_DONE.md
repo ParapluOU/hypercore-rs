@@ -76,13 +76,22 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [x] `storage` — **sparse bitfield** (`Bitfield`: get / set / set_range / count(start,**length**,val) /
       find_first / find_last over an unbounded, sparse, paged local presence map; clean-room of
       `bitfield.js`'s L1 data structure — `find_first(false,..)` always `Some` (infinite-zero tail),
-      a missing page is an all-`false` page never materialized on clear; persistence `open`/`flush` and
-      replication `want` chunking out of scope, ADR-0030) — the foundation for `clear`/`purge`/sparse cores
+      a missing page is an all-`false` page never materialized on clear; **persistence now via
+      `serialize`/`deserialize`** (live non-zero pages only; ADR-0041) — replication `want` chunking still
+      out of scope, ADR-0030) — the foundation for `clear`/`purge`/sparse cores
 - [x] `storage` — **OPFS browser backend** (wasm): sync `FileSystemSyncAccessHandle`, persistent;
       behind the `opfs` feature + `--cfg web_sys_unstable_apis`; worker-only. **Verified in real headless
       Chrome** — put/get/overwrite/delete + persistence across close+reopen (ADR-0038). (IndexedDB has no
       sync API; rejected in favour of OPFS.) **Log-structured** — append + replay + `compact()` via a
       `SyncFile` abstraction whose KV/compaction logic is tested natively against `MemFile` (ADR-0039).
+- [x] `hypercore` — **persistence** (`persist`/`open`): reconstitute a core (Merkle tree + presence
+      bitfield + signed head + fork + prologue) from its `Store` — the local-first payoff for the OPFS
+      backend. Built on `MerkleTree`/`Bitfield` `serialize`/`deserialize` + three reserved top keys
+      (`u64::MAX..-2`, ADR-0041). The **secret key is never persisted**; `open` re-verifies the loaded head
+      against the caller's key, so wrong-key / tampered-metadata → `Corrupt` and an unpersisted store →
+      `NotPersisted`. A **sparse** core round-trips with cleared blocks still authenticated (tree survives,
+      proof verifies, bytes absent). Deferred: incremental/dirty persistence; an end-to-end OPFS wasm test;
+      `ManifestCore` persistence.
 - [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +
       **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019) +

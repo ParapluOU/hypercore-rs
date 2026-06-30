@@ -459,3 +459,12 @@ personal data** (this repo is public; use repo-relative paths).
   compaction, partial-tail recovery) is target-agnostic. Put it behind a `SyncFile` trait and test
   `LogStore<MemFile>` with plain `cargo test`; the browser run then only confirms the thin OPFS `SyncFile`
   impl. Push platform code to the edges.
+- **Proofs authenticate the codec-*encoded* leaf, not the raw value.** A Merkle leaf hashes what
+  `append` stored — `codec.encode(value)` — so `verify_block`/`proof.verify` must be given the encoded
+  bytes. Use `core.block(i)` (encoded) for present blocks; for a *cleared* block re-derive it with
+  `codec.encode(&value)`. Passing the raw value silently fails verification (re-learned writing the
+  persist/open round-trip test).
+- **Reserve top-of-keyspace keys for metadata in a flat `u64` store.** When one `u64→bytes` map holds both
+  block bytes (`0..length`) and per-core metadata, put metadata at `u64::MAX`, `MAX-1`, … — a collision
+  needs ~1.8e19 blocks. The clean-room single-store equivalent of upstream's separate per-section files
+  (ADR-0041). And keep each type's serialization *in its own crate* so private layouts stay encapsulated.

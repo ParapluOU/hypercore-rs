@@ -1880,3 +1880,34 @@ thin OPFS binding still needs a browser.
 **Next**
 - Compaction tuning; wire OPFS persistence into the bitfield/snapshot open/flush. Then: JS oracle /
   fork-merge consensus; `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.
+
+---
+
+## 2026-06-30 — Core persistence: `Hypercore::persist`/`open` (local-first payoff)
+
+**Did**
+- The capstone for the OPFS work: a core's authenticated state (Merkle tree, presence bitfield, signed
+  head, fork, prologue) was in-memory only, with no `open` — so a browser reload kept the bytes but
+  couldn't reconstitute the core. Added `Hypercore::persist`/`open`.
+- Serialization sits with each type: `MerkleTree::serialize`/`deserialize` (merkle) and
+  `Bitfield::serialize`/`deserialize` (storage — closes the ADR-0030 persistence gap, emitting only live
+  non-zero pages); `hypercore` adds a metadata codec and writes all three blobs under reserved top keys
+  (`u64::MAX`, `-1`, `-2`). The secret key is never persisted; `open` re-verifies the head against the
+  caller's key.
+- 11 new native tests: merkle 3 (round-trip root/proofs/byte_length, sparse round-trip, malformed reject);
+  bitfield 3 (round-trip every query, zero-page skipping, malformed reject); hypercore 5 (full round-trip
+  + live-append-after-open, sparse round-trip keeps cleared blocks authenticated, wrong-key→Corrupt,
+  unpersisted→NotPersisted, tampered-metadata→Corrupt). Full gate **183**; wasm compiles.
+
+**Decisions** — ADR-0041 (persist/open; reserved-key layout in the flat `u64` store; head re-verified
+against the caller's key on open).
+
+**Lessons** — verification authenticates the codec-*encoded* leaf, not the raw value (so a cleared block
+re-derives the encoded bytes to verify); encapsulate each type's serialization in its own crate; reserve
+top-of-keyspace keys for metadata in a flat `u64` store.
+
+**Next**
+- Wire `persist` into the OPFS path end-to-end in the browser (a wasm test: append → persist → reopen via
+  a fresh `OpfsStore` → verify); incremental/dirty persistence; `ManifestCore` persistence. Then the
+  larger tail: JS oracle / fork-merge consensus; `Hypercore`/`ManifestCore` unification; `hyperbee`
+  del/sub.

@@ -826,3 +826,27 @@ deterministic Rust fold (minimal new code, high proving cost). The view could th
   circuit-friendly). No swap now.
 **Non-goal:** privacy/ZK of op contents — attribution is meant to be public; the property of interest is
 succinctness (the "S" in SNARK), not zero-knowledge.
+
+## ADR-0041 — Reconstitute a core from storage: `persist`/`open` over reserved keys
+**Context:** `Hypercore` already wrote block bytes to the `Store` (`store.put(index, bytes)`), but its
+authenticated state — the Merkle tree, presence bitfield, signed head, fork, prologue — lived **only in
+memory**, and there was no `open`. So a browser (OPFS) writer's bytes survived a reload but the core
+itself could not be reconstituted: the local-first persistence story had no payoff.
+**Decision:** Add `Hypercore::persist(&mut self)` and `Hypercore::open(author, codec, store)`.
+- Serialization lives with each type (encapsulating its private layout): `merkle::MerkleTree::serialize`/
+  `deserialize` (`[length][count]` + `[index][size][hash]` per node) and `storage::Bitfield::serialize`/
+  `deserialize` (live non-zero pages only — an all-zero page ≡ absent, ADR-0030). `hypercore` adds a small
+  metadata codec for `fork` + the optional `SignedHead` + optional `Prologue`.
+- The single flat `u64→bytes` `Store` is shared with block keys (`0..length`), so metadata goes at three
+  **reserved top keys**: `KEY_META = u64::MAX`, `KEY_TREE = MAX-1`, `KEY_PRESENCE = MAX-2`. A collision
+  needs ~1.8e19 blocks — impossible in practice. (Upstream uses separate per-section files; this is the
+  clean-room single-store equivalent.)
+- The **secret key is never persisted** — it's the caller's keyring, passed back to `open`. `open`
+  reconstructs the core and then runs `verify_head()`: the persisted head must be self-consistent with the
+  persisted tree **and** signed by `author`'s key — so a wrong key, a mismatched tree/head, or tampered
+  metadata fails with `Error::Corrupt`; an unpersisted store yields `Error::NotPersisted`.
+**Consequence:** A core round-trips through its `Store` (incl. a **sparse** core: cleared blocks stay
+authenticated — the persisted tree still produces a verifying proof though the bytes are gone). Native
+tests cover full round-trip, sparse round-trip, wrong-key, unpersisted, and tampered-metadata. Deferred:
+incremental/dirty-tracked persistence (today `persist` rewrites all three blobs); auto-persist hooks;
+`ManifestCore` persistence.

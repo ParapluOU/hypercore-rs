@@ -230,6 +230,54 @@ impl MerkleTree {
         self.roots().iter().map(|r| r.size).sum()
     }
 
+    /// Serialize the tree (its `length` + all retained nodes) for persistence, so
+    /// a hypercore can be reconstituted from storage — including a **sparse** core
+    /// whose block bytes were cleared, whose tree nodes are the only thing that
+    /// still authenticates the absent blocks. Layout: `[length u64][node_count u64]`
+    /// then, per node, `[index u64][size u64][hash 32B]`, all little-endian. Nodes
+    /// are emitted in flat-index order (the [`BTreeMap`] iteration order). Not
+    /// disk-compatible with upstream (ADR-0001).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.nodes.len() * 48);
+        out.extend_from_slice(&self.length.to_le_bytes());
+        out.extend_from_slice(&(self.nodes.len() as u64).to_le_bytes());
+        for node in self.nodes.values() {
+            out.extend_from_slice(&node.index.to_le_bytes());
+            out.extend_from_slice(&node.size.to_le_bytes());
+            out.extend_from_slice(&node.hash);
+        }
+        out
+    }
+
+    /// Reconstruct a tree from [`serialize`](Self::serialize) output. Returns
+    /// `None` on a malformed buffer (too short, a node count that overruns, or
+    /// trailing bytes). Round-trips exactly: the restored tree has the same
+    /// `root_hash`, proofs, and `byte_length` as the original.
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 {
+            return None;
+        }
+        let length = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let count = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let mut nodes = BTreeMap::new();
+        let mut off = 16usize;
+        for _ in 0..count {
+            if off + 48 > bytes.len() {
+                return None;
+            }
+            let index = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
+            let size = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().ok()?);
+            let mut hash: Hash = [0u8; 32];
+            hash.copy_from_slice(&bytes[off + 16..off + 48]);
+            nodes.insert(index, Node { index, hash, size });
+            off += 48;
+        }
+        if off != bytes.len() {
+            return None; // trailing garbage
+        }
+        Some(MerkleTree { nodes, length })
+    }
+
     /// The root nodes the tree *would* have if truncated to its first `len`
     /// blocks, or `None` if any node that prefix needs is missing. `len == 0`
     /// yields the empty root set; `len > len()` yields `None`.
@@ -2296,5 +2344,58 @@ mod tests {
         }
         assert_eq!(empties.seek(0), (4, 0), "all-empty tree: byte 0 is past the end");
         assert!(empties.seek_proof(0).is_none(), "no block to locate in an all-empty tree");
+    }
+
+    #[test]
+    fn serialize_round_trips_root_proofs_and_byte_length() {
+        for n in [0usize, 1, 2, 3, 5, 8, 13, 25] {
+            let (t, blocks) = tree(n);
+            let restored = MerkleTree::deserialize(&t.serialize())
+                .unwrap_or_else(|| panic!("round-trips at n={n}"));
+
+            assert_eq!(restored.len(), t.len(), "length n={n}");
+            assert_eq!(restored.root_hash(), t.root_hash(), "root_hash n={n}");
+            assert_eq!(restored.byte_length(), t.byte_length(), "byte_length n={n}");
+
+            // every per-block proof from the restored tree verifies against the
+            // (identical) root — the authenticated structure survived the round-trip.
+            let root = restored.root_hash();
+            for (i, b) in blocks.iter().enumerate() {
+                let p = restored.proof(i as u64).expect("proof");
+                assert!(p.verify(b, &root), "restored proof block {i} (n={n})");
+            }
+        }
+    }
+
+    #[test]
+    fn serialize_round_trips_a_sparse_tree_missing_block_bytes() {
+        // A sparse core keeps its tree nodes after the block bytes are dropped;
+        // serialization must carry those nodes so absent blocks stay authenticated.
+        let (mut t, blocks) = tree(8);
+        let root = t.root_hash();
+        let restored = MerkleTree::deserialize(&t.serialize()).unwrap();
+        // the tree itself doesn't hold bytes, but its node set must be intact:
+        assert!(restored.is_intact());
+        for (i, b) in blocks.iter().enumerate() {
+            let p = restored.proof(i as u64).expect("proof from sparse tree");
+            assert!(p.verify(b, &root), "block {i} still authenticated after round-trip");
+        }
+        // truncation still works post-round-trip (length is a pure prefix function)
+        t.truncate(3);
+        let restored3 = MerkleTree::deserialize(&t.serialize()).unwrap();
+        assert_eq!(restored3.root_hash(), t.root_hash());
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_buffers() {
+        assert!(MerkleTree::deserialize(&[]).is_none());
+        assert!(MerkleTree::deserialize(&[0u8; 8]).is_none()); // header too short
+        let (t, _) = tree(5);
+        let mut bytes = t.serialize();
+        bytes.truncate(bytes.len() - 1); // chop the last node short
+        assert!(MerkleTree::deserialize(&bytes).is_none());
+        let mut trailing = t.serialize();
+        trailing.push(0); // trailing garbage
+        assert!(MerkleTree::deserialize(&trailing).is_none());
     }
 }
