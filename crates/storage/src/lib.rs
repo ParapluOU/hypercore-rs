@@ -15,6 +15,12 @@ use std::fmt::Debug;
 pub mod bitfield;
 pub use bitfield::Bitfield;
 
+/// Browser OPFS backend (wasm + Web Worker; `opfs` feature). See [`opfs`].
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub mod opfs;
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub use opfs::{OpfsError, OpfsStore};
+
 /// A `u64`-keyed byte store.
 pub trait Store {
     type Error: Debug;

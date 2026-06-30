@@ -5,3 +5,27 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+# Browser OPFS backend (wasm + Web Worker only). Opt-in, because it needs
+# RUSTFLAGS=--cfg=web_sys_unstable_apis and a worker context
+# (FileSystemSyncAccessHandle is worker-only). The default wasm build stays clean.
+[features]
+opfs = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+  "WorkerGlobalScope",
+  "WorkerNavigator",
+  "StorageManager",
+  "FileSystemDirectoryHandle",
+  "FileSystemFileHandle",
+  "FileSystemGetFileOptions",
+  "FileSystemSyncAccessHandle",
+  "FileSystemReadWriteOptions",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

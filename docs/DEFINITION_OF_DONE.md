@@ -11,7 +11,7 @@ gates**, all reduced to one runnable signal: `just verify-full` exits 0.
 | `merkle` | tree + inclusion/range proofs | valid proof verifies; **a tampered proof is rejected** |
 | `codec` | typed payload ⇄ bytes | `decode(encode(x)) == x`; **old bytes decode under a newer schema; unknown variants skip cleanly** |
 | `identity` | keygen / sign / verify | a valid signature verifies; **a forged signature is rejected** |
-| `storage` | byte backend | round-trip on in-memory; same contract upheld by the IndexedDB backend |
+| `storage` | byte backend | round-trip on in-memory; same contract upheld by the OPFS backend (verified in headless Chrome) |
 | `hypercore` | append / get / verify / replicate | append-only; each entry verifies vs signature + merkle; **a destination that applies proofs ends up byte-identical to the source log** |
 | `autobase` | linearize + quorum | **determinism** (same DAG ⇒ same order everywhere); **causal-respect** (no node before its deps); **convergence** (replicas seeing the same set agree); **finality-stability** (a quorum-finalized prefix never reorders) |
 | `hyperbee` | ordered KV + range | correctness over a hypercore (only if we build it) |
@@ -78,7 +78,10 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       `bitfield.js`'s L1 data structure — `find_first(false,..)` always `Some` (infinite-zero tail),
       a missing page is an all-`false` page never materialized on clear; persistence `open`/`flush` and
       replication `want` chunking out of scope, ADR-0030) — the foundation for `clear`/`purge`/sparse cores
-- [ ] `storage` — IndexedDB backend (wasm)
+- [x] `storage` — **OPFS browser backend** (wasm): sync `FileSystemSyncAccessHandle`, persistent;
+      behind the `opfs` feature + `--cfg web_sys_unstable_apis`; worker-only. **Verified in real headless
+      Chrome** — put/get/overwrite/delete + persistence across close+reopen (ADR-0038). (IndexedDB has no
+      sync API; rejected in favour of OPFS.)
 - [x] `hypercore` — append/get/verify + proof-based replication + **batch / atomic append**
       (stage → single-head commit, stale-base reject, all-or-nothing rollback; ADR-0018) +
       **fork detection** (`conflicting_heads` same-length/different-root + per-index `ForkProof`; ADR-0019) +
@@ -140,7 +143,7 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       partitioned/cooperative DAGs; order + state + finalized converge across delivery orders;
       finalized prefix monotone under cooperative growth (ADR-0016)
 - [ ] JS algorithmic-equivalence oracle (gate #4)
-- [ ] WASM runtime / IndexedDB (gate #2)
+- [x] WASM runtime / OPFS (gate #2) — `storage::opfs` worker test passes in real headless Chrome
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)
 - [~] `hyperbee` — v1 ordered KV B-tree over a hypercore: copy-on-write `put`/`get`/`range`
       (asc+desc, gt/gte/lt/lte/limit), order-9 split, multi-level; upstream `basic.js` **exhaustive

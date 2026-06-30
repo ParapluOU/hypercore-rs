@@ -779,3 +779,17 @@ new root is always the latest block. v1 = `put`/`get`/`range` (asc+desc, gt/gte/
 appends one block per path node (vs upstream's one), and a key's bytes are re-encoded when its node is
 rewritten. **Deferred:** `del` + rebalance (borrow/merge), sub-databases, the header/`isHyperbee`
 detection, and diff/history/watch.
+
+## ADR-0038 — Browser persistence is OPFS sync-access-handle (verified in Chrome)
+**Context:** Local-first means the browser is the writer and must persist its hypercores locally.
+IndexedDB has **no synchronous API**, but our `Store` trait is synchronous. OPFS's
+`FileSystemSyncAccessHandle` exposes synchronous read/write/getSize/truncate/flush, fitting the trait
+with no async plumbing — the same primitive SQLite-WASM uses.
+**Decision:** Ship `storage::opfs::OpfsStore` behind the `opfs` feature + `--cfg web_sys_unstable_apis`:
+an async `open()` acquires the sync handle; the sync `Store` ops mirror an in-memory map to a single OPFS
+file (re-serialize + rewrite per mutation — O(n), simple; a log-structured layout is a follow-up).
+Worker-only (sync handles are unavailable on the main thread; tests use `run_in_dedicated_worker`).
+**Consequence:** Verified end-to-end in **real headless Chrome** (`wasm-pack test`, dedicated worker):
+put/get/overwrite/delete + **persistence across close+reopen**. Closes gate #2. `localStorage` (too small)
+and async-IndexedDB (a trait-wide async refactor) were rejected. Deferred: a log-structured/compacting
+layout; per-key files.

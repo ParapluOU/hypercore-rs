@@ -1836,3 +1836,26 @@ Repo-relative paths only — no private or personal data (this repo is public).
 **Next**
 - `hyperbee` `del` + rebalance, sub-databases, header/`isHyperbee`; then the remaining blocked tail (JS
   oracle / wasm-runtime gates; fork/merge consensus; the `Hypercore`/`ManifestCore` unification).
+
+---
+
+## 2026-06-30 — `storage` OPFS browser backend (direct; verified in headless Chrome)
+
+**Did**
+- Implemented `storage::opfs::OpfsStore` — synchronous, persistent browser storage over OPFS
+  `FileSystemSyncAccessHandle` (behind the `opfs` feature + `--cfg web_sys_unstable_apis`). Fits the sync
+  `Store` trait; v1 mirrors an in-memory map to one OPFS file; `Drop` closes the handle so it can reopen.
+- Added a `run_in_dedicated_worker` `wasm_bindgen_test` (put/get/overwrite/delete + persistence across
+  close+reopen) and **ran it in real headless Chrome — passes**. Updated the `wasm-test` gate to the
+  OPFS-aware invocation; committed `crates/storage/webdriver.json` (`--no-sandbox`). **Closes gate #2.**
+
+**Decisions** — ADR-0038 (OPFS sync-access-handle; localStorage / async-IndexedDB rejected).
+
+**Lessons** (see LESSONS) — OPFS is worker-only + sync; `wasm-pack test` pins the latest chromedriver and
+ignores `CHROMEDRIVER`, so a lagging Chrome needs a version-matched chromedriver run via the
+`wasm-bindgen-test-runner` directly.
+
+**Next**
+- OPFS log-structured/compacting layout (avoid O(n)-per-write) + wire OPFS into bitfield/snapshot
+  open/flush persistence. Then the remaining tail: JS oracle / fork-merge consensus; the
+  `Hypercore`/`ManifestCore` unification; `hyperbee` del/sub.

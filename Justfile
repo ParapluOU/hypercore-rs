@@ -26,7 +26,11 @@ wasm:
 
 # WASM runtime test: IndexedDB persistence in headless Chrome. Requires wasm-pack + Chrome.
 wasm-test:
-    wasm-pack test --headless --chrome crates/storage
+    # Runs the storage::opfs worker test in real headless Chrome. wasm-pack fetches the
+    # latest chromedriver, which must match the installed Chrome's MAJOR version; if Chrome
+    # lags, fetch a version-matched chromedriver and run cargo test via the matching
+    # wasm-bindgen-test-runner with CHROMEDRIVER set (wasm-pack ignores CHROMEDRIVER).
+    RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome crates/storage --features opfs
 
 # JS algorithmic-equivalence oracle: compare our linearizer to reference/js/autobase.
 # Runs node ONLY inside a container via scripts/node-sandbox.sh (untrusted npm tree — see CLAUDE.md

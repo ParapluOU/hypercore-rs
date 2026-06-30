@@ -440,3 +440,17 @@ personal data** (this repo is public; use repo-relative paths).
   partial sigs by signer index so two cores with the same signer set produce **byte-identical** heads
   (determinism), and keep the head fork-free when the focused type has no `truncate` (don't import a
   fork-counter you don't yet use).
+- **OPFS is the sync, persistent browser store — and it is worker-only.** `FileSystemSyncAccessHandle`
+  read/write/getSize/truncate/flush are synchronous (so they fit a sync `Store`), but
+  `createSyncAccessHandle()` is unavailable on the main thread — browser tests must
+  `wasm_bindgen_test_configure!(run_in_dedicated_worker)`. *Acquiring* the handle (getDirectory →
+  getFileHandle → createSyncAccessHandle) is async; the I/O is sync. Needs `--cfg web_sys_unstable_apis`.
+- **`wasm-pack test` pins the *latest* chromedriver and ignores `CHROMEDRIVER`.** If the installed Chrome
+  lags (e.g. Chrome 149 vs chromedriver 150), session creation fails with `http 404` / `SIGKILL` — looks
+  like a sandbox problem, is actually a **major-version mismatch**. Fix: fetch the chromedriver matching the
+  installed Chrome (Chrome-for-Testing `known-good-versions-with-downloads.json`), de-quarantine it, and run
+  `cargo test --target wasm32-unknown-unknown` directly with
+  `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=<wasm-bindgen-test-runner whose version matches the
+  wasm-bindgen used to build>` + `CHROMEDRIVER=<that chromedriver>` (the runner honors `CHROMEDRIVER`;
+  a mismatched runner gives a "schema version" error). A `webdriver.json` with `--no-sandbox` /
+  `--disable-dev-shm-usage` helps in restricted environments.
