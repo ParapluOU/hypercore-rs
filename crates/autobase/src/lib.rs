@@ -216,12 +216,35 @@ impl Linearizer {
         Ok(())
     }
 
-    /// The current deterministic linearization: a topological order of the DAG,
-    /// emitting at each step the causally-ready node with the smallest [`NodeId`].
-    ///
-    /// Causality is always respected (a node never precedes a dependency) and the
-    /// result depends only on the node set, never on arrival order.
+    /// The deterministic linearization: the **confirmed view first** (the precise
+    /// consensus order — ADR-0043), then the remaining unconfirmed nodes in the same
+    /// key tiebreak. So [`finalized`](Self::finalized) (the confirmed view) is always
+    /// a true prefix of `order`. Causality is always respected and the result depends
+    /// only on the node set, never on arrival order. When nothing is confirmed this is
+    /// exactly [`plain_order`](Self::plain_order).
     pub fn order(&self) -> Vec<NodeId> {
+        let confirmed = self.confirmed_view();
+        if confirmed.is_empty() {
+            return self.plain_order();
+        }
+        let emitted: BTreeSet<NodeId> = confirmed.iter().copied().collect();
+        let remaining: BTreeSet<NodeId> = self
+            .deps
+            .keys()
+            .filter(|n| !emitted.contains(n))
+            .copied()
+            .collect();
+        let mut out = confirmed;
+        out.extend(self.topo_key_order(&remaining, &emitted));
+        out
+    }
+
+    /// Pure key-tiebreak topological linearization over *all* nodes (priority Kahn:
+    /// at each step emit the causally-ready node with the smallest [`NodeId`]). The
+    /// consensus-agnostic order; [`order`](Self::order) layers the confirmed view in
+    /// front of it, and [`quorum_degree`](Self::quorum_degree) uses it as a plain
+    /// topological order.
+    fn plain_order(&self) -> Vec<NodeId> {
         // Remaining unsatisfied dependencies per node.
         let mut indegree: BTreeMap<NodeId, usize> =
             self.deps.iter().map(|(n, d)| (*n, d.len())).collect();
@@ -898,8 +921,10 @@ impl Linearizer {
         let mut seesx: BTreeMap<NodeId, bool> = BTreeMap::new();
         let mut max_degree: i64 = 0;
 
-        // order() is a valid topological order: every dependency precedes its node.
-        for v in self.order() {
+        // plain_order() is a valid topological order: every dependency precedes its
+        // node. (We use the consensus-agnostic order here to stay independent of the
+        // confirmed view, which is itself built without quorum_degree.)
+        for v in self.plain_order() {
             let mut pre: BTreeMap<WriterKey, i64> = BTreeMap::new();
             let mut sees_target = v == *target;
             if let Some(ds) = self.deps.get(&v) {
@@ -966,36 +991,16 @@ impl Linearizer {
         max_degree.max(0) as usize
     }
 
-    /// The **finalized prefix**: the maximal prefix of [`order`](Self::order)
-    /// whose every node has reached a **double quorum** ([`quorum_degree`] ≥ 2)
-    /// *and* is causally comparable to every other node in the DAG (no unresolved
-    /// concurrent fork around it). Once a node enters this prefix, growing the DAG
-    /// cooperatively never reorders it — the **finality-stability** property.
-    ///
-    /// This is the snapshot / no-active-fork form of finalization: it deliberately
-    /// refuses to commit *either* arm of an unresolved fork until a confirmed merge
-    /// makes the contested nodes comparable. The fork/merge competition rule and
-    /// the 2-degree-lead caveat (DESIGN.md "Tails, Forks and Merges"; upstream
-    /// `consensus.js` merge handling) are deferred — see ADR-0015.
-    ///
-    /// [`quorum_degree`]: Self::quorum_degree
+    /// The **finalized (indexed) prefix**: the precise confirmed view from the
+    /// faithful `consensus.js` machine ([`confirmed_view`](Self::confirmed_view)) —
+    /// every node a majority of indexers have confirmed (including merge-resolved fork
+    /// arms the old conservative rule deferred), woven with the non-indexer nodes they
+    /// cover, in the consensus order. A true prefix of [`order`](Self::order) by
+    /// construction, and monotone under cooperative growth (the **finality-stability**
+    /// property; ADR-0042/0043). Supersedes the earlier conservative no-active-fork
+    /// rule (kept as a test oracle).
     pub fn finalized(&self) -> Vec<NodeId> {
-        if self.majority().is_none() {
-            return Vec::new();
-        }
-        let order = self.order();
-        let mut out = Vec::new();
-        for node in &order {
-            let comparable = order
-                .iter()
-                .all(|other| other == node || self.sees(node, other) || self.sees(other, node));
-            if comparable && self.quorum_degree(node) >= 2 {
-                out.push(*node);
-            } else {
-                break;
-            }
-        }
-        out
+        self.confirmed_view()
     }
 
     // ----------------------------------------------------------------------------------
@@ -1045,12 +1050,10 @@ impl Linearizer {
     /// `getIndexedViewLength` — `getIndexedInfo().views[].length`). Always
     /// `<= view_len()`.
     ///
-    /// This is our **conservative** confirmation depth: a double-quorum, no-active-fork
-    /// prefix (ADR-0015). For a fork-free indexer chain it equals upstream's confirmed
-    /// length exactly; the cases where upstream confirms *earlier* — a unanimous single
-    /// quorum (`n` indexers, all `n` voting, e.g. `dags.js` "simple 2") and confirmation
-    /// across a resolved fork/merge — are the deferred fork/merge consensus work and are
-    /// not yet matched (ADR-0015, ADR-0028).
+    /// This is the **precise** confirmation depth from the faithful `consensus.js`
+    /// machine ([`finalized`](Self::finalized) / [`confirmed_view`](Self::confirmed_view)):
+    /// it confirms across resolved fork/merges, not just fork-free chains (ADR-0042/0043
+    /// superseded the earlier conservative depth of ADR-0015).
     pub fn indexed_view_len(&self) -> usize {
         self.finalized().len()
     }
@@ -1176,6 +1179,25 @@ mod tests {
         add(&mut lin, n(C, 0), &[n(B, 0)]);
         add(&mut lin, n(A, 1), &[n(C, 0)]);
         lin
+    }
+
+    /// The superseded conservative no-active-fork rule, kept as an oracle: the maximal
+    /// `plain_order()` prefix of comparable-to-all, double-quorum'd nodes. The live
+    /// `finalized()` (the precise consensus machine) must always be at least this eager.
+    fn conservative_finalized(lin: &Linearizer) -> Vec<NodeId> {
+        let order = lin.plain_order();
+        let mut out = Vec::new();
+        for node in &order {
+            let comparable = order
+                .iter()
+                .all(|o| o == node || lin.sees(node, o) || lin.sees(o, node));
+            if comparable && lin.quorum_degree(node) >= 2 {
+                out.push(*node);
+            } else {
+                break;
+            }
+        }
+        out
     }
 
     #[test]
@@ -1353,11 +1375,12 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_prefix_supersets_finalized_and_resolves_a_merge() {
+    fn confirmed_prefix_supersets_conservative_and_resolves_a_merge() {
+        // The precise machine is never less eager than the old conservative rule.
         for lin in [chain(), fork_merge(), deep_fork_merge()] {
             let cp: BTreeSet<NodeId> = lin.confirmed_prefix().into_iter().collect();
-            for node in lin.finalized() {
-                assert!(cp.contains(&node), "{node:?} finalized ⇒ in confirmed_prefix");
+            for node in conservative_finalized(&lin) {
+                assert!(cp.contains(&node), "{node:?} conservatively-finalized ⇒ confirmed");
             }
         }
         // The merged fork: the conservative rule defers around the unresolved fork,
@@ -1367,10 +1390,10 @@ mod tests {
         assert!(cp.contains(&n(A, 0)) && cp.contains(&n(B, 0)) && cp.contains(&n(C, 0)),
             "the merged fork (a0,b0,c0) is confirmed: {cp:?}");
         assert!(
-            cp.len() > dfm.finalized().len(),
+            cp.len() > conservative_finalized(&dfm).len(),
             "precise prefix ({}) outpaces conservative ({})",
             cp.len(),
-            dfm.finalized().len()
+            conservative_finalized(&dfm).len()
         );
     }
 

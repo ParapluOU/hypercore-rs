@@ -901,3 +901,26 @@ documenting both gaps. The swap requires (a) porting `_yield` (non-indexer inter
 define the indexed view independently of the key-tiebreak `order()`. Deferred pending that decision.
 **Consequence:** No safety regression — the conservative prefix stays live. The consensus *core* is ported,
 proven, and converges; only the view assembly (`_yield`) + the ordering reconciliation remain.
+
+## ADR-0044 — Consensus swap done: `finalized()`/`order()` are now the precise machine
+**Context:** ADR-0043's two blockers, resolved. (1) **`_yield` ported** as `confirmed_view` — each `shift`
+batch expanded to its newly-covered causal closure (non-indexer nodes included) and emitted in key-tiebreak
+topo order. (2) **Order reconciliation:** the discovery that upstream's `Topolist.cmpUnlinked` uses the
+*same* lowest-key tiebreak as our `order()` made alignment clean — `order()` = `confirmed_view()` ++
+`topo_key_order(remaining)`, so `finalized()` (= `confirmed_view()`) is a true prefix by construction.
+**Decision:** Swap the live finalization onto the faithful machine: `finalized()` / `indexed_view` =
+`confirmed_view()`; `order()` puts the confirmed view first; `quorum_degree` now uses a private
+`plain_order()` (consensus-agnostic topo) to stay independent. The old conservative rule is kept as a
+**test oracle** (`conservative_finalized`) asserting the precise machine is never *less* eager.
+**Validation:** full suite + convergence sim green — `order ⊑ finalized` by construction, finalized
+**converges** across delivery orders (partitioned DAGs), and is **monotone** under cooperative growth.
+**Honest scope (the remaining gap):** the from-scratch `confirmed_view` is convergent always and
+order-stable for **cooperative** growth (the regime ADR-0016 already scoped, and the federated-homeserver
+norm). It does **not** guarantee order-stability under *adversarial* partitions — where a lower-key node
+concurrently confirmed *later* could re-sort into an earlier batch — because we did not port upstream's
+incremental **flush-permanence** (`Topolist` `undo`/`mark`, which freezes a once-published indexed prefix).
+The *set* of confirmed nodes is always monotone (consensus guarantees it); only intra-prefix *order*
+under adversarial partition is unguaranteed. Porting flush-permanence (so a published checkpoint never
+reorders even adversarially) is the one remaining refinement — deferred; not needed for the cooperative
+federated regime. (Trade vs. the old conservative rule: it was unconditionally order-stable but far less
+eager — it only committed fork-free prefixes; the precise machine confirms fork-merges.)

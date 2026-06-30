@@ -2104,3 +2104,23 @@ order, batch by batch (each `shift` appends a sorted batch). That makes the alig
   (a true prefix by construction, monotone). Add a test-only conservative oracle, repurpose the staging
   contrast tests onto it, and revalidate the whole convergence sim (order ⊑ finalized, convergence,
   monotonicity).
+
+---
+
+## 2026-06-30 — autobase: the consensus SWAP — `finalized()`/`order()` now the precise machine (DONE)
+
+**Did**
+- Swapped the live finalization onto the faithful machine (ADR-0044): `finalized()`/`indexed_view` =
+  `confirmed_view()`; `order()` = `confirmed_view()` ++ `topo_key_order(remaining)` (so `finalized ⊑ order`
+  by construction); `quorum_degree` moved to a private consensus-agnostic `plain_order()`. Old conservative
+  rule kept as the test oracle `conservative_finalized` (asserts the precise machine is never less eager).
+- **Validated green:** full autobase suite + convergence sim — `order ⊑ finalized`, finalized **converges**
+  across delivery orders (partitioned), **monotone** under cooperative growth (the deciding test). Full
+  workspace gate **204**, 0 warnings. The 4-stage `consensus.js` port is now **live**, closing ADR-0015.
+- **Honest scope (ADR-0044):** order-stable for cooperative growth (ADR-0016 regime / federated norm);
+  adversarial-partition order-stability would need flush-permanence (`Topolist` undo/mark) — deferred. The
+  confirmed *set* is always monotone.
+
+**Next (all deferred / external):** flush-permanence for adversarial order-stability; dynamic indexer
+reconfiguration (indexer set is passed in — external); the JS algorithmic-equivalence oracle (gate #4,
+needs a container).

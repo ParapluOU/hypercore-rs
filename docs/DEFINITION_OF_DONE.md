@@ -143,13 +143,17 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
       ported** — a host-safe in-Rust re-statement of upstream's non-optimistic insertion sort cross-checks
       that priority-Kahn `order()` agrees node-for-node with it (both = the lex-minimal linear extension)
       over the `DESIGN.md` DAGs + 200 seeded random fork/merge DAGs × delivery orders (ADR-0027)
-- [~] `autobase` — quorum / finality-stability (recursive quorum degree + double-quorum finalized
-      prefix + stability property done; fork/merge competition + 2-degree-lead caveat deferred, ADR-0015)
-      + **view materialization** (`view`/`view_len`/`view_get` ≡ upstream `view`/`view.length`/`view.get`;
-      `indexed_view_len` ≡ `getIndexedViewLength` — the fork-free `linearizer.js`/`dags.js` "simple" chain
-      asserts the exact upstream `view.length 6` / `getIndexedViewLength 4`, plus cross-replica view +
-      indexed-length convergence over every DAG; ADR-0028. The L1 fold is identity — one node, one entry —
-      since apply is domain logic; the fork-case confirmed lengths await the deferred consensus)
+- [x] `autobase` — quorum / finality. **Faithful `consensus.js` port, LIVE** (ADR-0042/0043/0044, 4
+      stages: vector clocks → DAG predicates `is_merge`/`indexer_tails`/`strictly_newer`/`acks` →
+      confirmation `confirms`/`is_confirmed`/`is_confirmable_at`/`acked_at` → the `shift`/`yield_next`
+      driver = `confirmed_view`, with `_yield` non-indexer weaving). `finalized()`/`indexed_view` =
+      `confirmed_view` (the precise machine — confirms merge-resolved fork arms, not just fork-free chains);
+      `order()` = confirmed view ++ key-tiebreak tail (so `finalized ⊑ order`). Validated: convergence sim
+      green (converges across delivery orders; monotone under cooperative growth); precise prefix asserted
+      ≥ the conservative oracle. Remaining (deferred, ADR-0044): flush-permanence (`Topolist` undo/mark) for
+      order-stability under *adversarial* partitions; dynamic indexer reconfiguration (indexer set is passed
+      in — external concern). + **view materialization** (`view`/`view_len`/`view_get` ≡ upstream;
+      `indexed_view_len` ≡ `getIndexedViewLength`; ADR-0028. L1 fold is identity — apply is domain logic)
 - [x] convergence simulation (gate #3) — `crates/autobase/tests/convergence.rs`: seeded random
       partitioned/cooperative DAGs; order + state + finalized converge across delivery orders;
       finalized prefix monotone under cooperative growth (ADR-0016)
