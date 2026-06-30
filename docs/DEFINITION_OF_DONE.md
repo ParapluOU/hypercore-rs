@@ -142,7 +142,10 @@ just verify-full  # verify + wasm-test (chrome) + oracle (node)
 - [ ] JS algorithmic-equivalence oracle (gate #4)
 - [ ] WASM runtime / IndexedDB (gate #2)
 - [ ] relevant upstream tests ported (see `UPSTREAM_TEST_MAP.md`)
-- [ ] `hyperbee` (only if needed)
+- [~] `hyperbee` — v1 ordered KV B-tree over a hypercore: copy-on-write `put`/`get`/`range`
+      (asc+desc, gt/gte/lt/lte/limit), order-9 split, multi-level; upstream `basic.js` **exhaustive
+      range oracle** (sizes 1..25 × all bound combos × reverse) ported. Deferred: `del`+rebalance,
+      sub-databases, header/`isHyperbee`, diff/history/watch (ADR-0037)
 
 ### Audit follow-ups (after iteration 21; see ADR-0029)
 - [x] `merkle` `SeekProof::verify` rejects non-leaf targets (P0 soundness) + `Proof`/`SeekProof`

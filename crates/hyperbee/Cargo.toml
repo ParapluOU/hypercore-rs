@@ -6,3 +6,6 @@ repository.workspace = true
 
 [dependencies]
 hypercore = { path = "../hypercore" }
+codec = { path = "../codec" }
+identity = { path = "../identity" }
+storage = { path = "../storage" }

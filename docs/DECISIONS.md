@@ -765,3 +765,17 @@ cross-length patch signing, the multisig wire format, and the session-level `mov
 counter is not yet on `ManifestCore` (no `truncate` here), so cross-fork equivocation lives only on the
 single-key core until unification. Soundness rests on the same ed25519 + manifest-hash collision-resistance
 ADR-0035 already assumes, plus the Merkle leaf binding `verify_block` rests on.
+
+## ADR-0037 — `hyperbee` is a one-block-per-node, inline-KV B-tree (v1)
+**Context:** Upstream `hyperbee` packs the rewritten leaf→root path into a single block's `YoloIndex`
+(addressing nodes by `(seq, offset)`) and stores keys/values in the entry block, referenced from nodes by
+`seq`. That is a block-count/storage optimization, not the ordered-KV semantics.
+**Decision:** Reimplement the *behaviour* — a copy-on-write B-tree over our `hypercore` — with a simpler
+format: **one block = one node** (a child pointer is just a `seq`); **key+value inline** in the node; **no
+header block** (`version()` = block count, empty = 0); split at `MAX_CHILDREN = 9` (matches upstream). The
+new root is always the latest block. v1 = `put`/`get`/`range` (asc+desc, gt/gte/lt/lte, limit).
+**Consequence:** Faithful to the ordered-KV behaviour — the upstream `basic.js` exhaustive range oracle
+(sizes 1..25 × {gt|gte}×{lt|lte}×reverse) passes and exercises multi-level splits. Trade-offs: a `put`
+appends one block per path node (vs upstream's one), and a key's bytes are re-encoded when its node is
+rewritten. **Deferred:** `del` + rebalance (borrow/merge), sub-databases, the header/`isHyperbee`
+detection, and diff/history/watch.

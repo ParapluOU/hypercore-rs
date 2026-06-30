@@ -1812,3 +1812,27 @@ Repo-relative paths only — no private or personal data (this repo is public).
     as a `Manifest::single` special case, retiring its single-key `SignedHead`; add the fork counter +
     `truncate` to the manifest path) — the in-place half of ADR-0036/ADR-0035; `merkle` reorg-by-proof /
     `additionalNodes`; the replication re-download that refills a cleared block + `purge`; `hyperbee`.
+
+---
+
+## 2026-06-30 — `hyperbee` v1 (direct implementation, outside the driver loop)
+
+**Did**
+- Implemented `crates/hyperbee`: an ordered key/value **copy-on-write B-tree** over a `hypercore`. One
+  block = one node (clean-room, ADR-0037), inline key+value, order-9 split, root = latest block. `put`
+  (insert / LWW + median split cascading to a new root), `get` (descent), `range` (asc+desc, gt/gte/lt/lte,
+  limit). 4 asserting tests incl. the upstream **`basic.js` exhaustive range oracle** (sizes 1..25 × all
+  bound combos × reverse — also forces multi-level splits). Added `hyperbee` to the wasm gate. `just
+  verify` green (168 tests).
+
+**Decisions** — ADR-0037 (one-block-per-node + inline-KV format; defer del / sub / header / diff).
+
+**Lessons**
+- Copy-on-write version semantics: each `put` appends the rewritten path (one block per node), so
+  `version` = block count, **not** key count — old node versions remain; the latest block is the root.
+- The exhaustive range oracle (small trees × every bound combo vs a sorted reference slice) is the single
+  highest-leverage `hyperbee` test: it pins descent, splits, multi-level structure, and bound handling at once.
+
+**Next**
+- `hyperbee` `del` + rebalance, sub-databases, header/`isHyperbee`; then the remaining blocked tail (JS
+  oracle / wasm-runtime gates; fork/merge consensus; the `Hypercore`/`ManifestCore` unification).

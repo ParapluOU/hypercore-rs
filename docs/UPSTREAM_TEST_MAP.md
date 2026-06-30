@@ -56,10 +56,14 @@ Status: `[ ]` todo · `[~]` partial · `[x]` ported & green · `—` out of scop
 | `suspend.js`, `timer.js`, `trace.js` | — | session/runtime/tracing |
 | `all.js`, `helpers/`, `fixtures/`, `reference/`, `replay/` | — | runner / support |
 
-## `reference/js/hyperbee/test` (only if we build `hyperbee`)
+## `reference/js/hyperbee/test`
 
-`basic.js`, `batches.js`, `ranges.js`, `sub.js`, `cas.js`, `checkout.js`, `diff.js`, `history.js`,
-`watch.js`, `cache.js` → `[ ]` deferred until the `hyperbee` decision. `extension.js` → networking.
+| File | Status | Maps to |
+|------|--------|---------|
+| `basic.js` | [~] | `hyperbee` put/get + the **exhaustive range oracle** ported; sub/header/`getBySeq` later |
+| `ranges.js` | [~] | range asc/desc/limit/open-bounds ported; `peek`/read-stream helpers later |
+| `batches.js`, `sub.js`, `cas.js`, `checkout.js`, `diff.js`, `history.js`, `watch.js`, `cache.js` | [ ] | del / sub / diff / history — deferred |
+| `extension.js` | — | networking |
 
 ## `reference/rust/datrs-hypercore` (already Rust — direct reference)
 
