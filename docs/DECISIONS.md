@@ -947,11 +947,12 @@ the tokio driver. A node's ed25519 seed is simultaneously its autobase `WriterKe
 `EndpointId`, so peers dial by writer key. Kept behind a feature flag so the default build stays
 wasm-clean and dependency-light.
 
-**Dependency pin:** iroh 0.97 pulls `ed25519-dalek 3.0.0-pre.1`, which only compiles against the
-*RC* crypto tree (`signature =3.0.0-rc.10`, `pkcs8 =0.11.0-rc.11`, `spki =0.8.0-rc.4`,
-`ed25519 3.0.0-rc.4`) — the released 3.0.0 RCs are API-incompatible with the pre-release. These
-exact pins (matching services/node) are declared as optional deps enabled by the `iroh` feature.
-Bumping to iroh 1.0 (a stable crypto tree) is a drop-in follow-on.
+**iroh version:** `iroh = "1"` (1.0.1). iroh 1.x pins its own crypto tree (`ed25519-dalek
+=3.0.0-rc.0`), which resolves against the released `ed25519`/`signature`/`pkcs8` — so **no manual
+crypto pins are needed** (an earlier 0.97 cut required RC pins for `ed25519-dalek 3.0.0-pre.1`; the
+1.0 bump removed them, and the 0.97→1.0 transport API was source-compatible — no code changes).
+**MSRV:** the `iroh` feature needs **rustc ≥ 1.91** (iroh 1.x MSRV); the default (wasm-clean) build
+has no such requirement, so the standard `just verify` gate stays on the project nightly.
 
 **Scope held out (follow-ons):** cross-writer resume-from-checkpoint (needs a persisted system/view
 core); relay of a replicated writer's blocks (needs `Replica::{block,proof}` in L1); discovery

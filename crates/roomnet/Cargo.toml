@@ -19,21 +19,16 @@ hypercore = { path = "../hypercore" }
 autobase = { path = "../autobase" }
 
 # Native Iroh transport + tokio driver. Optional so the default build stays
-# wasm-clean. Versions match services/node (bump to iroh 1.0 is a drop-in later).
-iroh = { version = "0.97", optional = true }
+# wasm-clean + lightweight. iroh 1.x pins its own crypto tree, so no manual crypto
+# pins are needed. NOTE: the `iroh` feature requires rustc >= 1.91 (iroh 1.x MSRV);
+# the default build has no such requirement.
+iroh = { version = "1", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
-
-# iroh 0.97 pulls `ed25519-dalek 3.0.0-pre.1`, which only compiles against the RC
-# releases of this crypto tree (the *released* 3.0.0 RCs are API-incompatible with
-# the pre-release). These exact pins match services/node; only pulled with `iroh`.
-signature = { version = "=3.0.0-rc.10", optional = true }
-pkcs8 = { version = "=0.11.0-rc.11", optional = true }
-spki = { version = "=0.8.0-rc.4", optional = true }
 
 [features]
 default = []
 # Real network transport (Iroh QUIC) + tokio driver.
-iroh = ["dep:iroh", "dep:tokio", "dep:signature", "dep:pkcs8", "dep:spki"]
+iroh = ["dep:iroh", "dep:tokio"]
 
 [[example]]
 name = "chat_room"
