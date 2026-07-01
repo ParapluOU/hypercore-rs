@@ -22,7 +22,7 @@ test:
 # WASM compile gate (the WASM-first goal). Requires the wasm32 target:
 #   rustup target add wasm32-unknown-unknown
 wasm:
-    cargo build --target wasm32-unknown-unknown -p hypercore -p autobase -p storage -p hyperbee
+    cargo build --target wasm32-unknown-unknown -p hypercore -p autobase -p storage -p hyperbee -p roomnet
 
 # WASM runtime test: OPFS persistence in headless Chrome. Requires wasm-pack + Chrome.
 wasm-test:

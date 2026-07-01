@@ -924,3 +924,38 @@ under adversarial partition is unguaranteed. Porting flush-permanence (so a publ
 reorders even adversarially) is the one remaining refinement — deferred; not needed for the cooperative
 federated regime. (Trade vs. the old conservative rule: it was unconditionally order-stable but far less
 eager — it only committed fork-free prefixes; the precise machine confirms fork-merges.)
+
+## ADR-0045 — `roomnet`: scope the Iroh room layer in as a separate crate
+
+**Status:** adopted. Amends ADR-0003 ("networking out of scope, deferred to Iroh"): the Iroh
+layer is now **in scope**, but confined to a dedicated crate (`crates/roomnet`) so the L1 crates
+(hypercore/autobase/storage/merkle/identity/codec) stay pure, transport-free, and `wasm32`-clean.
+
+**What:** `roomnet` is a pluggable room-replication layer. See `docs/ROOMNET_SPEC.md`. A **`Room`**
+(Tier 1) is a sans-IO state machine: one local writer `Hypercore` + a `Replica` per remote writer,
+driving the autobase `Linearizer`, maintaining a rolling **finalized** projection (authoritative →
+Lane 3 sink) and a **live** projection (optimistic → render). A **`RoomServer`** (Tier 2, native)
+owns many rooms and replicates remote ones on demand. Three pluggable seams — `Transport`,
+`StoreFactory`/`Store`, `ProjectionSink` — plus the portable `Projection` fold (the one place domain
+logic lives). Wire protocol `SyncMessage` (`Head`/`Have`/`Want`/`Block`) carries self-verifying,
+Merkle-proofed blocks; `wire::{encode,decode}` serializes it with the `codec` varints (no serde on
+the L1 types). `Entry { heads, payload }` is the log-entry *content* (opaque to L1).
+
+**Iroh (feature `iroh`, default-off):** `IrohTransport` binds a QUIC endpoint (ALPN + net params
+configurable via `IrohConfig`, all defaulted) and ships `[RoomId | wire]` frames; `run_server` is
+the tokio driver. A node's ed25519 seed is simultaneously its autobase `WriterKey` and its iroh
+`EndpointId`, so peers dial by writer key. Kept behind a feature flag so the default build stays
+wasm-clean and dependency-light.
+
+**Dependency pin:** iroh 0.97 pulls `ed25519-dalek 3.0.0-pre.1`, which only compiles against the
+*RC* crypto tree (`signature =3.0.0-rc.10`, `pkcs8 =0.11.0-rc.11`, `spki =0.8.0-rc.4`,
+`ed25519 3.0.0-rc.4`) — the released 3.0.0 RCs are API-incompatible with the pre-release. These
+exact pins (matching services/node) are declared as optional deps enabled by the `iroh` feature.
+Bumping to iroh 1.0 (a stable crypto tree) is a drop-in follow-on.
+
+**Scope held out (follow-ons):** cross-writer resume-from-checkpoint (needs a persisted system/view
+core); relay of a replicated writer's blocks (needs `Replica::{block,proof}` in L1); discovery
+beyond `bootstrap`; the monorepo-side TerminusDB adapters and the `lib/oplog` → `SongProjection`
+migration (kept out of the public submodule). Tests: 11 native (Room convergence/finality/in-order
+recovery, RoomServer on-demand replication, stale-GC, wire round-trip) + wasm build of the `Room`
+core + a compiling iroh transport & `chat_room` example.
