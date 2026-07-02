@@ -15,6 +15,10 @@ use std::fmt::Debug;
 pub mod bitfield;
 pub use bitfield::Bitfield;
 
+/// Write-through store combinator: mirror writes to a local cache. See [`tee`].
+pub mod tee;
+pub use tee::{TeeError, TeeStore};
+
 /// Log-structured `u64`-keyed store over a synchronous file (the OPFS backend builds on this).
 pub mod log;
 pub use log::{LogStore, MemFile, SyncFile};

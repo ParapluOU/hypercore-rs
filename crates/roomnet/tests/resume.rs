@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use identity::SecretKey;
 use roomnet::testkit::{put, KvProjection};
 use roomnet::{
-    DiskStoreFactory, Fanout, Outbound, PeerId, Projection, Room, RoomConfig, StoreFactory,
-    SyncMessage,
+    CachedFactory, DiskStoreFactory, Fanout, MemStoreFactory, Outbound, PeerId, Projection, Room,
+    RoomConfig, StoreFactory, SyncMessage,
 };
 
 enum Tgt {
@@ -155,4 +155,43 @@ fn single_writer_resumes_from_disk() {
     assert!(r2.poll_finalized().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn room_recovers_from_the_disk_cache_when_the_implementor_store_is_lost() {
+    // The implementor's factory is ephemeral (MemStoreFactory) — it stands in for
+    // a remote/DB store that a fresh container does NOT have locally. roomnet's
+    // CachedFactory keeps a local disk copy regardless, so the room still resumes.
+    let a = SecretKey::from_seed(&[9; 32]);
+    let ak = a.public().to_bytes();
+    let cache_dir = tmpdir("cache");
+
+    let (finalized, finalized_len) = {
+        let f = CachedFactory::new(MemStoreFactory, &cache_dir).unwrap();
+        let mut room =
+            Room::open(RoomConfig::original(a, vec![ak]), f, KvProjection::new()).unwrap();
+        for i in 0..8u8 {
+            room.local_append(&put(b"k", &[i])).unwrap();
+        }
+        assert!(room.finalized_len() > 0);
+        (room.snapshot_finalized().clone(), room.finalized_len())
+    };
+
+    // "Container restart": a brand-new (empty) implementor store, but the SAME
+    // local disk cache directory. Recovery must come from the cache alone.
+    let f2 = CachedFactory::new(MemStoreFactory, &cache_dir).unwrap();
+    let r2 = Room::open(
+        RoomConfig::original(SecretKey::from_seed(&[9; 32]), vec![ak]),
+        f2,
+        KvProjection::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        r2.snapshot_finalized(),
+        &finalized,
+        "recovered from the local disk cache even though the implementor store was empty"
+    );
+    assert_eq!(r2.finalized_len(), finalized_len);
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
 }

@@ -111,3 +111,69 @@ fn unhex(s: &str) -> Option<WriterKey> {
     }
     Some(out)
 }
+
+/// Wraps **any** [`StoreFactory`] with an always-on local disk cache, so roomnet
+/// keeps a local copy of every writer's log **regardless of the implementor's
+/// backend**.
+///
+/// Each writer's store becomes a [`TeeStore`](storage::TeeStore): writes go to the
+/// implementor's `inner` store (the source of truth) *and* a
+/// `LogStore<StdFile>` under `cache_dir`; reads prefer `inner` and fall back to the
+/// disk cache. So if the inner store is remote/unavailable — e.g. a fresh
+/// container that still has its local volume — the room recovers from the local
+/// cache alone. Unix-only (needs a filesystem); on wasm the implementor's factory
+/// is used directly.
+#[cfg(unix)]
+pub struct CachedFactory<F> {
+    inner: F,
+    cache_dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl<F> CachedFactory<F> {
+    /// Wrap `inner`, mirroring every writer's store to a disk cache under
+    /// `cache_dir` (created if absent).
+    pub fn new(inner: F, cache_dir: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let cache_dir = cache_dir.into();
+        std::fs::create_dir_all(&cache_dir)?;
+        Ok(Self { inner, cache_dir })
+    }
+}
+
+/// Failure opening a cached writer store — from the inner factory or the disk cache.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum CachedOpenError<E> {
+    Inner(E),
+    Cache(std::io::Error),
+}
+
+#[cfg(unix)]
+impl<F: StoreFactory> StoreFactory for CachedFactory<F> {
+    type Store = storage::TeeStore<F::Store, storage::LogStore<storage::StdFile>>;
+    type OpenError = CachedOpenError<F::OpenError>;
+
+    fn open(&mut self, writer: WriterKey) -> Result<Self::Store, Self::OpenError> {
+        let primary = self.inner.open(writer).map_err(CachedOpenError::Inner)?;
+        let file =
+            storage::StdFile::open(self.cache_dir.join(hex(&writer))).map_err(CachedOpenError::Cache)?;
+        let cache = storage::LogStore::open(file).map_err(CachedOpenError::Cache)?;
+        Ok(storage::TeeStore::new(primary, cache))
+    }
+
+    fn known_writers(&self) -> Vec<WriterKey> {
+        // Union of the inner factory's writers and the local disk cache's. The
+        // cache lists every writer held locally — which is what recovers a room in
+        // a fresh container whose inner store is unavailable.
+        let mut set: std::collections::BTreeSet<WriterKey> =
+            self.inner.known_writers().into_iter().collect();
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                if let Some(w) = e.file_name().to_str().and_then(unhex) {
+                    set.insert(w);
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+}

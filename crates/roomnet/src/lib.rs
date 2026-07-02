@@ -47,7 +47,7 @@ pub use room::{Error, Fanout, Finalized, Outbound, PeerId, Room, StoreErr};
 pub use server::{RoomId, RoomServer};
 pub use store::{MemStoreFactory, StoreFactory};
 #[cfg(unix)]
-pub use store::DiskStoreFactory;
+pub use store::{CachedFactory, CachedOpenError, DiskStoreFactory};
 pub use sync::SyncMessage;
 pub use transport::{ProjectionSink, Transport};
 

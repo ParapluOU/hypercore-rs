@@ -998,3 +998,35 @@ present — a room that `sweep`s (GC's live block bytes) needs a persisted proje
 `(state, finalized_len)` instead of replay. Persist is per-op (a crash-safe WAL); batched/debounced
 persist is a later optimization. `RoomServer` still constructs in-mem (`Default`) factories — wiring
 it to per-room disk directories rides with the `services/node` cutover (still out of scope).
+
+## ADR-0047 — Default local disk cache (write-through) around any implementor store
+
+**Status:** adopted. The [`StoreFactory`] lets an implementor choose where hypercore data is persisted
+(a DB, a remote store, …). Independently, roomnet should keep a **local disk copy regardless**, so a
+container that still has its local volume can recover even when the implementor's real store is remote
+or unavailable — "at least something we have locally."
+
+**What:**
+- **storage `TeeStore<P, C>`** — a write-through combinator: `put`/`delete` go to **both** the primary
+  `P` and the cache `C`; `get` prefers `P` and **falls back to `C`**; `len` reports the cache's count
+  when the primary is empty. `TeeError { Primary, Cache }`. Upholds the Store contract.
+- **roomnet `CachedFactory<F>`** (unix) — wraps any `StoreFactory` so each writer's store becomes a
+  `TeeStore<F::Store, LogStore<StdFile>>` under a `cache_dir`. The inner factory stays the source of
+  truth; the disk cache is an always-present local backup. `known_writers()` is the **union** of the
+  inner factory's writers and the local cache directory's — so a fresh container whose inner store is
+  unavailable still enumerates (and resumes) every writer from the local cache.
+
+Because `get` falls back to the cache, `Hypercore::open`/`Replica::open` reconstruct entirely from the
+local cache when the primary is empty — a room resumes from local disk alone even after the
+implementor's store is lost.
+
+**Validation:** storage — write-through mirrors to both sides, read recovers from the cache when the
+primary is empty, contract upheld; roomnet — a room over `CachedFactory<MemStoreFactory>` (ephemeral
+primary) resumes its full finalized state from the disk cache directory after a simulated container
+restart with a brand-new empty primary.
+
+**Notes / scope:** opt-in at wiring time (wrap the implementor's factory in `CachedFactory`) so the
+Room generics are unchanged; the node uses it by default in production. Write-through is per-op
+(fsync'd on the cache side). Unix-only (needs a filesystem); on wasm the implementor's factory is used
+directly. If the primary and cache diverge (e.g. the primary was written out-of-band), `get`'s
+prefer-primary policy wins — the cache is a backup, not a merge.
