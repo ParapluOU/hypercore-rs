@@ -68,12 +68,19 @@ pub enum Error<SE> {
     BadWriterKey,
     /// The [`Projection`] rejected a mutation (rendered via its `Debug`).
     Projection(String),
+    /// A [`StoreFactory`] failed to open a writer's store (rendered via `Debug`).
+    StoreOpen(String),
 }
 
 impl<SE> From<hypercore::Error<SE>> for Error<SE> {
     fn from(e: hypercore::Error<SE>) -> Self {
         Error::Hypercore(e)
     }
+}
+
+/// Map a store-factory open error into a roomnet [`Error`] (via its `Debug`).
+fn store_open<E: core::fmt::Debug, SE>(e: E) -> Error<SE> {
+    Error::StoreOpen(format!("{e:?}"))
 }
 
 /// A single room: an autobase-ordered multiwriter log with rolling projections.
@@ -118,17 +125,32 @@ where
     /// Creates the local writer core (fresh here; durable re-open of a persisted
     /// local core and cross-writer resume-from-checkpoint are follow-ons). Remote
     /// writers are learned and pulled on demand as their adverts arrive.
-    pub fn open(cfg: RoomConfig, mut factory: F, projection: P) -> Self {
+    pub fn open(
+        cfg: RoomConfig,
+        mut factory: F,
+        projection: P,
+    ) -> Result<Self, Error<StoreErr<F>>> {
         let RoomConfig { identity, indexers, origin } = cfg;
         let local_key = identity.public().to_bytes();
-        let store = factory.open(local_key);
-        let local = Hypercore::new(identity, EntryCodec, store);
+
+        // Local writer: reopen its persisted, signed history if present, else fresh.
+        let local_store = factory.open(local_key).map_err(store_open)?;
+        let local = match Hypercore::open(identity.clone(), EntryCodec, local_store) {
+            Ok(core) => core,
+            Err(hypercore::Error::NotPersisted) => {
+                let store = factory.open(local_key).map_err(store_open)?;
+                Hypercore::new(identity, EntryCodec, store)
+            }
+            Err(e) => return Err(Error::Hypercore(e)),
+        };
+
         let lin = if indexers.is_empty() {
             Linearizer::new()
         } else {
             Linearizer::with_indexers(indexers.iter().copied())
         };
-        Room {
+
+        let mut room = Room {
             local_key,
             origin,
             local,
@@ -142,7 +164,28 @@ where
             finalized_len: 0,
             finalized_since_poll: Vec::new(),
             last_activity: 0,
+        };
+
+        // Reopen every *other* persisted writer's replica from local storage — the
+        // resume path: the room comes back from disk, no peers required.
+        for writer in room.factory.known_writers() {
+            if writer == local_key {
+                continue;
+            }
+            let public = PublicKey::from_bytes(&writer).ok_or(Error::BadWriterKey)?;
+            let store = room.factory.open(writer).map_err(store_open)?;
+            match Replica::open(public, EntryCodec, store) {
+                Ok(rep) => {
+                    room.remotes.insert(writer, rep);
+                }
+                Err(hypercore::Error::NotPersisted) => {} // no persisted state yet
+                Err(e) => return Err(Error::Hypercore(e)),
+            }
         }
+
+        // Rebuild the DAG + projections deterministically from the reopened cores.
+        room.replay()?;
+        Ok(room)
     }
 
     /// This node's writer key.
@@ -191,6 +234,7 @@ where
         let heads: Vec<NodeId> = self.lin.tails().into_iter().collect();
         let entry = Entry::new(heads.clone(), op.to_vec());
         self.local.append(&entry)?;
+        self.local.persist()?; // durable — the local writer survives a restart
 
         let node = NodeId::new(self.local_key, seq);
         match self.lin.add(node, &heads) {
@@ -341,13 +385,14 @@ where
     ) -> Result<bool, Error<StoreErr<F>>> {
         if !self.remotes.contains_key(&writer) {
             let public = PublicKey::from_bytes(&writer).ok_or(Error::BadWriterKey)?;
-            let store = self.factory.open(writer);
+            let store = self.factory.open(writer).map_err(store_open)?;
             self.remotes.insert(writer, Replica::new(public, EntryCodec, store));
         }
         let replica = self.remotes.get_mut(&writer).expect("just inserted");
         if !replica.add_block(head, index, bytes, proof)? {
             return Ok(false);
         }
+        replica.persist()?; // durable — this remote writer survives a restart
         let entry = EntryCodec.decode(bytes).map_err(Error::Codec)?;
         self.try_add_node(NodeId::new(writer, index), entry);
         self.touch();
@@ -387,6 +432,34 @@ where
                 break;
             }
         }
+    }
+
+    /// Rebuild the DAG + projections from the reopened writer cores (the resume
+    /// path). Feeds every writer's entries into the linearizer — per-writer in
+    /// order; cross-writer causal deps buffer via `pending` — then folds the
+    /// projections. The finalized deltas produced here were already persisted
+    /// before the restart, so the delta queue is cleared, not re-emitted to Lane 3.
+    fn replay(&mut self) -> Result<(), Error<StoreErr<F>>> {
+        let local_len = self.local.len();
+        for i in 0..local_len {
+            if let Some(entry) = self.local.get(i)? {
+                self.try_add_node(NodeId::new(self.local_key, i), entry);
+            }
+        }
+        let writers: Vec<WriterKey> = self.remotes.keys().copied().collect();
+        for w in writers {
+            let len = self.remotes.get(&w).map(|r| r.len()).unwrap_or(0);
+            for i in 0..len {
+                let entry = self.remotes.get(&w).expect("writer present").get(i)?;
+                if let Some(entry) = entry {
+                    self.try_add_node(NodeId::new(w, i), entry);
+                }
+            }
+        }
+        self.drain_pending();
+        self.advance()?;
+        self.finalized_since_poll.clear();
+        Ok(())
     }
 
     /// Recompute derived state: extend the finalized fold, then rebuild the live

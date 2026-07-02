@@ -245,13 +245,15 @@ pub async fn run_server<F, P, Sink>(
         tokio::select! {
             maybe = commands.recv() => match maybe {
                 Some(Command::Host(room)) => {
-                    server.host(room);
-                    announce(&server, &transport, room);
+                    if server.host(room).is_ok() {
+                        announce(&server, &transport, room);
+                    }
                 }
                 Some(Command::JoinRemote(room, origin)) => {
                     transport.add_peer(origin);
-                    server.join_remote(room);
-                    announce(&server, &transport, room);
+                    if server.join_remote(room).is_ok() {
+                        announce(&server, &transport, room);
+                    }
                 }
                 Some(Command::Append(room, op)) => {
                     if let Some(r) = server.get_mut(room) {

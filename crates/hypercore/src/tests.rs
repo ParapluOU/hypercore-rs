@@ -6,6 +6,72 @@ fn author(seed: u8) -> SecretKey {
     SecretKey::from_seed(&[seed; 32])
 }
 
+/// A [`Store`] whose bytes survive the owning core being dropped — clones share
+/// one backing map, so it stands in for "reopen the same on-disk store".
+#[derive(Clone, Default)]
+struct SharedStore(std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<u64, Vec<u8>>>>);
+
+impl Store for SharedStore {
+    type Error = std::convert::Infallible;
+    fn put(&mut self, key: u64, value: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().insert(key, value.to_vec());
+        Ok(())
+    }
+    fn get(&self, key: u64) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.borrow().get(&key).cloned())
+    }
+    fn delete(&mut self, key: u64) -> Result<(), Self::Error> {
+        self.0.borrow_mut().remove(&key);
+        Ok(())
+    }
+    fn len(&self) -> Result<u64, Self::Error> {
+        Ok(self.0.borrow().len() as u64)
+    }
+}
+
+#[test]
+fn replica_persist_open_round_trips() {
+    // A source core produces signed blocks + inclusion proofs.
+    let mut src = Hypercore::<Vec<u8>, _, _>::new(author(40), Bytes, MemoryStore::new());
+    for b in [b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()] {
+        src.append(&b).unwrap();
+    }
+    let pk = src.public_key();
+    let head = src.head().unwrap().clone();
+
+    // Replicate into a shared-backed store, then persist and drop the replica.
+    let store = SharedStore::default();
+    let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, store.clone());
+    for i in 0..3u64 {
+        let enc = src.block(i).unwrap().unwrap();
+        let proof = src.proof(i).unwrap();
+        assert!(rep.add_block(&head, i, &enc, &proof).unwrap());
+    }
+    rep.persist().unwrap();
+    drop(rep); // gone from memory — only the store survives
+
+    // Reopen from the same store — no source, no network.
+    let rep2 = Replica::<Vec<u8>, _, _>::open(pk, Bytes, store.clone()).unwrap();
+    assert_eq!(rep2.len(), 3, "length recovered");
+    assert_eq!(rep2.verified_head(), Some(&head), "verified head recovered");
+    for i in 0..3u64 {
+        assert_eq!(rep2.get(i).unwrap(), src.get(i).unwrap(), "block {i} recovered");
+    }
+
+    // A wrong key must be rejected (tamper/mis-key guard).
+    let wrong = author(41).public();
+    assert!(matches!(
+        Replica::<Vec<u8>, _, _>::open(wrong, Bytes, store.clone()),
+        Err(Error::Corrupt)
+    ));
+
+    // A never-persisted store reports NotPersisted, not a bogus replica.
+    assert!(matches!(
+        Replica::<Vec<u8>, _, _>::open(pk, Bytes, SharedStore::default()),
+        Err(Error::NotPersisted)
+    ));
+}
+
 #[test]
 fn append_get_roundtrip() {
     let mut core = Hypercore::<Vec<u8>, _, _>::new(author(1), Bytes, MemoryStore::new());

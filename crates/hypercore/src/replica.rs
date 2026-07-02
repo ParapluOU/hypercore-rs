@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use codec::Codec;
-use identity::PublicKey;
+use identity::{PublicKey, Sig};
 use merkle::{Hash, MerkleTree, Proof, UpgradeProof};
 use storage::Store;
 
@@ -229,6 +229,89 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
             .map_err(Error::Storage)?
             .ok_or(Error::Corrupt)?;
         Ok(Some(self.codec.decode(&bytes).map_err(Error::Codec)?))
+    }
+
+    /// Persist this replica's authenticated state (Merkle tree + verified head) to
+    /// its [`Store`] so it can be reopened with [`open`](Self::open) — the durable
+    /// resume payoff: a node recovers a remote writer's *verified* log from local
+    /// storage without re-fetching it from peers. Block bytes are already written by
+    /// [`add_block`](Self::add_block); this flushes the tree and head (which
+    /// otherwise live only in memory) under the reserved [`crate::KEY_TREE`] /
+    /// [`crate::KEY_META`] keys. A replica never clears blocks, so — unlike a
+    /// [`Hypercore`] — there is no presence map to store.
+    pub fn persist(&mut self) -> Result<(), Error<S::Error>> {
+        let tree = self.tree.serialize();
+        let meta = encode_replica_meta(self.head.as_ref());
+        self.store.put(crate::KEY_TREE, &tree).map_err(Error::Storage)?;
+        self.store.put(crate::KEY_META, &meta).map_err(Error::Storage)?;
+        Ok(())
+    }
+
+    /// Reconstitute a replica from a [`Store`] previously written by
+    /// [`persist`](Self::persist), pairing the persisted tree + head with the
+    /// writer's `public` key and a `codec`. A persisted head is re-verified against
+    /// `public` and the persisted tree, so a wrong key or tampered metadata fails
+    /// with [`Error::Corrupt`]; [`Error::NotPersisted`] if the store was never
+    /// persisted. Block bytes are read on demand via [`get`](Self::get).
+    pub fn open(public: PublicKey, codec: C, store: S) -> Result<Self, Error<S::Error>> {
+        let tree_bytes = store.get(crate::KEY_TREE).map_err(Error::Storage)?;
+        let meta_bytes = store.get(crate::KEY_META).map_err(Error::Storage)?;
+        let (Some(tree_bytes), Some(meta_bytes)) = (tree_bytes, meta_bytes) else {
+            return Err(Error::NotPersisted);
+        };
+        let tree = MerkleTree::deserialize(&tree_bytes).ok_or(Error::Corrupt)?;
+        let head = decode_replica_meta(&meta_bytes).ok_or(Error::Corrupt)?;
+        let replica = Self { public, codec, store, tree, head, _t: PhantomData };
+        // A persisted head must be signed by this writer *and* consistent with the
+        // persisted tree — catches a wrong key or tampered metadata.
+        if let Some(h) = &replica.head {
+            let ok = replica.public.verify(&head_message(h.fork, h.length, &h.root), &h.sig)
+                && replica.tree.len() == h.length
+                && replica.tree.root_hash() == h.root;
+            if !ok {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(replica)
+    }
+}
+
+/// Encode an optional signed head: `[tag]` (0 = none, 1 = some), then when some
+/// `fork(8) | length(8) | root(32) | sig(64)`, little-endian. (Replica metadata.)
+fn encode_replica_meta(head: Option<&SignedHead>) -> Vec<u8> {
+    match head {
+        None => vec![0u8],
+        Some(h) => {
+            let mut out = Vec::with_capacity(1 + 8 + 8 + 32 + 64);
+            out.push(1);
+            out.extend_from_slice(&h.fork.to_le_bytes());
+            out.extend_from_slice(&h.length.to_le_bytes());
+            out.extend_from_slice(&h.root);
+            out.extend_from_slice(&h.sig.to_bytes());
+            out
+        }
+    }
+}
+
+/// Inverse of [`encode_replica_meta`]. Returns `Some(None)` for "persisted, no head
+/// yet"; `None` on a malformed buffer.
+fn decode_replica_meta(bytes: &[u8]) -> Option<Option<SignedHead>> {
+    let (&tag, rest) = bytes.split_first()?;
+    match tag {
+        0 => Some(None),
+        1 => {
+            if rest.len() < 8 + 8 + 32 + 64 {
+                return None;
+            }
+            let fork = u64::from_le_bytes(rest[0..8].try_into().ok()?);
+            let length = u64::from_le_bytes(rest[8..16].try_into().ok()?);
+            let mut root: Hash = [0u8; 32];
+            root.copy_from_slice(&rest[16..48]);
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&rest[48..112]);
+            Some(Some(SignedHead { fork, length, root, sig: Sig::from_bytes(&sig) }))
+        }
+        _ => None,
     }
 }
 

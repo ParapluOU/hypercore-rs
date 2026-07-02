@@ -55,7 +55,7 @@ fn entry_round_trips_through_its_codec() {
 #[test]
 fn local_append_is_reflected_in_the_live_snapshot() {
     let cfg = RoomConfig::original(seed(2), vec![]);
-    let mut room = Room::open(cfg, MemStoreFactory, KvProjection::new());
+    let mut room = Room::open(cfg, MemStoreFactory, KvProjection::new()).unwrap();
 
     room.local_append(&put(b"k", b"v")).unwrap();
     assert_eq!(
@@ -74,7 +74,7 @@ fn local_append_is_reflected_in_the_live_snapshot() {
 #[test]
 fn without_indexers_nothing_finalizes_but_live_reflects_everything() {
     let cfg = RoomConfig::original(seed(3), vec![]);
-    let mut room = Room::open(cfg, MemStoreFactory, KvProjection::new());
+    let mut room = Room::open(cfg, MemStoreFactory, KvProjection::new()).unwrap();
 
     room.local_append(&put(b"a", b"1")).unwrap();
     room.local_append(&put(b"b", b"2")).unwrap();
@@ -91,7 +91,7 @@ fn finalized_deltas_are_per_mutation_and_contiguous() {
     let a = seed(1);
     let ak = a.public().to_bytes();
     let cfg = RoomConfig::original(a, vec![ak]);
-    let mut room = Room::open(cfg, MemStoreFactory, CounterProjection::default());
+    let mut room = Room::open(cfg, MemStoreFactory, CounterProjection::default()).unwrap();
 
     let mut drained_versions = Vec::new();
     for i in 0..8u64 {

@@ -66,8 +66,8 @@ fn two_writers_converge_on_the_live_snapshot() {
     let bk = b.public().to_bytes();
     let idx = vec![ak, bk];
 
-    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new());
-    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new());
+    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
 
     ra.local_append(&put(b"x", b"1")).unwrap();
     converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
@@ -93,9 +93,9 @@ fn three_writers_converge_exercising_cross_writer_buffering() {
     let (ak, bk, ck) = (a.public().to_bytes(), b.public().to_bytes(), c.public().to_bytes());
     let idx = vec![ak, bk, ck];
 
-    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new());
-    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new());
-    let mut rc = Room::open(RoomConfig::original(c, idx.clone()), MemStoreFactory, KvProjection::new());
+    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rc = Room::open(RoomConfig::original(c, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
 
     for round in 0..4u8 {
         ra.local_append(&put(b"a", &[round])).unwrap();
@@ -118,8 +118,8 @@ fn indexers_reach_the_same_finalized_view() {
     let bk = b.public().to_bytes();
     let idx = vec![ak, bk];
 
-    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new());
-    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new());
+    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
 
     // Interleave several rounds so mutual references accumulate and finality advances.
     for round in 0..6u8 {
@@ -146,8 +146,8 @@ fn replica_enforces_in_order_delivery_and_recovers() {
     let bk = b.public().to_bytes();
     let idx = vec![ak, bk];
 
-    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new());
-    let mut rb = Room::open(RoomConfig::original(b, idx), MemStoreFactory, KvProjection::new());
+    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, idx), MemStoreFactory, KvProjection::new()).unwrap();
 
     ra.local_append(&put(b"k", b"v0")).unwrap();
     ra.local_append(&put(b"k", b"v1")).unwrap();
@@ -188,13 +188,13 @@ fn room_server_join_remote_replicates_a_hosted_room() {
 
     // D hosts and edits the room.
     {
-        let r = d.host(room_id);
+        let r = d.host(room_id).unwrap();
         r.local_append(&put(b"song", b"abc")).unwrap();
         r.local_append(&put(b"tempo", b"120")).unwrap();
     }
 
     // A client of C reaches for the room ⇒ C replicates it on demand.
-    c.join_remote(room_id);
+    c.join_remote(room_id).unwrap();
     {
         let dr = d.get_mut(room_id).unwrap();
         let cr = c.get_mut(room_id).unwrap();
@@ -221,8 +221,8 @@ fn replicated_rooms_are_evictable_originals_are_not() {
         },
         KvProjection::new(),
     );
-    s.host([1u8; 32]);
-    s.join_remote([2u8; 32]);
+    s.host([1u8; 32]).unwrap();
+    s.join_remote([2u8; 32]).unwrap();
 
     // Judge every room stale: only the replicated one is eligible for eviction.
     let dropped = s.evict_stale(|_| true);

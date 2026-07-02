@@ -18,6 +18,9 @@ pub use bitfield::Bitfield;
 /// Log-structured `u64`-keyed store over a synchronous file (the OPFS backend builds on this).
 pub mod log;
 pub use log::{LogStore, MemFile, SyncFile};
+/// Native on-disk [`SyncFile`] (Unix); pair with [`LogStore`] for a durable store.
+#[cfg(unix)]
+pub use log::StdFile;
 
 /// Browser OPFS backend (wasm + Web Worker; `opfs` feature). See [`opfs`].
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]

@@ -235,6 +235,49 @@ impl SyncFile for MemFile {
     }
 }
 
+/// A native [`SyncFile`] over `std::fs::File` (Unix positional `pread`/`pwrite`).
+///
+/// The real on-disk backend for [`LogStore`] — a node's logs are written to disk
+/// and survive a process restart. Unix-only (macOS/Linux, the node targets); wasm
+/// uses the OPFS backend instead.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct StdFile {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl StdFile {
+    /// Open the file at `path` for read+write, creating it if absent.
+    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl SyncFile for StdFile {
+    type Error = std::io::Error;
+
+    fn size(&self) -> Result<u64, Self::Error> {
+        Ok(self.file.metadata()?.len())
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, offset)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), Self::Error> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(buf, offset)
+    }
+    fn truncate(&mut self, size: u64) -> Result<(), Self::Error> {
+        self.file.set_len(size)
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.file.sync_all() // fsync — durability across a crash
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +341,36 @@ mod tests {
         let s2 = LogStore::open(MemFile::from_bytes(bytes)).unwrap();
         assert_eq!(s2.get(1).unwrap().as_deref(), Some(&b"good"[..]));
         assert_eq!(s2.len().unwrap(), 1, "partial tail ignored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdfile_upholds_contract_and_persists_across_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("hcrs-stdfile-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // The full Store contract, on a real file.
+        {
+            let mut s = LogStore::open(StdFile::open(&path).unwrap()).unwrap();
+            crate::contract::run(&mut s);
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // Writes survive dropping the store and reopening the file from disk.
+        {
+            let mut s = LogStore::open(StdFile::open(&path).unwrap()).unwrap();
+            s.put(1, b"one").unwrap();
+            s.put(1, b"ONE").unwrap();
+            s.put(2, b"two").unwrap();
+            s.delete(2).unwrap();
+        }
+        {
+            let s = LogStore::open(StdFile::open(&path).unwrap()).unwrap();
+            assert_eq!(s.get(1).unwrap().as_deref(), Some(&b"ONE"[..]), "reopened from disk");
+            assert_eq!(s.get(2).unwrap(), None);
+            assert_eq!(s.len().unwrap(), 1);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

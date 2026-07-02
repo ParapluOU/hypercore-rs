@@ -127,8 +127,8 @@ fn main() {
     let bk = bob.public().to_bytes();
     let indexers = vec![ak, bk];
 
-    let mut ra = Room::open(RoomConfig::original(alice, indexers.clone()), MemStoreFactory, Board::default());
-    let mut rb = Room::open(RoomConfig::original(bob, indexers), MemStoreFactory, Board::default());
+    let mut ra = Room::open(RoomConfig::original(alice, indexers.clone()), MemStoreFactory, Board::default()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(bob, indexers), MemStoreFactory, Board::default()).unwrap();
 
     ra.local_append(&encode(&BoardOp::Add { id: 1, text: "buy strings".into() })).unwrap();
     rb.local_append(&encode(&BoardOp::Add { id: 2, text: "tune to drop D".into() })).unwrap();

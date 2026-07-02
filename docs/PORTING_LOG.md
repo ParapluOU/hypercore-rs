@@ -2125,3 +2125,11 @@ order, batch by batch (each `shift` appends a sorted batch). That makes the alig
 **Next (all deferred / external):** flush-permanence for adversarial order-stability; dynamic indexer
 reconfiguration (indexer set is passed in — external); the JS algorithmic-equivalence oracle (gate #4,
 needs a container).
+
+## roomnet durable resume (ADR-0046)
+
+Added `Replica::persist`/`open` (L1), a native on-disk `StdFile`/`LogStore<StdFile>` (storage), and a
+`DiskStoreFactory` + resume path in roomnet: `Room::open` reopens every writer's core from disk and
+replays the DAG, so a room recovers its full finalized/live state with no peers. Persist is per-op.
+Tests: hypercore replica round-trip, storage disk contract+reopen, roomnet two-/single-writer resume
+from a temp dir (zero network). Gate: 233 workspace tests, 0 warnings; wasm core still clean.

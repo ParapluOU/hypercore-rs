@@ -17,7 +17,7 @@ use identity::SecretKey;
 
 use crate::config::{Origin, RoomConfig, ServerConfig};
 use crate::projection::Projection;
-use crate::room::Room;
+use crate::room::{Error, Room, StoreErr};
 use crate::store::StoreFactory;
 
 /// A room's stable identifier (the node derives it from the room's topic).
@@ -48,30 +48,31 @@ where
         }
     }
 
-    /// Host a room locally (creating it if absent). Never auto-deleted.
-    pub fn host(&mut self, room: RoomId) -> &mut Room<F, P> {
+    /// Host a room locally (creating it if absent). Never auto-deleted. Fallible
+    /// because opening the room may resume it from a durable store.
+    pub fn host(&mut self, room: RoomId) -> Result<&mut Room<F, P>, Error<StoreErr<F>>> {
         if !self.rooms.contains_key(&room) {
             let cfg = RoomConfig::original(self.mint_identity(), self.indexers.clone());
-            let r = Room::open(cfg, F::default(), self.projection.clone());
+            let r = Room::open(cfg, F::default(), self.projection.clone())?;
             self.rooms.insert(room, r);
         }
-        self.rooms.get_mut(&room).expect("just inserted")
+        Ok(self.rooms.get_mut(&room).expect("just inserted"))
     }
 
     /// Replicate a remote room on demand (creating a replica room if absent). The
     /// driver connects to the origin; the room pulls via adverts + `Want`s.
     /// Eligible for stale eviction after the configured idle window.
-    pub fn join_remote(&mut self, room: RoomId) -> &mut Room<F, P> {
+    pub fn join_remote(&mut self, room: RoomId) -> Result<&mut Room<F, P>, Error<StoreErr<F>>> {
         if !self.rooms.contains_key(&room) {
             let cfg = RoomConfig::replicated(
                 self.mint_identity(),
                 self.indexers.clone(),
                 self.replica_stale_after,
             );
-            let r = Room::open(cfg, F::default(), self.projection.clone());
+            let r = Room::open(cfg, F::default(), self.projection.clone())?;
             self.rooms.insert(room, r);
         }
-        self.rooms.get_mut(&room).expect("just inserted")
+        Ok(self.rooms.get_mut(&room).expect("just inserted"))
     }
 
     pub fn get(&self, room: RoomId) -> Option<&Room<F, P>> {
