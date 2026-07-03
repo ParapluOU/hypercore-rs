@@ -180,10 +180,12 @@ fn room_server_join_remote_replicates_a_hosted_room() {
     let mut d = RoomServer::open(
         ServerConfig { identity_seed: [10; 32], indexers: vec![dk], replica_stale_after: None },
         KvProjection::new(),
+        |_| MemStoreFactory,
     );
     let mut c = RoomServer::open(
         ServerConfig { identity_seed: [11; 32], indexers: vec![dk], replica_stale_after: None },
         KvProjection::new(),
+        |_| MemStoreFactory,
     );
 
     // D hosts and edits the room.
@@ -220,6 +222,7 @@ fn replicated_rooms_are_evictable_originals_are_not() {
             replica_stale_after: Some(Duration::from_secs(1)),
         },
         KvProjection::new(),
+        |_| MemStoreFactory,
     );
     s.host([1u8; 32]).unwrap();
     s.join_remote([2u8; 32]).unwrap();

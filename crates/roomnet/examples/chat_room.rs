@@ -145,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server: RoomServer<MemStoreFactory, ChatProjection> = RoomServer::open(
         ServerConfig { identity_seed: seed, indexers: vec![writer_key], replica_stale_after: None },
         ChatProjection::default(),
+        |_| MemStoreFactory,
     );
 
     let (tx, rx) = tokio::sync::mpsc::channel(32);

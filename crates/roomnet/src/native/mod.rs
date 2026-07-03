@@ -21,9 +21,11 @@ use std::time::Duration;
 
 use std::future::Future;
 
+use futures_lite::StreamExt as _;
 use iroh::endpoint::{presets::N0, Connection};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, PublicKey, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
+use iroh_gossip::{api::Event, Gossip, TopicId, ALPN as GOSSIP_ALPN};
 use tokio::sync::mpsc;
 
 use crate::projection::Projection;
@@ -107,13 +109,19 @@ pub struct IrohTransport {
     alpn: Vec<u8>,
     inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     peers: Arc<Mutex<BTreeSet<[u8; 32]>>>,
+    /// Per-room peer discovery. Subscribing to a room's topic finds co-subscribers
+    /// (their `NeighborUp`s populate `peers`) and, because the overlay dials them,
+    /// teaches the endpoint their addresses so the direct-dial sync path resolves.
+    gossip: Gossip,
 }
 
 impl IrohTransport {
     /// Bind the endpoint and start accepting sync connections.
     pub async fn bind(cfg: &IrohConfig) -> IrohResult<Self> {
         let sk = SecretKey::from_bytes(&cfg.seed);
-        let mut builder = Endpoint::builder(N0).secret_key(sk).alpns(vec![cfg.alpn.clone()]);
+        let mut builder = Endpoint::builder(N0)
+            .secret_key(sk)
+            .alpns(vec![cfg.alpn.clone(), GOSSIP_ALPN.to_vec()]);
         if let Some(port) = cfg.bind_port {
             builder = builder.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))?;
         }
@@ -123,9 +131,46 @@ impl IrohTransport {
         let peers: Arc<Mutex<BTreeSet<[u8; 32]>>> =
             Arc::new(Mutex::new(cfg.bootstrap.iter().copied().collect()));
         let handler = SyncHandler { inbound: tx, peers: peers.clone(), max: cfg.max_message_bytes };
-        let router = Router::builder(endpoint.clone()).accept(cfg.alpn.clone(), handler).spawn();
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let router = Router::builder(endpoint.clone())
+            .accept(cfg.alpn.clone(), handler)
+            .accept(GOSSIP_ALPN.to_vec(), gossip.clone())
+            .spawn();
 
-        Ok(Self { endpoint, _router: router, alpn: cfg.alpn.clone(), inbound_rx: rx, peers })
+        Ok(Self {
+            endpoint,
+            _router: router,
+            alpn: cfg.alpn.clone(),
+            inbound_rx: rx,
+            peers,
+            gossip,
+        })
+    }
+
+    /// Join a room's gossip topic for peer discovery. `bootstrap` are peers to seed
+    /// the overlay with (the origin, for a replica; empty for a host that only needs
+    /// to accept). Spawns a task that adds each discovered neighbour to `peers` —
+    /// and, as a side effect of the overlay dialling them, the endpoint learns their
+    /// addresses so the direct-dial sync path can reach them.
+    pub fn discover_room(&self, room: [u8; 32], bootstrap: Vec<[u8; 32]>) {
+        let gossip = self.gossip.clone();
+        let peers = self.peers.clone();
+        tokio::spawn(async move {
+            let topic = TopicId::from_bytes(room);
+            let boot: Vec<PublicKey> = bootstrap
+                .iter()
+                .filter_map(|k| PublicKey::from_bytes(k).ok())
+                .collect();
+            let mut sub = match gossip.subscribe(topic, boot).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while let Some(ev) = sub.next().await {
+                if let Ok(Event::NeighborUp(id)) = ev {
+                    peers.lock().unwrap().insert(*id.as_bytes());
+                }
+            }
+        });
     }
 
     /// This node's 32-byte endpoint id (== its writer key).
@@ -172,7 +217,15 @@ impl IrohTransport {
         let alpn = self.alpn.clone();
         tokio::spawn(async move {
             let Ok(id) = PublicKey::from_bytes(&target) else { return };
-            let Ok(conn) = endpoint.connect(id, alpn.as_slice()).await else { return };
+            // Dial via our home relay (peers share the same n0 relay) so we don't
+            // wait on discovery resolving the peer's key by DNS — which is slow and,
+            // as observed, asymmetric. Fall back to a bare-key dial (discovery) if
+            // the relay isn't up yet.
+            let dest: EndpointAddr = match endpoint.addr().relay_urls().next() {
+                Some(relay) => EndpointAddr::new(id).with_relay_url(relay.clone()),
+                None => id.into(),
+            };
+            let Ok(conn) = endpoint.connect(dest, alpn.as_slice()).await else { return };
             if let Ok((mut send, mut recv)) = conn.open_bi().await {
                 let _ = send.write_all(&frame).await;
                 let _ = send.finish();
@@ -236,7 +289,7 @@ pub async fn run_server<F, P, Sink>(
     mut commands: mpsc::Receiver<Command>,
     opts: DriverOpts,
 ) where
-    F: StoreFactory + Default,
+    F: StoreFactory,
     P: Projection + Clone,
     Sink: ProjectionSink<P::State>,
 {
@@ -297,7 +350,7 @@ pub async fn run_server<F, P, Sink>(
 
 fn announce<F, P>(server: &RoomServer<F, P>, transport: &IrohTransport, room: RoomId)
 where
-    F: StoreFactory + Default,
+    F: StoreFactory,
     P: Projection + Clone,
 {
     if let Some(r) = server.get(room) {
