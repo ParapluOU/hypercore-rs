@@ -92,6 +92,16 @@ pub struct Room<F: StoreFactory, P: Projection> {
     local: Hypercore<Entry, EntryCodec, F::Store>,
     /// Verify-only replicas of every other writer we have seen.
     remotes: BTreeMap<WriterKey, Replica<Entry, EntryCodec, F::Store>>,
+    /// The verified `(head, bytes, proof)` triple of every replicated block,
+    /// kept verbatim so this room can *serve* other writers' logs on [`Want`]
+    /// — a late joiner backfills the whole room history from any one peer.
+    /// Blocks arrive in order (`Replica::add_block` enforces it), so index i
+    /// lives at `vec[i]`. In-memory only: replicas reopened from disk can be
+    /// read but not re-served until proofs can be regenerated from a full
+    /// Merkle tree (follow-on).
+    ///
+    /// [`Want`]: SyncMessage::Want
+    remote_blocks: BTreeMap<WriterKey, Vec<(SignedHead, Vec<u8>, merkle::Proof)>>,
     factory: F,
 
     /// The causal DAG + quorum machine.
@@ -155,6 +165,7 @@ where
             origin,
             local,
             remotes: BTreeMap::new(),
+            remote_blocks: BTreeMap::new(),
             factory,
             lin,
             payloads: BTreeMap::new(),
@@ -231,7 +242,12 @@ where
     /// and a client fanout of the new block (Lane 1).
     pub fn local_append(&mut self, op: &[u8]) -> Result<Vec<Outbound>, Error<StoreErr<F>>> {
         let seq = self.local.len();
-        let heads: Vec<NodeId> = self.lin.tails().into_iter().collect();
+        // Link against the DAG frontier (upstream `linearizer.getHeads()`), so
+        // this entry causally sees everything delivered before it. Referencing
+        // the tails (roots) here was a porting mistake: it collapsed
+        // cross-writer ordering to the key tiebreak and kept indexer appends
+        // from ever "seeing" — and thus finalizing — other writers' entries.
+        let heads: Vec<NodeId> = self.lin.heads().into_iter().collect();
         let entry = Entry::new(heads.clone(), op.to_vec());
         self.local.append(&entry)?;
         self.local.persist()?; // durable — the local writer survives a restart
@@ -239,7 +255,7 @@ where
         let node = NodeId::new(self.local_key, seq);
         match self.lin.add(node, &heads) {
             Ok(()) | Err(AddError::Duplicate(_)) => {}
-            // A local append references only already-delivered tails, so a gap or
+            // A local append references only already-delivered heads, so a gap or
             // missing head would be a bug in this room, not a network condition.
             Err(_) => debug_assert!(false, "local append violated causal delivery"),
         }
@@ -284,9 +300,8 @@ where
                 }
             }
             SyncMessage::Want { writer, start, end } => {
-                // Only writers we host locally can be served (we hold their proofs).
-                // Relaying a replicated writer's blocks is a follow-on.
                 if writer == self.local_key {
+                    // Our own writer: mint fresh proofs from the local core.
                     if let Some(head) = self.local.head().cloned() {
                         let hi = end.min(self.local.len());
                         for i in start..hi {
@@ -297,6 +312,27 @@ where
                                 });
                             }
                         }
+                    }
+                } else if let Some(blocks) = self.remote_blocks.get(&writer) {
+                    // A replicated writer: re-serve the verified triples exactly
+                    // as they arrived — each block is self-verifying against the
+                    // head it was originally proven for, so the requester's
+                    // replica accepts it the same way we did. This is what lets
+                    // a late joiner pull the WHOLE room history from any peer,
+                    // not just each writer from its home node.
+                    let hi = (end as usize).min(blocks.len());
+                    for i in (start as usize)..hi {
+                        let (head, bytes, proof) = &blocks[i];
+                        out.push(Outbound {
+                            msg: SyncMessage::Block {
+                                writer,
+                                head: head.clone(),
+                                index: i as u64,
+                                bytes: bytes.clone(),
+                                proof: proof.clone(),
+                            },
+                            to: Fanout::Peer(from),
+                        });
                     }
                 }
             }
@@ -317,15 +353,29 @@ where
         Ok(out)
     }
 
-    /// A gossip advert of the local writer's current head (sent on connect).
+    /// A gossip advert of everything this room can serve (sent on connect and
+    /// re-announce): the local writer's signed head, plus a [`Have`] for every
+    /// replicated writer whose blocks we hold — so a late joiner discovers and
+    /// pulls the *whole* room history from any one peer.
+    ///
+    /// [`Have`]: SyncMessage::Have
     pub fn announce(&self) -> Vec<Outbound> {
-        match self.local.head().cloned() {
-            Some(head) => vec![Outbound {
+        let mut out = Vec::new();
+        if let Some(head) = self.local.head().cloned() {
+            out.push(Outbound {
                 msg: SyncMessage::Head { writer: self.local_key, head },
                 to: Fanout::Gossip,
-            }],
-            None => Vec::new(),
+            });
         }
+        for (writer, blocks) in &self.remote_blocks {
+            if !blocks.is_empty() {
+                out.push(Outbound {
+                    msg: SyncMessage::Have { writer: *writer, length: blocks.len() as u64 },
+                    to: Fanout::Gossip,
+                });
+            }
+        }
+        out
     }
 
     /// Drain the finalized mutations produced since the last call (Lane 3). One
@@ -393,6 +443,12 @@ where
             return Ok(false);
         }
         replica.persist()?; // durable — this remote writer survives a restart
+        // Keep the verified triple verbatim so this block can be re-served on
+        // Want (blocks apply in order, so vec position == block index).
+        let served = self.remote_blocks.entry(writer).or_default();
+        if served.len() as u64 == index {
+            served.push((head.clone(), bytes.to_vec(), proof.clone()));
+        }
         let entry = EntryCodec.decode(bytes).map_err(Error::Codec)?;
         self.try_add_node(NodeId::new(writer, index), entry);
         self.touch();

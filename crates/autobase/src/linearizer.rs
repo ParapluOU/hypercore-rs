@@ -129,10 +129,24 @@ impl Linearizer {
 
     /// Tails: nodes with no dependencies (the roots of the DAG). Mirrors upstream's
     /// `linearizer.tails` — useful for the quorum layer and as a structural check.
+    /// NOT what a new append should reference — that is [`heads`](Self::heads).
     pub fn tails(&self) -> BTreeSet<NodeId> {
         self.deps
             .iter()
             .filter(|(_, d)| d.is_empty())
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
+    /// Heads: nodes with no dependents (the frontier / tips of the DAG). Mirrors
+    /// upstream's `linearizer.getHeads()` — "the global links of the dag, use this
+    /// to link against the current state of the dag". A new local append must
+    /// reference these so it causally sees everything delivered before it; that
+    /// is also what lets an indexer's appends vote on other writers' entries.
+    pub fn heads(&self) -> BTreeSet<NodeId> {
+        self.dependents
+            .iter()
+            .filter(|(_, children)| children.is_empty())
             .map(|(n, _)| *n)
             .collect()
     }
@@ -1342,6 +1356,30 @@ mod tests {
         );
         assert_causal(&lin, &lin.order());
         assert_eq!(lin.tails(), [n(A, 0), n(C, 0)].into_iter().collect());
+    }
+
+    // Heads (frontier) mirror upstream `getHeads()`: the links a new local
+    // append must reference. Distinct from tails (the roots).
+    #[test]
+    fn heads_track_the_frontier_not_the_roots() {
+        let mut lin = Linearizer::new();
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(C, 0), &[]);
+        // Two concurrent roots: each is both a tail and a head.
+        assert_eq!(lin.heads(), [n(A, 0), n(C, 0)].into_iter().collect());
+        assert_eq!(lin.heads(), lin.tails());
+
+        // b0 links both: it becomes the sole head; the tails are unchanged.
+        add(&mut lin, n(B, 0), &[n(A, 0), n(C, 0)]);
+        assert_eq!(lin.heads(), [n(B, 0)].into_iter().collect());
+        assert_eq!(lin.tails(), [n(A, 0), n(C, 0)].into_iter().collect());
+
+        // Full DESIGN.md dag: only the causally-latest node is a head.
+        let mut lin = Linearizer::new();
+        for (node, heads) in recursive_dag() {
+            add(&mut lin, node, &heads);
+        }
+        assert_eq!(lin.heads(), [n(B, 2)].into_iter().collect());
     }
 
     // Determinism: same DAG ⇒ same order, regardless of (causally-valid) arrival
