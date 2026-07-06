@@ -56,7 +56,7 @@ pub use store::{MemStoreFactory, StoreFactory};
 #[cfg(unix)]
 pub use store::{CachedFactory, CachedOpenError, DiskStoreFactory};
 pub use sync::SyncMessage;
-pub use transport::{CompositeTransport, Inbound, ProjectionSink, Transport};
+pub use transport::{Both, CompositeTransport, Inbound, ProjectionSink, Transport};
 
 #[cfg(feature = "iroh")]
 pub use native::{run_server, Command, DriverOpts, IrohConfig, IrohTransport};

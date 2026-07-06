@@ -114,6 +114,55 @@ impl<T: Transport> Transport for CompositeTransport<T> {
     }
 }
 
+/// Unites TWO DIFFERENT transports into one. Where [`CompositeTransport`] fans over N of
+/// the *same* transport, `Both` composes two *distinct* types: a node driving one
+/// [`Room`](crate::Room)/[`Driver`](crate::Driver) over `IrohTransport` (node↔node) AND
+/// a WS server transport (browser clients) at once — `dispatch` goes to both, and
+/// `drain_inbound` merges both. Access an inner transport (e.g. for `IrohTransport`'s
+/// inherent `add_peer`/`endpoint_id`) via [`a_mut`](Self::a_mut) / [`b_mut`](Self::b_mut).
+pub struct Both<A: Transport, B: Transport> {
+    a: A,
+    b: B,
+}
+
+impl<A: Transport, B: Transport> Both<A, B> {
+    /// Compose two transports.
+    pub fn new(a: A, b: B) -> Self {
+        Self { a, b }
+    }
+    /// The first inner transport.
+    pub fn a_mut(&mut self) -> &mut A {
+        &mut self.a
+    }
+    /// The second inner transport.
+    pub fn b_mut(&mut self) -> &mut B {
+        &mut self.b
+    }
+}
+
+impl<A, B, E> Transport for Both<A, B>
+where
+    A: Transport<Error = E>,
+    B: Transport<Error = E>,
+    E: core::fmt::Debug,
+{
+    type Error = E;
+
+    /// Dispatch to both inner transports (attempting both), returning the first error.
+    fn dispatch(&mut self, room: RoomId, out: Outbound) -> Result<(), E> {
+        let ra = self.a.dispatch(room, out.clone());
+        let rb = self.b.dispatch(room, out);
+        ra.and(rb)
+    }
+
+    /// Merge the inbound frames drained from both inner transports.
+    fn drain_inbound(&mut self) -> Vec<Inbound> {
+        let mut v = self.a.drain_inbound();
+        v.extend(self.b.drain_inbound());
+        v
+    }
+}
+
 /// The Lane-3 projection sink a driver wires under a [`Room`](crate::Room).
 ///
 /// The core emits a finalized mutation per [`poll_finalized`](crate::Room::poll_finalized);
