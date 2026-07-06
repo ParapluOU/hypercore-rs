@@ -35,11 +35,15 @@ futures-lite = { version = "2", optional = true }
 tokio-tungstenite-wasm = { version = "0.3.1", optional = true }
 futures = { version = "0.3", optional = true }
 
-# Native executor for the iroh driver + the `ws` pump tasks. Native-only, so a wasm
+# Native executor for the iroh driver + the `ws` pump tasks, and the native WS SERVER
+# transport (`WsServerTransport` — accepts browser clients). Native-only, so a wasm
 # `ws` build pulls the browser executor (below) instead of tokio's rt (which does not
-# build for wasm32).
+# build for wasm32) and never pulls the server transport.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+# The server side of the `ws` transport (accept connections). tokio-tungstenite-wasm is
+# client-only; the node's relay needs a real WS acceptor. Native-only.
+tokio-tungstenite = { version = "0.21", optional = true, default-features = false, features = ["handshake"] }
 
 # Browser executor for the `ws` pump tasks on wasm.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -49,14 +53,9 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 default = []
 # Real network transport (Iroh QUIC) + tokio driver.
 iroh = ["dep:iroh", "dep:iroh-gossip", "dep:tokio", "dep:futures-lite"]
-# WebSocket transport (browser session + native WS-relay client). Sans-Iroh, wasm-clean.
-ws = ["dep:tokio-tungstenite-wasm", "dep:futures", "dep:tokio", "dep:wasm-bindgen-futures"]
-
-[dev-dependencies]
-# Native WS-relay server + async runtime for the `ws` round-trip test.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
-futures = "0.3"
+# WebSocket transport: browser client (`WsTransport`, native+wasm) + native server
+# (`WsServerTransport`, gated `not(wasm32)`). Sans-Iroh; the client half is wasm-clean.
+ws = ["dep:tokio-tungstenite-wasm", "dep:futures", "dep:tokio", "dep:wasm-bindgen-futures", "dep:tokio-tungstenite"]
 
 [[example]]
 name = "chat_room"

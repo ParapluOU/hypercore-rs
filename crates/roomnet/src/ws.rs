@@ -137,6 +137,141 @@ impl Transport for WsTransport {
     }
 }
 
+/// The SERVER side of the WS transport — a native acceptor that relays roomnet frames
+/// between many client (browser) connections and the local `RoomServer`. The
+/// counterpart to [`WsTransport`]: a node runs one of these to bridge browser clients
+/// into its [`Driver`](crate::Driver), typically composed with `IrohTransport` for the
+/// node↔node path. Native-only (browsers don't accept connections).
+///
+/// Each client stamps its own `from` id on every frame (see the module wire format), so
+/// the server learns a connection's peer id from its first frame and registers that
+/// connection's outbound channel under it. `dispatch` then routes `Fanout::Peer` to
+/// that one connection and `Fanout::Gossip` to all; `Fanout::Clients` is a local
+/// concern (skipped, as in `IrohTransport`). Outbound frames are stamped with the
+/// server's own `local_id` so clients address their replies back to the node.
+#[cfg(not(target_arch = "wasm32"))]
+mod server {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message as TMessage;
+
+    use super::{encode_frame, parse_frame};
+    use crate::room::{Fanout, Outbound, PeerId};
+    use crate::server::RoomId;
+    use crate::transport::{Inbound, Transport};
+    use core::convert::Infallible;
+
+    type Conns = Arc<Mutex<HashMap<PeerId, UnboundedSender<Vec<u8>>>>>;
+
+    /// A native WebSocket server transport. See the type-level docs above the module.
+    pub struct WsServerTransport {
+        local_id: PeerId,
+        local_addr: std::net::SocketAddr,
+        conns: Conns,
+        inbound: UnboundedReceiver<Inbound>,
+    }
+
+    impl WsServerTransport {
+        /// Bind `addr` and start accepting client connections in the background.
+        /// `local_id` is this node's id, stamped as `from` on every outbound frame.
+        /// Pass a `:0` port to bind an ephemeral one; read it back via [`local_addr`](Self::local_addr).
+        pub async fn bind(addr: std::net::SocketAddr, local_id: PeerId) -> std::io::Result<Self> {
+            let listener = TcpListener::bind(addr).await?;
+            let local_addr = listener.local_addr()?;
+            let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+            let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
+
+            let conns_accept = conns.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else { break };
+                    let Ok(ws) = accept_async(tcp).await else { continue };
+                    let (mut sink, mut stream) = ws.split();
+                    let (out_tx, mut out_rx) = mpsc::unbounded::<Vec<u8>>();
+
+                    // Writer: this connection's outbound queue → socket.
+                    tokio::spawn(async move {
+                        while let Some(frame) = out_rx.next().await {
+                            if sink.send(TMessage::Binary(frame.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    // Reader: socket → learn the peer id (first frame) → register this
+                    // connection's outbound channel → forward inbound frames.
+                    let conns_conn = conns_accept.clone();
+                    let in_tx_conn = in_tx.clone();
+                    tokio::spawn(async move {
+                        let mut registered = false;
+                        while let Some(Ok(msg)) = stream.next().await {
+                            if let TMessage::Binary(data) = msg {
+                                if let Some(inb) = parse_frame(&data) {
+                                    if !registered {
+                                        conns_conn.lock().unwrap().insert(inb.from, out_tx.clone());
+                                        registered = true;
+                                    }
+                                    if in_tx_conn.unbounded_send(inb).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            Ok(Self { local_id, local_addr, conns, inbound: in_rx })
+        }
+
+        /// The address the server is bound to (resolves a `:0` request to a real port).
+        pub fn local_addr(&self) -> std::net::SocketAddr {
+            self.local_addr
+        }
+    }
+
+    impl Transport for WsServerTransport {
+        // Enqueue-only, like the client: a dead connection is dropped, never fails.
+        type Error = Infallible;
+
+        fn dispatch(&mut self, room: RoomId, out: Outbound) -> Result<(), Infallible> {
+            let frame = encode_frame(&room, &self.local_id, &out.msg);
+            let conns = self.conns.lock().unwrap();
+            match out.to {
+                // Local-client fanout is not a peer-transport concern (matches IrohTransport).
+                Fanout::Clients => {}
+                Fanout::Peer(p) => {
+                    if let Some(tx) = conns.get(&p) {
+                        let _ = tx.unbounded_send(frame);
+                    }
+                }
+                Fanout::Gossip => {
+                    for tx in conns.values() {
+                        let _ = tx.unbounded_send(frame.clone());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn drain_inbound(&mut self) -> Vec<Inbound> {
+            let mut v = Vec::new();
+            while let Ok(Some(inb)) = self.inbound.try_next() {
+                v.push(inb);
+            }
+            v
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use server::WsServerTransport;
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -243,5 +378,57 @@ mod tests {
             }
             other => panic!("wrong message decoded: {other:?}"),
         }
+    }
+
+    /// The server accepts two clients, learns each connection's peer id from its frames,
+    /// then routes a `Fanout::Peer` frame to ONLY that client (stamped with the server's
+    /// id) — the node-relay path a browser client rides.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn server_routes_a_peer_frame_to_only_that_client() {
+        let a_id: PeerId = [1u8; 32];
+        let b_id: PeerId = [2u8; 32];
+        let srv_id: PeerId = [9u8; 32];
+
+        let mut server =
+            WsServerTransport::bind("127.0.0.1:0".parse().unwrap(), srv_id).await.unwrap();
+        let url = format!("ws://{}", server.local_addr());
+        let mut a = WsTransport::connect(&url, a_id).await.unwrap();
+        let mut b = WsTransport::connect(&url, b_id).await.unwrap();
+
+        let room: RoomId = [7u8; 32];
+        // Both clients announce so the server learns which connection is which peer.
+        a.dispatch(room, Outbound { to: Fanout::Gossip, msg: SyncMessage::Have { writer: a_id, length: 1 } }).unwrap();
+        b.dispatch(room, Outbound { to: Fanout::Gossip, msg: SyncMessage::Have { writer: b_id, length: 1 } }).unwrap();
+
+        // Wait until the server has ingested both announces ⇒ both connections registered.
+        let mut seen = 0usize;
+        for _ in 0..100 {
+            seen += server.drain_inbound().len();
+            if seen >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(seen >= 2, "server ingested both clients' announces (registered both)");
+
+        // Server sends a frame addressed to B only.
+        server
+            .dispatch(room, Outbound { to: Fanout::Peer(b_id), msg: SyncMessage::Want { writer: a_id, start: 0, end: 1 } })
+            .unwrap();
+
+        let got_b = wait_for_inbound(&mut b).await;
+        assert_eq!(got_b.len(), 1, "B receives the server's peer-addressed frame");
+        assert_eq!(got_b[0].from, srv_id, "frame stamped with the server's id");
+        match got_b[0].msg {
+            SyncMessage::Want { start, end, .. } => {
+                assert_eq!(start, 0);
+                assert_eq!(end, 1);
+            }
+            ref other => panic!("wrong message: {other:?}"),
+        }
+
+        // A must NOT receive B's peer-addressed frame.
+        assert!(a.drain_inbound().is_empty(), "A does not receive a frame addressed to B");
     }
 }

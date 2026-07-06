@@ -64,5 +64,8 @@ pub use native::{run_server, Command, DriverOpts, IrohConfig, IrohTransport};
 #[cfg(feature = "ws")]
 pub use ws::WsTransport;
 
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+pub use ws::WsServerTransport;
+
 #[cfg(test)]
 mod tests;
