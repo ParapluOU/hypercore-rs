@@ -28,12 +28,12 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use iroh_gossip::{api::Event, Gossip, TopicId, ALPN as GOSSIP_ALPN};
 use tokio::sync::mpsc;
 
+use crate::driver::Driver;
 use crate::projection::Projection;
 use crate::room::{Fanout, Outbound, PeerId};
 use crate::server::{RoomId, RoomServer};
 use crate::store::StoreFactory;
-use crate::sync::SyncMessage;
-use crate::transport::ProjectionSink;
+use crate::transport::{Inbound, ProjectionSink, Transport};
 use crate::wire;
 
 /// Any transport error (bind/dial/stream), boxed.
@@ -64,14 +64,6 @@ impl Default for IrohConfig {
             max_message_bytes: 16 * 1024 * 1024,
         }
     }
-}
-
-/// One decoded inbound frame: which room, which peer, which message.
-#[derive(Clone, Debug)]
-pub struct Inbound {
-    pub room: RoomId,
-    pub from: PeerId,
-    pub msg: SyncMessage,
 }
 
 /// A local command to the driver.
@@ -236,6 +228,23 @@ impl IrohTransport {
     }
 }
 
+/// `IrohTransport` is the native realisation of the sans-IO [`Transport`] seam:
+/// its inherent `dispatch`/`drain_inbound` already match the trait, so the impl
+/// forwards to them. Dispatch is fire-and-forget (it spawns a dial task), so it is
+/// [`Infallible`](core::convert::Infallible).
+impl Transport for IrohTransport {
+    type Error = core::convert::Infallible;
+
+    fn dispatch(&mut self, room: RoomId, out: Outbound) -> Result<(), Self::Error> {
+        IrohTransport::dispatch(self, room, out);
+        Ok(())
+    }
+
+    fn drain_inbound(&mut self) -> Vec<Inbound> {
+        IrohTransport::drain_inbound(self)
+    }
+}
+
 /// The accept side: read one `[RoomId | wire]` frame per connection, enqueue it,
 /// ack, and record the peer.
 struct SyncHandler {
@@ -282,9 +291,15 @@ impl ProtocolHandler for SyncHandler {
 /// Run the node event loop: bind rooms to the transport, pump messages, drain
 /// finalized deltas to `sink`, and service local [`Command`]s. Returns when a
 /// [`Command::Shutdown`] arrives or the command channel closes.
+///
+/// This is a thin tokio shell over the runtime-agnostic [`Driver`]: `select!`
+/// routes each [`Command`] to the matching driver method and, on each
+/// `poll_interval`, calls [`Driver::tick`] and feeds the finalized deltas it
+/// returns to `sink`. (The inbound sender is already recorded as a peer by the
+/// accept handler, so the driver's internal pump needs no extra `add_peer`.)
 pub async fn run_server<F, P, Sink>(
-    mut server: RoomServer<F, P>,
-    mut transport: IrohTransport,
+    server: RoomServer<F, P>,
+    transport: IrohTransport,
     mut sink: Sink,
     mut commands: mpsc::Receiver<Command>,
     opts: DriverOpts,
@@ -293,69 +308,31 @@ pub async fn run_server<F, P, Sink>(
     P: Projection + Clone,
     Sink: ProjectionSink<P::State>,
 {
-    let mut tick = 0u64;
+    let mut driver = Driver::new(server, transport, opts.announce_every_ticks);
     loop {
         tokio::select! {
             maybe = commands.recv() => match maybe {
                 Some(Command::Host(room)) => {
-                    if server.host(room).is_ok() {
-                        announce(&server, &transport, room);
-                    }
+                    let _ = driver.host(room);
                 }
                 Some(Command::JoinRemote(room, origin)) => {
-                    transport.add_peer(origin);
-                    if server.join_remote(room).is_ok() {
-                        announce(&server, &transport, room);
-                    }
+                    driver.transport_mut().add_peer(origin);
+                    let _ = driver.join_remote(room);
                 }
                 Some(Command::Append(room, op)) => {
-                    if let Some(r) = server.get_mut(room) {
-                        if let Ok(outs) = r.local_append(&op) {
-                            for o in outs {
-                                transport.dispatch(room, o);
-                            }
-                        }
-                    }
+                    let _ = driver.append(room, &op);
                 }
                 Some(Command::Shutdown) | None => break,
             },
             _ = tokio::time::sleep(opts.poll_interval) => {
-                for Inbound { room, from, msg } in transport.drain_inbound() {
-                    transport.add_peer(from);
-                    if let Some(r) = server.get_mut(room) {
-                        if let Ok(outs) = r.on_inbound(from, msg) {
-                            for o in outs {
-                                transport.dispatch(room, o);
-                            }
-                        }
-                    }
-                }
-                let ids: Vec<RoomId> = server.rooms().map(|(id, _)| *id).collect();
-                for id in ids {
-                    if let Some(r) = server.get_mut(id) {
-                        let deltas = r.poll_finalized();
-                        for f in deltas {
+                for (room, deltas) in driver.tick() {
+                    for f in deltas {
+                        if let Some(r) = driver.server().get(room) {
                             let _ = sink.write(f.version, r.snapshot_finalized());
                         }
                     }
-                    if tick % opts.announce_every_ticks == 0 {
-                        announce(&server, &transport, id);
-                    }
                 }
-                tick = tick.wrapping_add(1);
             }
-        }
-    }
-}
-
-fn announce<F, P>(server: &RoomServer<F, P>, transport: &IrohTransport, room: RoomId)
-where
-    F: StoreFactory,
-    P: Projection + Clone,
-{
-    if let Some(r) = server.get(room) {
-        for o in r.announce() {
-            transport.dispatch(room, o);
         }
     }
 }

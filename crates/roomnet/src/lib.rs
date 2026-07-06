@@ -24,6 +24,7 @@
 //!    finalized mutation via [`Room::poll_finalized`] (Lane 3, throttled by the driver).
 
 pub mod config;
+pub mod driver;
 pub mod entry;
 pub mod projection;
 pub mod room;
@@ -41,6 +42,7 @@ pub mod native;
 
 pub use autobase::{NodeId, WriterKey};
 pub use config::{Origin, RoomConfig, ServerConfig};
+pub use driver::Driver;
 pub use entry::{Entry, EntryCodec};
 pub use projection::Projection;
 pub use room::{Error, Fanout, Finalized, Outbound, PeerId, Room, StoreErr};
@@ -49,10 +51,10 @@ pub use store::{MemStoreFactory, StoreFactory};
 #[cfg(unix)]
 pub use store::{CachedFactory, CachedOpenError, DiskStoreFactory};
 pub use sync::SyncMessage;
-pub use transport::{ProjectionSink, Transport};
+pub use transport::{CompositeTransport, Inbound, ProjectionSink, Transport};
 
 #[cfg(feature = "iroh")]
-pub use native::{run_server, Command, DriverOpts, Inbound, IrohConfig, IrohTransport};
+pub use native::{run_server, Command, DriverOpts, IrohConfig, IrohTransport};
 
 #[cfg(test)]
 mod tests;

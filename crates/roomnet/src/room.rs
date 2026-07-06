@@ -334,6 +334,36 @@ where
         std::mem::take(&mut self.finalized_since_poll)
     }
 
+    /// True if this room is an [`Original`](Origin::Original) (host/indexer) with an
+    /// unfinalized op from SOME OTHER writer pending — meaning a sole indexer must
+    /// reference it (append) for it to finalise.
+    ///
+    /// A passive indexer never references peers' ops, so autobase never finalises
+    /// them; extending our own head to cover the pending peer op lets the normal
+    /// (monotone) finality confirm it on the next advance.
+    pub fn needs_checkpoint(&self) -> bool {
+        matches!(self.origin(), Origin::Original)
+            && self
+                .order()
+                .into_iter()
+                .skip(self.finalized_len())
+                .any(|n| n.key != self.local_key())
+    }
+
+    /// If [`needs_checkpoint`](Self::needs_checkpoint), append a reference-only empty
+    /// block so peers' pending ops finalise, returning the outbound frames to
+    /// dispatch. Returns an empty vec (no append) when no checkpoint is needed.
+    ///
+    /// An empty payload is the checkpoint no-op convention — the consumer's
+    /// projection skips empty payloads.
+    pub fn checkpoint(&mut self) -> Result<Vec<Outbound>, Error<StoreErr<F>>> {
+        if self.needs_checkpoint() {
+            self.local_append(&[])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// The decoded entries of `writer` in `[start, end)` (a hypercore-logs query).
     pub fn logs(
         &self,
