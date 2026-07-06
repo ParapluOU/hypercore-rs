@@ -40,6 +40,11 @@ pub mod wire;
 #[cfg(feature = "iroh")]
 pub mod native;
 
+/// A WebSocket [`Transport`] (browser + native WS-relay client). Behind `ws`; unlike
+/// `iroh` it compiles for both native and `wasm32`.
+#[cfg(feature = "ws")]
+pub mod ws;
+
 pub use autobase::{NodeId, WriterKey};
 pub use config::{Origin, RoomConfig, ServerConfig};
 pub use driver::Driver;
@@ -55,6 +60,9 @@ pub use transport::{CompositeTransport, Inbound, ProjectionSink, Transport};
 
 #[cfg(feature = "iroh")]
 pub use native::{run_server, Command, DriverOpts, IrohConfig, IrohTransport};
+
+#[cfg(feature = "ws")]
+pub use ws::WsTransport;
 
 #[cfg(test)]
 mod tests;

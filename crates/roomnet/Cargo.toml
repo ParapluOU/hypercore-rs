@@ -27,13 +27,36 @@ iroh = { version = "1", optional = true }
 # RoomId): subscribing to a room's topic finds co-subscribers and teaches the
 # endpoint their addresses, so the direct-dial sync path can reach them.
 iroh-gossip = { version = "0.101", optional = true }
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures-lite = { version = "2", optional = true }
+
+# WebSocket transport (feature `ws`, native + wasm). tokio-tungstenite-wasm speaks WS
+# on both targets; `futures` supplies the channels + Stream/Sink combinators the
+# sync Transport seam bridges the async socket with.
+tokio-tungstenite-wasm = { version = "0.3.1", optional = true }
+futures = { version = "0.3", optional = true }
+
+# Native executor for the iroh driver + the `ws` pump tasks. Native-only, so a wasm
+# `ws` build pulls the browser executor (below) instead of tokio's rt (which does not
+# build for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+# Browser executor for the `ws` pump tasks on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [features]
 default = []
 # Real network transport (Iroh QUIC) + tokio driver.
 iroh = ["dep:iroh", "dep:iroh-gossip", "dep:tokio", "dep:futures-lite"]
+# WebSocket transport (browser session + native WS-relay client). Sans-Iroh, wasm-clean.
+ws = ["dep:tokio-tungstenite-wasm", "dep:futures", "dep:tokio", "dep:wasm-bindgen-futures"]
+
+[dev-dependencies]
+# Native WS-relay server + async runtime for the `ws` round-trip test.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+futures = "0.3"
 
 [[example]]
 name = "chat_room"
