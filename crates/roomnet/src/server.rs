@@ -31,7 +31,7 @@ pub type RoomId = [u8; 32];
 /// directory; an ephemeral factory (`MemStoreFactory`) can ignore the id.
 ///
 /// [`mint_identity`]: RoomServer::mint_identity
-pub type StoreProvider<F> = Box<dyn Fn(RoomId) -> F + Send>;
+pub type StoreProvider<F> = Box<dyn Fn(RoomId) -> F + Send + Sync>;
 
 /// A node's collection of rooms.
 pub struct RoomServer<F: StoreFactory, P: Projection> {
@@ -54,7 +54,7 @@ where
     pub fn open(
         cfg: ServerConfig,
         projection: P,
-        new_store: impl Fn(RoomId) -> F + Send + 'static,
+        new_store: impl Fn(RoomId) -> F + Send + Sync + 'static,
     ) -> Self {
         Self {
             identity_seed: cfg.identity_seed,
