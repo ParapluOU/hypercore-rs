@@ -145,10 +145,13 @@ impl Transport for WsTransport {
 ///
 /// Each client stamps its own `from` id on every frame (see the module wire format), so
 /// the server learns a connection's peer id from its first frame and registers that
-/// connection's outbound channel under it. `dispatch` then routes `Fanout::Peer` to
-/// that one connection and `Fanout::Gossip` to all; `Fanout::Clients` is a local
-/// concern (skipped, as in `IrohTransport`). Outbound frames are stamped with the
-/// server's own `local_id` so clients address their replies back to the node.
+/// connection's outbound channel under it. `dispatch` routes `Fanout::Peer` to that one
+/// connection; `Fanout::Gossip` AND `Fanout::Clients` both go to every connected client
+/// — a homeserver's WS clients ARE its local clients, so a block the room relays from
+/// one writer (emitted to `Clients` on ingest) reaches that writer's co-editors here.
+/// (This is the opposite of `IrohTransport`, whose peers are nodes, not clients — it
+/// skips `Clients`.) Outbound frames are stamped with the server's own `local_id` so
+/// clients address their replies back to the node.
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
     use std::collections::{HashMap, HashSet};
@@ -262,14 +265,20 @@ mod server {
             let frame = encode_frame(&room, &self.local_id, &out.msg);
             let conns = self.conns.lock().unwrap();
             match out.to {
-                // Local-client fanout is not a peer-transport concern (matches IrohTransport).
-                Fanout::Clients => {}
                 Fanout::Peer(p) => {
                     if let Some(tx) = conns.get(&p) {
                         let _ = tx.unbounded_send(frame);
                     }
                 }
-                Fanout::Gossip => {
+                // A homeserver's WS clients ARE its local clients, so BOTH peer gossip
+                // (head adverts) AND `Fanout::Clients` go to every connected client.
+                // The room emits a verified REMOTE writer's block to `Clients` on ingest
+                // (room.rs on_inbound), so routing `Clients` here is exactly what relays
+                // one browser's edit to its co-editors on the same homeserver. (The
+                // origin re-receives its own block and ignores it — writer == its own
+                // key. The client `WsTransport` still skips `Clients`: a browser has no
+                // clients of its own.)
+                Fanout::Gossip | Fanout::Clients => {
                     for tx in conns.values() {
                         let _ = tx.unbounded_send(frame.clone());
                     }
