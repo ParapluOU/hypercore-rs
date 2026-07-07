@@ -151,7 +151,7 @@ impl Transport for WsTransport {
 /// server's own `local_id` so clients address their replies back to the node.
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -167,12 +167,17 @@ mod server {
     use core::convert::Infallible;
 
     type Conns = Arc<Mutex<HashMap<PeerId, UnboundedSender<Vec<u8>>>>>;
+    /// Every room id a client has ever framed to this server. A homeserver polls this
+    /// (via [`seen_rooms`](WsServerTransport::seen_rooms)) to host + relay rooms its
+    /// browser clients announce, without an out-of-band "host this room" signal.
+    type Seen = Arc<Mutex<HashSet<RoomId>>>;
 
     /// A native WebSocket server transport. See the type-level docs above the module.
     pub struct WsServerTransport {
         local_id: PeerId,
         local_addr: std::net::SocketAddr,
         conns: Conns,
+        seen: Seen,
         inbound: UnboundedReceiver<Inbound>,
     }
 
@@ -184,9 +189,11 @@ mod server {
             let listener = TcpListener::bind(addr).await?;
             let local_addr = listener.local_addr()?;
             let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
+            let seen: Seen = Arc::new(Mutex::new(HashSet::new()));
             let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
 
             let conns_accept = conns.clone();
+            let seen_accept = seen.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else { break };
@@ -204,8 +211,9 @@ mod server {
                     });
 
                     // Reader: socket → learn the peer id (first frame) → register this
-                    // connection's outbound channel → forward inbound frames.
+                    // connection's outbound channel → record the room → forward the frame.
                     let conns_conn = conns_accept.clone();
+                    let seen_conn = seen_accept.clone();
                     let in_tx_conn = in_tx.clone();
                     tokio::spawn(async move {
                         let mut registered = false;
@@ -216,6 +224,10 @@ mod server {
                                         conns_conn.lock().unwrap().insert(inb.from, out_tx.clone());
                                         registered = true;
                                     }
+                                    // Record the room BEFORE forwarding, so a homeserver
+                                    // polling `seen_rooms()` can host it before the driver
+                                    // drains (and would otherwise drop) this frame.
+                                    seen_conn.lock().unwrap().insert(inb.room);
                                     if in_tx_conn.unbounded_send(inb).is_err() {
                                         break;
                                     }
@@ -226,12 +238,19 @@ mod server {
                 }
             });
 
-            Ok(Self { local_id, local_addr, conns, inbound: in_rx })
+            Ok(Self { local_id, local_addr, conns, seen, inbound: in_rx })
         }
 
         /// The address the server is bound to (resolves a `:0` request to a real port).
         pub fn local_addr(&self) -> std::net::SocketAddr {
             self.local_addr
+        }
+
+        /// Every room id a client has framed to this server so far. A homeserver polls
+        /// this to host + relay rooms its clients announce (see the type docs). The set
+        /// only grows; hosting is idempotent, so re-seeing a room is harmless.
+        pub fn seen_rooms(&self) -> Vec<RoomId> {
+            self.seen.lock().unwrap().iter().copied().collect()
         }
     }
 
