@@ -109,3 +109,109 @@ fn finalized_deltas_are_per_mutation_and_contiguous() {
     // The counter projection folded exactly the finalized mutations.
     assert_eq!(*room.snapshot_finalized(), fin as u64, "finalized fold count matches");
 }
+
+/// The RELAY (homeserver) path, star topology: A and B never talk directly — every
+/// frame goes through R. Proves the three relay primitives together:
+///
+/// 1. a fresh room's `announce()` is non-empty (the zero-length `Have` **hello** a
+///    connection-oriented transport needs to register a silent joiner);
+/// 2. `announce()` advertises REPLICATED writers (so a late joiner learns, from R
+///    alone, that writer A exists);
+/// 3. the `Want` arm re-serves a replicated writer's verified blocks (so B pulls
+///    A's log *through* R, verifying against A's own signed head).
+///
+/// Plus the checkpoint regression: two Originals must not ping-pong checkpoints
+/// forever (a peer's EMPTY checkpoint block is not itself checkpoint-worthy).
+#[test]
+fn late_joiner_converges_through_a_relay_it_never_shared_a_frame_with() {
+    let (a, r, b) = (seed(11), seed(12), seed(13));
+    let (ak, rk, bk) = (a.public().to_bytes(), r.public().to_bytes(), b.public().to_bytes());
+
+    // Every participant is an Original self-indexer — exactly the browser/homeserver
+    // shape (the node auto-hosts; each browser hosts its own session's room).
+    let mut ra = Room::open(RoomConfig::original(a, vec![ak]), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rr = Room::open(RoomConfig::original(r, vec![rk]), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, vec![bk]), MemStoreFactory, KvProjection::new()).unwrap();
+
+    // (1) A fresh, empty room still announces — the hello.
+    let hello = rb.announce();
+    assert!(
+        !hello.is_empty(),
+        "an empty room's announce must be non-empty (the hello a WS relay registers by)"
+    );
+
+    // A edits, then syncs with R ONLY (B is not even connected yet).
+    ra.local_append(&put(b"riff", b"E5-A5-D5")).unwrap();
+    let mut inbox_r: Vec<SyncMessage> = ra.announce().into_iter().map(|o| o.msg).collect();
+    let mut inbox_a: Vec<SyncMessage> = Vec::new();
+    for _ in 0..8 {
+        let to_r = std::mem::take(&mut inbox_r);
+        for m in to_r {
+            for o in rr.on_inbound(ak, m).unwrap() {
+                inbox_a.push(o.msg);
+            }
+        }
+        let to_a = std::mem::take(&mut inbox_a);
+        for m in to_a {
+            for o in ra.on_inbound(rk, m).unwrap() {
+                inbox_r.push(o.msg);
+            }
+        }
+    }
+    assert_eq!(
+        rr.snapshot_live().get(b"riff".as_slice()).map(Vec::as_slice),
+        Some(b"E5-A5-D5".as_slice()),
+        "the relay replicated + folded A's op"
+    );
+
+    // (2) B joins LATE: R's announce must advertise writer A (a replicated writer).
+    let adverts = rr.announce();
+    assert!(
+        adverts.iter().any(|o| matches!(o.msg, SyncMessage::Have { writer, length } if writer == ak && length == 1)),
+        "the relay's announce advertises the replicated writer it can serve"
+    );
+
+    // (3) Deliver R's adverts to B; B Wants writer A FROM R; R re-serves A's block.
+    let mut inbox_r2: Vec<SyncMessage> = Vec::new();
+    for o in adverts {
+        for reply in rb.on_inbound(rk, o.msg).unwrap() {
+            inbox_r2.push(reply.msg);
+        }
+    }
+    assert!(!inbox_r2.is_empty(), "B wants the advertised writer");
+    let mut inbox_b: Vec<SyncMessage> = Vec::new();
+    for m in inbox_r2 {
+        for o in rr.on_inbound(bk, m).unwrap() {
+            inbox_b.push(o.msg);
+        }
+    }
+    for m in inbox_b {
+        rb.on_inbound(rk, m).unwrap();
+    }
+    assert_eq!(
+        rb.snapshot_live().get(b"riff".as_slice()).map(Vec::as_slice),
+        Some(b"E5-A5-D5".as_slice()),
+        "the late joiner converged on A's edit through the relay alone"
+    );
+
+    // Checkpoint regression: R (holding A's real op) may checkpoint once; but A,
+    // whose only pending peer entries would be empty checkpoints, must NOT answer
+    // with a checkpoint of its own (else the two Originals ping-pong forever).
+    if rr.needs_checkpoint() {
+        let outs = rr.checkpoint().unwrap();
+        for o in outs {
+            if let SyncMessage::Head { .. } | SyncMessage::Have { .. } = o.msg {
+                for reply in ra.on_inbound(rk, o.msg.clone()).unwrap() {
+                    // A pulls R's checkpoint block.
+                    for served in rr.on_inbound(ak, reply.msg).unwrap() {
+                        ra.on_inbound(rk, served.msg).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !ra.needs_checkpoint(),
+        "a peer's empty checkpoint must not trigger a counter-checkpoint (ping-pong)"
+    );
+}

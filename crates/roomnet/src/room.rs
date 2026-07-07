@@ -284,13 +284,29 @@ where
                 }
             }
             SyncMessage::Want { writer, start, end } => {
-                // Only writers we host locally can be served (we hold their proofs).
-                // Relaying a replicated writer's blocks is a follow-on.
                 if writer == self.local_key {
+                    // Our own log: serve from the local hypercore.
                     if let Some(head) = self.local.head().cloned() {
                         let hi = end.min(self.local.len());
                         for i in start..hi {
                             if let (Some(bytes), Some(proof)) = (self.local.block(i)?, self.local.proof(i)) {
+                                out.push(Outbound {
+                                    msg: SyncMessage::Block { writer, head: head.clone(), index: i, bytes, proof },
+                                    to: Fanout::Peer(from),
+                                });
+                            }
+                        }
+                    }
+                } else if let Some(rep) = self.remotes.get(&writer) {
+                    // A REPLICATED writer's log: re-serve the verified blocks with the
+                    // writer's own signed head + our replica-tree proofs — the relay
+                    // role (a homeserver forwarding one client's log to another). The
+                    // requester verifies against the writer's signature, so the relay
+                    // adds no trust. Serve only the fully verified prefix (the head).
+                    if let Some(head) = rep.verified_head().cloned() {
+                        let hi = end.min(head.length);
+                        for i in start..hi {
+                            if let (Some(bytes), Some(proof)) = (rep.block(i)?, rep.proof(i)) {
                                 out.push(Outbound {
                                     msg: SyncMessage::Block { writer, head: head.clone(), index: i, bytes, proof },
                                     to: Fanout::Peer(from),
@@ -317,15 +333,42 @@ where
         Ok(out)
     }
 
-    /// A gossip advert of the local writer's current head (sent on connect).
+    /// A gossip advert of everything this room can serve (sent on connect and on
+    /// the driver's announce cadence): the local writer's head, plus a `Have` for
+    /// every replicated writer we hold — so a late joiner can pull writers it has
+    /// never heard of *through us* (the relay/homeserver role).
+    ///
+    /// A fresh room with no head and no replicas still emits a zero-length `Have`
+    /// for the local writer: a universal no-op for receivers (`0 > writer_len` is
+    /// never true), but it is the **hello** that lets a connection-oriented
+    /// transport (e.g. a WS relay, which learns a connection's peer id from its
+    /// first frame) register us — a silent joiner would otherwise never be
+    /// addressed by anyone.
     pub fn announce(&self) -> Vec<Outbound> {
+        let mut out = Vec::new();
         match self.local.head().cloned() {
-            Some(head) => vec![Outbound {
+            Some(head) => out.push(Outbound {
                 msg: SyncMessage::Head { writer: self.local_key, head },
                 to: Fanout::Gossip,
-            }],
-            None => Vec::new(),
+            }),
+            None => out.push(Outbound {
+                msg: SyncMessage::Have { writer: self.local_key, length: 0 },
+                to: Fanout::Gossip,
+            }),
         }
+        for (writer, rep) in &self.remotes {
+            // Only advertise what we can actually serve: fully verified prefixes
+            // (serving requires the verified head — see the `Want` arm).
+            if let Some(head) = rep.verified_head() {
+                if head.length > 0 {
+                    out.push(Outbound {
+                        msg: SyncMessage::Have { writer: *writer, length: head.length },
+                        to: Fanout::Gossip,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Drain the finalized mutations produced since the last call (Lane 3). One
@@ -341,13 +384,22 @@ where
     /// A passive indexer never references peers' ops, so autobase never finalises
     /// them; extending our own head to cover the pending peer op lets the normal
     /// (monotone) finality confirm it on the next advance.
+    ///
+    /// EMPTY payloads (peer checkpoints — the reference-only no-op convention, see
+    /// [`checkpoint`](Self::checkpoint)) are ignored: they carry nothing worth
+    /// finalising, and answering a peer's checkpoint with our own would ping-pong
+    /// forever between two Originals (each side's checkpoint is the other's next
+    /// pending peer op).
     pub fn needs_checkpoint(&self) -> bool {
         matches!(self.origin(), Origin::Original)
             && self
                 .order()
                 .into_iter()
                 .skip(self.finalized_len())
-                .any(|n| n.key != self.local_key())
+                .any(|n| {
+                    n.key != self.local_key()
+                        && self.payloads.get(&n).is_some_and(|p| !p.is_empty())
+                })
     }
 
     /// If [`needs_checkpoint`](Self::needs_checkpoint), append a reference-only empty
@@ -494,6 +546,12 @@ where
 
     /// Recompute derived state: extend the finalized fold, then rebuild the live
     /// fold as finalized-state + the speculative tail.
+    ///
+    /// EMPTY payloads (checkpoints — reference-only no-ops, see
+    /// [`checkpoint`](Self::checkpoint)) are never handed to the [`Projection`]:
+    /// the no-op convention is enforced HERE, once, rather than by every domain
+    /// fold. They still surface as [`Finalized`] deltas (a version bump the
+    /// driver's sink may care about), just with an empty payload.
     fn advance(&mut self) -> Result<(), Error<StoreErr<F>>> {
         // 1. Finalized prefix grows monotonically — fold only the new suffix.
         let fin = self.lin.finalized();
@@ -501,9 +559,11 @@ where
             for i in self.finalized_len..fin.len() {
                 let node = fin[i];
                 let payload = self.payloads.get(&node).cloned().unwrap_or_default();
-                self.finalized_proj
-                    .apply(node, &payload)
-                    .map_err(|e| Error::Projection(format!("{:?}", e)))?;
+                if !payload.is_empty() {
+                    self.finalized_proj
+                        .apply(node, &payload)
+                        .map_err(|e| Error::Projection(format!("{:?}", e)))?;
+                }
                 self.finalized_since_poll.push(Finalized {
                     node,
                     payload,
@@ -520,6 +580,9 @@ where
         debug_assert!(order.len() >= self.finalized_len, "finalized must be a prefix of order");
         for node in &order[self.finalized_len..] {
             let payload = self.payloads.get(node).cloned().unwrap_or_default();
+            if payload.is_empty() {
+                continue;
+            }
             // Live is best-effort/optimistic; a tail apply error must not abort ingest.
             let _ = self.live_proj.apply(*node, &payload);
         }

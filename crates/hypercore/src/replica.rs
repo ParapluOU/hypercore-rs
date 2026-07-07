@@ -231,6 +231,24 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
         Ok(Some(self.codec.decode(&bytes).map_err(Error::Codec)?))
     }
 
+    /// The RAW verified bytes of block `index` (as stored by
+    /// [`add_block`](Self::add_block)) — for re-serving this writer's log to a
+    /// third peer (the relay role). `None` beyond our replicated length.
+    pub fn block(&self, index: u64) -> Result<Option<Vec<u8>>, Error<S::Error>> {
+        if index >= self.tree.len() {
+            return Ok(None);
+        }
+        self.store.get(index).map_err(Error::Storage)
+    }
+
+    /// A Merkle inclusion proof for `index` from this replica's own tree (built
+    /// from the verified blocks). Paired with [`verified_head`](Self::verified_head)
+    /// a third party verifies the re-served block exactly as if it came from the
+    /// writer — the relay adds no trust.
+    pub fn proof(&self, index: u64) -> Option<Proof> {
+        self.tree.proof(index)
+    }
+
     /// Persist this replica's authenticated state (Merkle tree + verified head) to
     /// its [`Store`] so it can be reopened with [`open`](Self::open) — the durable
     /// resume payoff: a node recovers a remote writer's *verified* log from local
