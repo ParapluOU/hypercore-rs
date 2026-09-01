@@ -27,6 +27,17 @@ pub type PeerId = [u8; 32];
 /// The storage error type of a [`StoreFactory`]'s stores.
 pub type StoreErr<F> = <<F as StoreFactory>::Store as Store>::Error;
 
+/// A read-only archival snapshot of one writer's feed — its key, signed head, and
+/// ordered raw block bytes (the exact bytes appended, i.e. `EntryCodec`-encoded
+/// [`Entry`]s). Produced by [`Room::snapshot_feeds`] for a typed history archive that
+/// reconstructs + re-authenticates the feed with no live peer.
+#[derive(Clone, Debug)]
+pub struct FeedSnapshot {
+    pub writer: WriterKey,
+    pub head: SignedHead,
+    pub blocks: Vec<Vec<u8>>,
+}
+
 /// Where an [`Outbound`] message should be delivered.
 #[derive(Clone, Debug)]
 pub enum Fanout {
@@ -439,6 +450,35 @@ where
             }
         }
         Ok(v)
+    }
+
+    /// A read-only archival snapshot of every writer's feed (local + verified
+    /// remotes): each writer's key, its `SignedHead`, and all raw block bytes in
+    /// order — enough to reconstruct + re-authenticate the feeds offline (the typed
+    /// history archive). Writers with no signed head yet are skipped.
+    pub fn snapshot_feeds(&self) -> Result<Vec<FeedSnapshot>, Error<StoreErr<F>>> {
+        let mut out = Vec::new();
+        if let Some(head) = self.local.head() {
+            let mut blocks = Vec::with_capacity(self.local.len() as usize);
+            for i in 0..self.local.len() {
+                if let Some(b) = self.local.block(i)? {
+                    blocks.push(b);
+                }
+            }
+            out.push(FeedSnapshot { writer: self.local_key, head: head.clone(), blocks });
+        }
+        for (writer, replica) in &self.remotes {
+            if let Some(head) = replica.verified_head() {
+                let mut blocks = Vec::with_capacity(replica.len() as usize);
+                for i in 0..replica.len() {
+                    if let Some(b) = replica.block(i)? {
+                        blocks.push(b);
+                    }
+                }
+                out.push(FeedSnapshot { writer: *writer, head: head.clone(), blocks });
+            }
+        }
+        Ok(out)
     }
 
     // ---- internals -------------------------------------------------------

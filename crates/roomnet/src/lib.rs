@@ -50,7 +50,7 @@ pub use config::{Origin, RoomConfig, ServerConfig};
 pub use driver::Driver;
 pub use entry::{Entry, EntryCodec};
 pub use projection::Projection;
-pub use room::{Error, Fanout, Finalized, Outbound, PeerId, Room, StoreErr};
+pub use room::{Error, Fanout, FeedSnapshot, Finalized, Outbound, PeerId, Room, StoreErr};
 pub use server::{RoomId, RoomServer};
 pub use store::{MemStoreFactory, StoreFactory};
 #[cfg(unix)]
