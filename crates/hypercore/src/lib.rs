@@ -281,6 +281,24 @@ pub fn verify_block(public: &PublicKey, head: &SignedHead, index: u64, data: &[u
         && proof.verify(data, &head.root)
 }
 
+/// Verify a whole feed **from an archive**, with no live core and no per-block
+/// proof: recompute the Merkle tree from `blocks` (the authenticated leaf bytes, in
+/// `seq` order), require its length + root equal the signed head, and verify the
+/// head signature under `public`. This is the read-only archival counterpart to
+/// [`Hypercore::verify_head`] — used by a typed history archive that stores each
+/// writer's `SignedHead` + ordered block bytes and must re-authenticate them
+/// offline. `blocks` are the exact bytes that were appended (for roomnet, each is an
+/// `EntryCodec`-encoded `Entry`).
+pub fn verify_archived_feed(public: &PublicKey, head: &SignedHead, blocks: &[Vec<u8>]) -> bool {
+    let mut tree = merkle::MerkleTree::new();
+    for block in blocks {
+        tree.append(block);
+    }
+    head.length == tree.len()
+        && head.root == tree.root_hash()
+        && public.verify(&head_message(head.fork, head.length, &head.root), &head.sig)
+}
+
 /// Whether two signed heads from the **same author** are a proven *equivocation*
 /// (a fork at one fork counter).
 ///
