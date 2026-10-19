@@ -215,3 +215,44 @@ fn late_joiner_converges_through_a_relay_it_never_shared_a_frame_with() {
         "a peer's empty checkpoint must not trigger a counter-checkpoint (ping-pong)"
     );
 }
+
+/// A homeserver must acknowledge the newest peer entry, then stop producing
+/// reference-only checkpoints once the entire batch has finalized.
+#[test]
+fn hosted_indexer_settles_after_a_peer_batch() {
+    let host = seed(71);
+    let peer = seed(72);
+    let hk = host.public().to_bytes();
+    let pk = peer.public().to_bytes();
+    let mut hosted = Room::open(
+        RoomConfig::original(host, vec![hk]),
+        MemStoreFactory,
+        KvProjection::new(),
+    ).unwrap();
+    let mut client = Room::open(
+        RoomConfig::original(peer, vec![hk]),
+        MemStoreFactory,
+        KvProjection::new(),
+    ).unwrap();
+    for value in 0..5 {
+        client.local_append(&put(b"selected-beat", &[value])).unwrap();
+    }
+    let mut to_host: Vec<_> = client.announce().into_iter().map(|o| o.msg).collect();
+    let mut to_peer = Vec::new();
+    for _ in 0..8 {
+        for msg in std::mem::take(&mut to_host) {
+            to_peer.extend(hosted.on_inbound(pk, msg).unwrap().into_iter().map(|o| o.msg));
+        }
+        for msg in std::mem::take(&mut to_peer) {
+            to_host.extend(client.on_inbound(hk, msg).unwrap().into_iter().map(|o| o.msg));
+        }
+    }
+    assert_eq!(hosted.snapshot_live().get(b"selected-beat".as_slice()), Some(&vec![4]));
+    for _ in 0..12 {
+        hosted.checkpoint().unwrap();
+    }
+    assert!(!hosted.needs_checkpoint(),
+        "a finite peer edit batch must not create an unbounded checkpoint stream");
+    assert_eq!(hosted.snapshot_finalized().get(b"selected-beat".as_slice()), Some(&vec![4]),
+        "the host must confirm the latest peer entry, not only its root");
+}

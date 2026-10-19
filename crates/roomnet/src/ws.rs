@@ -336,8 +336,9 @@ mod tests {
     /// the other. Stands in for a homeserver bridging two roomnet peers.
     async fn relay_two(listener: TcpListener) {
         let (a, _) = listener.accept().await.unwrap();
-        let (b, _) = listener.accept().await.unwrap();
+        // The caller awaits A's WebSocket handshake before opening B.
         let a = accept_async(a).await.unwrap();
+        let (b, _) = listener.accept().await.unwrap();
         let b = accept_async(b).await.unwrap();
         let (mut a_tx, mut a_rx) = a.split();
         let (mut b_tx, mut b_rx) = b.split();
@@ -385,8 +386,10 @@ mod tests {
         tokio::spawn(relay_two(listener));
 
         let url = format!("ws://{addr}");
-        let mut a = WsTransport::connect(&url, [1u8; 32]).await.unwrap();
-        let mut b = WsTransport::connect(&url, [2u8; 32]).await.unwrap();
+        let mut a = tokio::time::timeout(std::time::Duration::from_secs(5),
+            WsTransport::connect(&url, [1u8; 32])).await.unwrap().unwrap();
+        let mut b = tokio::time::timeout(std::time::Duration::from_secs(5),
+            WsTransport::connect(&url, [2u8; 32])).await.unwrap().unwrap();
 
         let room: RoomId = [9u8; 32];
         a.dispatch(

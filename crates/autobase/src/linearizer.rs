@@ -127,6 +127,19 @@ impl Linearizer {
         out
     }
 
+    /// The configured confirming writers; `None` means finality is disabled.
+    pub fn indexers(&self) -> Option<&BTreeSet<WriterKey>> {
+        self.indexers.as_ref()
+    }
+
+    /// Causal heads: observed nodes with no dependents (the DAG frontier).
+    /// New entries reference these tips to acknowledge everything already seen.
+    pub fn heads(&self) -> BTreeSet<NodeId> {
+        self.deps.keys().filter(|node| {
+            self.dependents.get(node).is_none_or(BTreeSet::is_empty)
+        }).copied().collect()
+    }
+
     /// Tails: nodes with no dependencies (the roots of the DAG). Mirrors upstream's
     /// `linearizer.tails` — useful for the quorum layer and as a structural check.
     pub fn tails(&self) -> BTreeSet<NodeId> {
@@ -1546,4 +1559,22 @@ mod tests {
         // c is still part of the linearization.
         assert!(lin.order().contains(&n(C, 0)));
     }
+    #[test]
+    fn causal_heads_follow_the_observed_frontier_after_finalization() {
+        let a = [81; 32];
+        let b = [82; 32];
+        let mut lin = Linearizer::with_indexers([a]);
+        let root = NodeId::new(a, 0);
+        let latest = NodeId::new(a, 1);
+        lin.add(root, &[]).unwrap();
+        lin.add(latest, &[]).unwrap();
+        let _confirmed = lin.finalized();
+        assert_eq!(lin.tails(), BTreeSet::from([root]));
+        assert_eq!(lin.heads(), BTreeSet::from([latest]));
+        let peer = NodeId::new(b, 0);
+        lin.add(peer, &lin.heads().into_iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!(lin.heads(), BTreeSet::from([peer]));
+        assert!(lin.sees(&peer, &latest), "new writer must acknowledge the newest observed entry");
+    }
+
 }

@@ -204,6 +204,22 @@ where
         self.local_key
     }
 
+    /// Configured confirmation authority, distinct from the set of writers.
+    pub fn indexers(&self) -> Vec<WriterKey> {
+        self.lin.indexers().into_iter().flatten().copied().collect()
+    }
+
+    /// Read-only synchronization counters, without copying blocks or the DAG.
+    pub fn writer_lengths(&self) -> BTreeMap<WriterKey, u64> {
+        std::iter::once((self.local_key, self.local.len()))
+            .chain(self.remotes.iter().map(|(key, replica)| (*key, replica.len())))
+            .collect()
+    }
+
+    pub fn checkpoint_count(&self) -> usize {
+        self.payloads.values().filter(|payload| payload.is_empty()).count()
+    }
+
     /// The room's provenance/GC policy.
     pub fn origin(&self) -> &Origin {
         &self.origin
@@ -242,7 +258,7 @@ where
     /// and a client fanout of the new block (Lane 1).
     pub fn local_append(&mut self, op: &[u8]) -> Result<Vec<Outbound>, Error<StoreErr<F>>> {
         let seq = self.local.len();
-        let heads: Vec<NodeId> = self.lin.tails().into_iter().collect();
+        let heads: Vec<NodeId> = self.lin.heads().into_iter().collect();
         let entry = Entry::new(heads.clone(), op.to_vec());
         self.local.append(&entry)?;
         self.local.persist()?; // durable — the local writer survives a restart
@@ -250,7 +266,7 @@ where
         let node = NodeId::new(self.local_key, seq);
         match self.lin.add(node, &heads) {
             Ok(()) | Err(AddError::Duplicate(_)) => {}
-            // A local append references only already-delivered tails, so a gap or
+            // A local append references only already-delivered heads, so a gap or
             // missing head would be a bug in this room, not a network condition.
             Err(_) => debug_assert!(false, "local append violated causal delivery"),
         }
