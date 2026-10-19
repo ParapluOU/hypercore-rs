@@ -272,11 +272,16 @@ pub struct Snapshot<T, C> {
     _t: PhantomData<fn() -> T>,
 }
 
+/// Authenticate a head without accepting any blocks or changing replica state.
+pub fn verify_signed_head(public: &PublicKey, head: &SignedHead) -> bool {
+    public.verify(&head_message(head.fork, head.length, &head.root), &head.sig)
+}
+
 /// Verify, from a signed head alone, that `data` is the block at `index` in the
 /// log owned by `public`. This is what a replica/verifier uses — it needs only
 /// the public key, the signed head, and the block's proof.
 pub fn verify_block(public: &PublicKey, head: &SignedHead, index: u64, data: &[u8], proof: &Proof) -> bool {
-    public.verify(&head_message(head.fork, head.length, &head.root), &head.sig)
+    verify_signed_head(public, head)
         && proof.block == index
         && proof.verify(data, &head.root)
 }

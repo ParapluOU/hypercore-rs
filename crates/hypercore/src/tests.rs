@@ -2256,3 +2256,61 @@ fn sweep_drops_unmarked_blocks_keeping_them_authenticated() {
     // sweeping again is a no-op (already absent)
     assert_eq!(core.sweep(|i| i % 2 == 0).unwrap(), 0);
 }
+
+#[test]
+fn recover_signed_suffix_preserves_prefix_and_rejects_tamper_forks_and_storage_failure() {
+    let mut source = Hypercore::new(author(83), Bytes, MemoryStore::new());
+    for bytes in [b"root".to_vec(), b"next".to_vec(), b"last".to_vec()] {
+        source.append(&bytes).unwrap();
+    }
+    let head = source.head().unwrap().clone();
+    let suffix = vec![
+        source.block(1).unwrap().unwrap(),
+        source.block(2).unwrap().unwrap(),
+    ];
+    let mut local = Hypercore::new(author(83), Bytes, FaultyStore::default());
+    local.append(&b"root".to_vec()).unwrap();
+    let before = local.head().unwrap().clone();
+    let mut tampered = suffix.clone();
+    tampered[0][0] ^= 1;
+    assert!(local.recover_signed_suffix(&head, &tampered).is_err());
+    assert_eq!(local.head(), Some(&before));
+    let mut conflicting = Hypercore::new(author(83), Bytes, MemoryStore::new());
+    for bytes in [b"fork".to_vec(), b"next".to_vec(), b"last".to_vec()] {
+        conflicting.append(&bytes).unwrap();
+    }
+    assert!(local
+        .recover_signed_suffix(conflicting.head().unwrap(), &suffix)
+        .is_err());
+    assert_eq!(local.head(), Some(&before));
+    let mut wrong_author = Hypercore::new(author(84), Bytes, MemoryStore::new());
+    for bytes in [b"root".to_vec(), b"next".to_vec(), b"last".to_vec()] {
+        wrong_author.append(&bytes).unwrap();
+    }
+    assert!(local
+        .recover_signed_suffix(wrong_author.head().unwrap(), &suffix)
+        .is_err());
+    let mut different_fork = head.clone();
+    different_fork.fork += 1;
+    assert!(local
+        .recover_signed_suffix(&different_fork, &suffix)
+        .is_err());
+    for fail_at in [2, KEY_TREE, KEY_PRESENCE, KEY_META] {
+        local.store.fail_at = Some(fail_at);
+        assert!(local.recover_signed_suffix(&head, &suffix).is_err());
+        assert_eq!(local.len(), 1);
+        assert_eq!(local.head(), Some(&before));
+        assert_eq!(local.block(0).unwrap(), source.block(0).unwrap());
+    }
+    local.store.fail_at = None;
+    local.recover_signed_suffix(&head, &suffix).unwrap();
+    assert_eq!(local.head(), Some(&head));
+    assert!(local.verify_head());
+    for index in 0..3 {
+        assert_eq!(local.block(index).unwrap(), source.block(index).unwrap());
+        assert_eq!(local.proof(index), source.proof(index));
+    }
+    assert!(local.recover_signed_suffix(&before, &[]).is_err());
+    local.append(&b"continue".to_vec()).unwrap();
+    assert_eq!(local.len(), 4);
+}

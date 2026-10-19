@@ -200,6 +200,50 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
         Ok(index)
     }
 
+    /// Recover an authenticated extension authored by this same writer before a
+    /// crash. Existing bytes cannot be supplied or overwritten: reconstruct the
+    /// prefix from our store and verify the complete signed feed before mutation.
+    /// Reorgs require a separate explicit protocol and are rejected here.
+    pub fn recover_signed_suffix(
+        &mut self,
+        head: &SignedHead,
+        suffix: &[Vec<u8>],
+    ) -> Result<(), Error<S::Error>> {
+        let start = self.len();
+        if head.fork != self.fork || start.checked_add(suffix.len() as u64) != Some(head.length) {
+            return Err(Error::Corrupt);
+        }
+        let mut blocks = Vec::new();
+        for index in 0..start {
+            blocks.push(self.block(index)?.ok_or(Error::Corrupt)?);
+        }
+        blocks.extend_from_slice(suffix);
+        if !verify_archived_feed(&self.public, head, &blocks) {
+            return Err(Error::Corrupt);
+        }
+        let mut tree = MerkleTree::new();
+        let mut presence = Bitfield::new();
+        for (index, bytes) in blocks.iter().enumerate() {
+            tree.append(bytes);
+            presence.set(index as u64, true);
+        }
+        for (offset, bytes) in suffix.iter().enumerate() {
+            self.store.put(start + offset as u64, bytes).map_err(Error::Storage)?;
+        }
+        self.store.put(KEY_TREE, &tree.serialize()).map_err(Error::Storage)?;
+        self.store.put(KEY_PRESENCE, &presence.serialize()).map_err(Error::Storage)?;
+        let meta = Self::encode_meta_parts(self.fork, Some(head), self.prologue.as_ref());
+        self.store.put(KEY_META, &meta).map_err(Error::Storage)?;
+        // Logical promotion follows all fallible I/O. Store has no transaction
+        // API: failures can leave orphan suffix bytes/partial persisted metadata,
+        // but the trusted in-memory head and prefix never advance on failure.
+        self.tree = tree;
+        self.presence = presence;
+        self.head = Some(head.clone());
+        self.last_truncation = None;
+        Ok(())
+    }
+
     /// Rewind the log to its first `new_len` blocks, discarding every block at
     /// index `>= new_len`, then re-sign a new head under an **incremented `fork`
     /// counter**. Returns the [`Truncation`] performed, or `None` if
@@ -523,9 +567,13 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
     /// prologue tag — `0` for none or `1` followed by `[length u64][hash 32B]`.
     /// The transient `last_truncation` guard is deliberately not persisted.
     fn encode_meta(&self) -> Vec<u8> {
+        Self::encode_meta_parts(self.fork, self.head.as_ref(), self.prologue.as_ref())
+    }
+
+    fn encode_meta_parts(fork: u64, head: Option<&SignedHead>, prologue: Option<&Prologue>) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + 1 + 112 + 1 + 40);
-        out.extend_from_slice(&self.fork.to_le_bytes());
-        match &self.head {
+        out.extend_from_slice(&fork.to_le_bytes());
+        match head {
             Some(h) => {
                 out.push(1);
                 out.extend_from_slice(&h.fork.to_le_bytes());
@@ -535,7 +583,7 @@ impl<T, C: Codec<T>, S: Store> Hypercore<T, C, S> {
             }
             None => out.push(0),
         }
-        match &self.prologue {
+        match prologue {
             Some(p) => {
                 out.push(1);
                 out.extend_from_slice(&p.length.to_le_bytes());

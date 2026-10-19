@@ -256,3 +256,144 @@ fn hosted_indexer_settles_after_a_peer_batch() {
     assert_eq!(hosted.snapshot_finalized().get(b"selected-beat".as_slice()), Some(&vec![4]),
         "the host must confirm the latest peer entry, not only its root");
 }
+
+#[test]
+fn rejoined_writer_recovers_its_authenticated_missing_suffix_before_appending() {
+    let identity = seed(81);
+    let key = identity.public().to_bytes();
+    let mut original = Room::open(
+        RoomConfig::original(identity.clone(), vec![key]),
+        MemStoreFactory,
+        KvProjection::new(),
+    )
+    .unwrap();
+    let mut rejoined = Room::open(
+        RoomConfig::original(identity, vec![key]),
+        MemStoreFactory,
+        KvProjection::new(),
+    )
+    .unwrap();
+    // Identical root represents the last persisted writer prefix, not a new fork.
+    for room in [&mut original, &mut rejoined] {
+        room.local_append(&put(b"beat", b"quarter")).unwrap();
+    }
+    let stale = rejoined.snapshot_feeds().unwrap()[0].head.clone();
+    original.local_append(&put(b"beat", b"eighth")).unwrap();
+    original
+        .local_append(&put(b"second", b"sixteenth"))
+        .unwrap();
+    let head = original.snapshot_feeds().unwrap()[0].head.clone();
+    let wants = rejoined
+        .on_inbound(
+            [82; 32],
+            SyncMessage::Head {
+                writer: key,
+                head: head.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        wants.len(),
+        1,
+        "same-identity rejoin must pull its missing signed suffix"
+    );
+    assert!(
+        rejoined.local_append(&put(b"fork", b"forbidden")).is_err(),
+        "cannot append while advertised own history is missing"
+    );
+    let mut blocks = original.on_inbound(key, wants[0].msg.clone()).unwrap();
+    blocks.reverse(); // verified suffix delivery need not be in order
+    rejoined
+        .on_inbound(
+            [82; 32],
+            SyncMessage::Head {
+                writer: key,
+                head: stale.clone(),
+            },
+        )
+        .unwrap();
+    let mut tampered = blocks[0].msg.clone();
+    if let SyncMessage::Block { bytes, .. } = &mut tampered {
+        bytes[0] ^= 1;
+    }
+    assert!(rejoined.on_inbound([82; 32], tampered).is_err());
+    assert_eq!(rejoined.writer_lengths()[&key], 1);
+    let duplicate = blocks[0].msg.clone();
+    rejoined.on_inbound([82; 32], duplicate.clone()).unwrap();
+    rejoined.on_inbound([82; 32], duplicate).unwrap();
+    assert!(
+        rejoined.local_append(&[]).is_err(),
+        "partial recovery remains gated"
+    );
+    for block in blocks {
+        rejoined.on_inbound([82; 32], block.msg).unwrap();
+    }
+    assert_eq!(rejoined.snapshot_live(), original.snapshot_live());
+    assert_eq!(
+        rejoined.snapshot_feeds().unwrap()[0].blocks,
+        original.snapshot_feeds().unwrap()[0].blocks,
+        "signed bytes preserved"
+    );
+    assert_eq!(rejoined.snapshot_feeds().unwrap()[0].head, head);
+    rejoined
+        .on_inbound(
+            [82; 32],
+            SyncMessage::Head {
+                writer: key,
+                head: stale,
+            },
+        )
+        .unwrap();
+    rejoined.local_append(&put(b"continued", b"yes")).unwrap();
+    assert_eq!(rejoined.writer_lengths()[&key], 4);
+}
+
+#[test]
+fn own_feed_conflicting_prefix_never_promotes_or_reenables_writes() {
+    let identity = seed(85);
+    let key = identity.public().to_bytes();
+    let mut trusted = Room::open(
+        RoomConfig::original(identity.clone(), vec![key]),
+        MemStoreFactory,
+        KvProjection::new(),
+    )
+    .unwrap();
+    let mut conflict = Room::open(
+        RoomConfig::original(identity, vec![key]),
+        MemStoreFactory,
+        KvProjection::new(),
+    )
+    .unwrap();
+    trusted.local_append(&put(b"beat", b"trusted")).unwrap();
+    conflict.local_append(&put(b"beat", b"fork")).unwrap();
+    let same_length = conflict.snapshot_feeds().unwrap()[0].head.clone();
+    assert!(trusted
+        .on_inbound(
+            key,
+            SyncMessage::Head {
+                writer: key,
+                head: same_length
+            }
+        )
+        .is_err());
+    let before = trusted.snapshot_feeds().unwrap();
+    conflict.local_append(&put(b"beat", b"later")).unwrap();
+    let head = conflict.snapshot_feeds().unwrap()[0].head.clone();
+    let want = trusted
+        .on_inbound(key, SyncMessage::Head { writer: key, head })
+        .unwrap();
+    for block in conflict.on_inbound(key, want[0].msg.clone()).unwrap() {
+        assert!(trusted.on_inbound(key, block.msg).is_err());
+    }
+    assert_eq!(trusted.snapshot_feeds().unwrap()[0].head, before[0].head);
+    assert_eq!(
+        trusted.snapshot_feeds().unwrap()[0].blocks,
+        before[0].blocks
+    );
+    assert_eq!(
+        trusted.snapshot_live().get(b"beat".as_slice()),
+        Some(&b"trusted".to_vec())
+    );
+    assert!(trusted.local_append(&[]).is_err());
+    assert!(!trusted.needs_checkpoint());
+}

@@ -77,6 +77,8 @@ pub enum Error<SE> {
     Codec(codec::Error),
     /// A writer key was not a valid ed25519 public key.
     BadWriterKey,
+    /// An authenticated newer own feed must be recovered before signing again.
+    RecoveringOwnFeed,
     /// The [`Projection`] rejected a mutation (rendered via its `Debug`).
     Projection(String),
     /// A [`StoreFactory`] failed to open a writer's store (rendered via `Debug`).
@@ -101,6 +103,7 @@ pub struct Room<F: StoreFactory, P: Projection> {
 
     /// The one writer this node owns and can *serve* proofs for.
     local: Hypercore<Entry, EntryCodec, F::Store>,
+    own_recovery: Option<(SignedHead, BTreeMap<u64, Vec<u8>>)>,
     /// Verify-only replicas of every other writer we have seen.
     remotes: BTreeMap<WriterKey, Replica<Entry, EntryCodec, F::Store>>,
     factory: F,
@@ -141,7 +144,11 @@ where
         mut factory: F,
         projection: P,
     ) -> Result<Self, Error<StoreErr<F>>> {
-        let RoomConfig { identity, indexers, origin } = cfg;
+        let RoomConfig {
+            identity,
+            indexers,
+            origin,
+        } = cfg;
         let local_key = identity.public().to_bytes();
 
         // Local writer: reopen its persisted, signed history if present, else fresh.
@@ -165,6 +172,7 @@ where
             local_key,
             origin,
             local,
+            own_recovery: None,
             remotes: BTreeMap::new(),
             factory,
             lin,
@@ -212,12 +220,19 @@ where
     /// Read-only synchronization counters, without copying blocks or the DAG.
     pub fn writer_lengths(&self) -> BTreeMap<WriterKey, u64> {
         std::iter::once((self.local_key, self.local.len()))
-            .chain(self.remotes.iter().map(|(key, replica)| (*key, replica.len())))
+            .chain(
+                self.remotes
+                    .iter()
+                    .map(|(key, replica)| (*key, replica.len())),
+            )
             .collect()
     }
 
     pub fn checkpoint_count(&self) -> usize {
-        self.payloads.values().filter(|payload| payload.is_empty()).count()
+        self.payloads
+            .values()
+            .filter(|payload| payload.is_empty())
+            .count()
     }
 
     /// The room's provenance/GC policy.
@@ -257,6 +272,9 @@ where
     /// feeds the linearizer, and returns the outbounds: a gossip [`Head`] advert
     /// and a client fanout of the new block (Lane 1).
     pub fn local_append(&mut self, op: &[u8]) -> Result<Vec<Outbound>, Error<StoreErr<F>>> {
+        if self.own_recovery.is_some() {
+            return Err(Error::RecoveringOwnFeed);
+        }
         let seq = self.local.len();
         let heads: Vec<NodeId> = self.lin.heads().into_iter().collect();
         let entry = Entry::new(heads.clone(), op.to_vec());
@@ -274,13 +292,29 @@ where
         self.touch();
         self.advance()?;
 
-        let head = self.local.head().cloned().expect("head exists after append");
+        let head = self
+            .local
+            .head()
+            .cloned()
+            .expect("head exists after append");
         let bytes = self.local.block(seq)?.expect("block exists after append");
         let proof = self.local.proof(seq).expect("proof exists after append");
         Ok(vec![
-            Outbound { msg: SyncMessage::Head { writer: self.local_key, head: head.clone() }, to: Fanout::Gossip },
             Outbound {
-                msg: SyncMessage::Block { writer: self.local_key, head, index: seq, bytes, proof },
+                msg: SyncMessage::Head {
+                    writer: self.local_key,
+                    head: head.clone(),
+                },
+                to: Fanout::Gossip,
+            },
+            Outbound {
+                msg: SyncMessage::Block {
+                    writer: self.local_key,
+                    head,
+                    index: seq,
+                    bytes,
+                    proof,
+                },
                 to: Fanout::Clients,
             },
         ])
@@ -295,17 +329,35 @@ where
         let mut out = Vec::new();
         match msg {
             SyncMessage::Head { writer, head } => {
-                if writer != self.local_key && head.length > self.writer_len(writer) {
+                if writer == self.local_key {
+                    if head.length > self.local.len() {
+                        self.begin_own_recovery(&head)?;
+                    } else if head.length == self.local.len()
+                        && self.local.head().is_some_and(|local| local != &head)
+                        && hypercore::verify_signed_head(&self.local.public_key(), &head)
+                    {
+                        return Err(Error::Hypercore(hypercore::Error::Corrupt));
+                    }
+                }
+                if head.length > self.writer_len(writer) {
                     out.push(Outbound {
-                        msg: SyncMessage::Want { writer, start: self.writer_len(writer), end: head.length },
+                        msg: SyncMessage::Want {
+                            writer,
+                            start: self.writer_len(writer),
+                            end: head.length,
+                        },
                         to: Fanout::Peer(from),
                     });
                 }
             }
             SyncMessage::Have { writer, length } => {
-                if writer != self.local_key && length > self.writer_len(writer) {
+                if length > self.writer_len(writer) {
                     out.push(Outbound {
-                        msg: SyncMessage::Want { writer, start: self.writer_len(writer), end: length },
+                        msg: SyncMessage::Want {
+                            writer,
+                            start: self.writer_len(writer),
+                            end: length,
+                        },
                         to: Fanout::Peer(from),
                     });
                 }
@@ -316,9 +368,17 @@ where
                     if let Some(head) = self.local.head().cloned() {
                         let hi = end.min(self.local.len());
                         for i in start..hi {
-                            if let (Some(bytes), Some(proof)) = (self.local.block(i)?, self.local.proof(i)) {
+                            if let (Some(bytes), Some(proof)) =
+                                (self.local.block(i)?, self.local.proof(i))
+                            {
                                 out.push(Outbound {
-                                    msg: SyncMessage::Block { writer, head: head.clone(), index: i, bytes, proof },
+                                    msg: SyncMessage::Block {
+                                        writer,
+                                        head: head.clone(),
+                                        index: i,
+                                        bytes,
+                                        proof,
+                                    },
                                     to: Fanout::Peer(from),
                                 });
                             }
@@ -335,7 +395,13 @@ where
                         for i in start..hi {
                             if let (Some(bytes), Some(proof)) = (rep.block(i)?, rep.proof(i)) {
                                 out.push(Outbound {
-                                    msg: SyncMessage::Block { writer, head: head.clone(), index: i, bytes, proof },
+                                    msg: SyncMessage::Block {
+                                        writer,
+                                        head: head.clone(),
+                                        index: i,
+                                        bytes,
+                                        proof,
+                                    },
                                     to: Fanout::Peer(from),
                                 });
                             }
@@ -343,21 +409,98 @@ where
                     }
                 }
             }
-            SyncMessage::Block { writer, head, index, bytes, proof } => {
-                if writer != self.local_key
-                    && self.ingest_remote_block(writer, &head, index, &bytes, &proof)?
-                {
+            SyncMessage::Block {
+                writer,
+                head,
+                index,
+                bytes,
+                proof,
+            } => {
+                if writer == self.local_key {
+                    self.recover_own_block(&head, index, &bytes, &proof)?;
+                } else if self.ingest_remote_block(writer, &head, index, &bytes, &proof)? {
                     self.drain_pending();
                     self.advance()?;
                     // Immediately fan the verified block out to local clients (Lane 1).
                     out.push(Outbound {
-                        msg: SyncMessage::Block { writer, head, index, bytes, proof },
+                        msg: SyncMessage::Block {
+                            writer,
+                            head,
+                            index,
+                            bytes,
+                            proof,
+                        },
                         to: Fanout::Clients,
                     });
                 }
             }
         }
         Ok(out)
+    }
+
+    fn begin_own_recovery(&mut self, head: &SignedHead) -> Result<(), Error<StoreErr<F>>> {
+        if !hypercore::verify_signed_head(&self.local.public_key(), head)
+            || head.fork != self.local.fork()
+        {
+            return Err(Error::Hypercore(hypercore::Error::Corrupt));
+        }
+        if let Some((target, _)) = &self.own_recovery {
+            if head.length < target.length {
+                return Ok(());
+            }
+            if head.length == target.length {
+                return if head == target {
+                    Ok(())
+                } else {
+                    Err(Error::Hypercore(hypercore::Error::Corrupt))
+                };
+            }
+        }
+        self.own_recovery = Some((head.clone(), BTreeMap::new()));
+        Ok(())
+    }
+
+    fn recover_own_block(
+        &mut self,
+        head: &SignedHead,
+        index: u64,
+        bytes: &[u8],
+        proof: &merkle::Proof,
+    ) -> Result<(), Error<StoreErr<F>>> {
+        if head.length <= self.local.len() {
+            return Ok(());
+        }
+        if index >= head.length
+            || !hypercore::verify_block(&self.local.public_key(), head, index, bytes, proof)
+        {
+            return Err(Error::Hypercore(hypercore::Error::Corrupt));
+        }
+        self.begin_own_recovery(head)?;
+        let (target, blocks) = self.own_recovery.as_mut().expect("authenticated recovery");
+        if head != target || index < self.local.len() {
+            return Ok(());
+        }
+        blocks.insert(index, bytes.to_vec());
+        let start = self.local.len();
+        if (start..target.length).any(|index| !blocks.contains_key(&index)) {
+            return Ok(());
+        }
+        let suffix: Vec<_> = (start..target.length)
+            .map(|index| blocks[&index].clone())
+            .collect();
+        self.local.recover_signed_suffix(target, &suffix)?;
+        self.own_recovery = None;
+        for index in start..self.local.len() {
+            let entry = self
+                .local
+                .get(index)?
+                .ok_or(Error::Hypercore(hypercore::Error::Corrupt))?;
+            self.try_add_node(NodeId::new(self.local_key, index), entry);
+        }
+        self.drain_pending();
+        self.touch();
+        self.advance()?;
+        Ok(())
     }
 
     /// A gossip advert of everything this room can serve (sent on connect and on
@@ -375,11 +518,17 @@ where
         let mut out = Vec::new();
         match self.local.head().cloned() {
             Some(head) => out.push(Outbound {
-                msg: SyncMessage::Head { writer: self.local_key, head },
+                msg: SyncMessage::Head {
+                    writer: self.local_key,
+                    head,
+                },
                 to: Fanout::Gossip,
             }),
             None => out.push(Outbound {
-                msg: SyncMessage::Have { writer: self.local_key, length: 0 },
+                msg: SyncMessage::Have {
+                    writer: self.local_key,
+                    length: 0,
+                },
                 to: Fanout::Gossip,
             }),
         }
@@ -389,7 +538,10 @@ where
             if let Some(head) = rep.verified_head() {
                 if head.length > 0 {
                     out.push(Outbound {
-                        msg: SyncMessage::Have { writer: *writer, length: head.length },
+                        msg: SyncMessage::Have {
+                            writer: *writer,
+                            length: head.length,
+                        },
                         to: Fanout::Gossip,
                     });
                 }
@@ -418,7 +570,8 @@ where
     /// forever between two Originals (each side's checkpoint is the other's next
     /// pending peer op).
     pub fn needs_checkpoint(&self) -> bool {
-        matches!(self.origin(), Origin::Original)
+        self.own_recovery.is_none()
+            && matches!(self.origin(), Origin::Original)
             && self
                 .order()
                 .into_iter()
@@ -481,7 +634,11 @@ where
                     blocks.push(b);
                 }
             }
-            out.push(FeedSnapshot { writer: self.local_key, head: head.clone(), blocks });
+            out.push(FeedSnapshot {
+                writer: self.local_key,
+                head: head.clone(),
+                blocks,
+            });
         }
         for (writer, replica) in &self.remotes {
             if let Some(head) = replica.verified_head() {
@@ -491,7 +648,11 @@ where
                         blocks.push(b);
                     }
                 }
-                out.push(FeedSnapshot { writer: *writer, head: head.clone(), blocks });
+                out.push(FeedSnapshot {
+                    writer: *writer,
+                    head: head.clone(),
+                    blocks,
+                });
             }
         }
         Ok(out)
@@ -524,7 +685,8 @@ where
         if !self.remotes.contains_key(&writer) {
             let public = PublicKey::from_bytes(&writer).ok_or(Error::BadWriterKey)?;
             let store = self.factory.open(writer).map_err(store_open)?;
-            self.remotes.insert(writer, Replica::new(public, EntryCodec, store));
+            self.remotes
+                .insert(writer, Replica::new(public, EntryCodec, store));
         }
         let replica = self.remotes.get_mut(&writer).expect("just inserted");
         if !replica.add_block(head, index, bytes, proof)? {
@@ -633,7 +795,10 @@ where
         //    finalized() is a true prefix of order(), so the tail is order[finalized_len..].
         self.live_proj.reset_to(self.finalized_proj.snapshot());
         let order = self.lin.order();
-        debug_assert!(order.len() >= self.finalized_len, "finalized must be a prefix of order");
+        debug_assert!(
+            order.len() >= self.finalized_len,
+            "finalized must be a prefix of order"
+        );
         for node in &order[self.finalized_len..] {
             let payload = self.payloads.get(node).cloned().unwrap_or_default();
             if payload.is_empty() {
