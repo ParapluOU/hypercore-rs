@@ -75,13 +75,15 @@ impl WsTransport {
         });
 
         // Writer: outbound queue → socket. Ends when the transport (out_tx) drops or
-        // the socket errors.
+        // the socket errors; a dropped transport closes the socket, so the server
+        // sees the client go (the read half alone would keep it open).
         spawn(async move {
             while let Some(frame) = out_rx.next().await {
                 if sink.send(frame.into()).await.is_err() {
-                    break;
+                    return;
                 }
             }
+            let _ = sink.close().await;
         });
 
         Ok(Self { local_id, outbound: out_tx, inbound: in_rx })
@@ -174,6 +176,8 @@ mod server {
     /// (via [`seen_rooms`](WsServerTransport::seen_rooms)) to host + relay rooms its
     /// browser clients announce, without an out-of-band "host this room" signal.
     type Seen = Arc<Mutex<HashSet<RoomId>>>;
+    /// The clients connected now, by the rooms they have framed to this server.
+    type Present = Arc<Mutex<HashMap<RoomId, HashSet<PeerId>>>>;
 
     /// A native WebSocket server transport. See the type-level docs above the module.
     pub struct WsServerTransport {
@@ -181,6 +185,7 @@ mod server {
         local_addr: std::net::SocketAddr,
         conns: Conns,
         seen: Seen,
+        present: Present,
         inbound: UnboundedReceiver<Inbound>,
     }
 
@@ -193,10 +198,12 @@ mod server {
             let local_addr = listener.local_addr()?;
             let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
             let seen: Seen = Arc::new(Mutex::new(HashSet::new()));
+            let present: Present = Arc::new(Mutex::new(HashMap::new()));
             let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
 
             let conns_accept = conns.clone();
             let seen_accept = seen.clone();
+            let present_accept = present.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else { break };
@@ -217,15 +224,20 @@ mod server {
                     // connection's outbound channel → record the room → forward the frame.
                     let conns_conn = conns_accept.clone();
                     let seen_conn = seen_accept.clone();
+                    let present_conn = present_accept.clone();
                     let in_tx_conn = in_tx.clone();
                     tokio::spawn(async move {
-                        let mut registered = false;
+                        let mut registered: Option<PeerId> = None;
+                        let mut rooms: HashSet<RoomId> = HashSet::new();
                         while let Some(Ok(msg)) = stream.next().await {
                             if let TMessage::Binary(data) = msg {
                                 if let Some(inb) = parse_frame(&data) {
-                                    if !registered {
+                                    if registered.is_none() {
                                         conns_conn.lock().unwrap().insert(inb.from, out_tx.clone());
-                                        registered = true;
+                                        registered = Some(inb.from);
+                                    }
+                                    if rooms.insert(inb.room) {
+                                        present_conn.lock().unwrap().entry(inb.room).or_default().insert(inb.from);
                                     }
                                     // Record the room BEFORE forwarding, so a homeserver
                                     // polling `seen_rooms()` can host it before the driver
@@ -237,11 +249,27 @@ mod server {
                                 }
                             }
                         }
+                        // Gone: no longer a client to relay to, nor present in its rooms.
+                        if let Some(peer) = registered {
+                            let mut conns = conns_conn.lock().unwrap();
+                            if conns.get(&peer).is_some_and(|tx| tx.same_receiver(&out_tx)) {
+                                conns.remove(&peer);
+                            }
+                            let mut present = present_conn.lock().unwrap();
+                            for room in rooms {
+                                if let Some(peers) = present.get_mut(&room) {
+                                    peers.remove(&peer);
+                                    if peers.is_empty() {
+                                        present.remove(&room);
+                                    }
+                                }
+                            }
+                        }
                     });
                 }
             });
 
-            Ok(Self { local_id, local_addr, conns, seen, inbound: in_rx })
+            Ok(Self { local_id, local_addr, conns, seen, present, inbound: in_rx })
         }
 
         /// The address the server is bound to (resolves a `:0` request to a real port).
@@ -254,6 +282,12 @@ mod server {
         /// only grows; hosting is idempotent, so re-seeing a room is harmless.
         pub fn seen_rooms(&self) -> Vec<RoomId> {
             self.seen.lock().unwrap().iter().copied().collect()
+        }
+
+        /// How many clients are connected now in each room they have framed to
+        /// this server (rooms with none are absent).
+        pub fn clients_by_room(&self) -> HashMap<RoomId, usize> {
+            self.present.lock().unwrap().iter().map(|(room, peers)| (*room, peers.len())).collect()
         }
     }
 
@@ -461,5 +495,44 @@ mod tests {
 
         // A must NOT receive B's peer-addressed frame.
         assert!(a.drain_inbound().is_empty(), "A does not receive a frame addressed to B");
+    }
+
+    /// The server counts the clients connected now per room they framed to it, and
+    /// forgets a client once its connection closes.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn server_counts_the_clients_in_each_room() {
+        let mut server = WsServerTransport::bind("127.0.0.1:0".parse().unwrap(), [9u8; 32]).await.unwrap();
+        let url = format!("ws://{}", server.local_addr());
+        let (room, other): (RoomId, RoomId) = ([7u8; 32], [8u8; 32]);
+        let mut a = WsTransport::connect(&url, [1u8; 32]).await.unwrap();
+        let mut b = WsTransport::connect(&url, [2u8; 32]).await.unwrap();
+        let have = |writer| Outbound { to: Fanout::Gossip, msg: SyncMessage::Have { writer, length: 1 } };
+        a.dispatch(room, have([1u8; 32])).unwrap();
+        b.dispatch(room, have([2u8; 32])).unwrap();
+        b.dispatch(other, have([2u8; 32])).unwrap();
+        let counts = |server: &mut WsServerTransport| {
+            server.drain_inbound();
+            server.clients_by_room()
+        };
+        let mut now = std::collections::HashMap::new();
+        for _ in 0..100 {
+            now = counts(&mut server);
+            if now.get(&room) == Some(&2) && now.get(&other) == Some(&1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!((now.get(&room), now.get(&other)), (Some(&2), Some(&1)));
+
+        drop(b);
+        for _ in 0..100 {
+            now = counts(&mut server);
+            if now.get(&room) == Some(&1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!((now.get(&room), now.get(&other)), (Some(&1), None), "a closed client is gone from its rooms");
     }
 }
