@@ -33,6 +33,12 @@ pub type RoomId = [u8; 32];
 /// [`mint_identity`]: RoomServer::mint_identity
 pub type StoreProvider<F> = Box<dyn Fn(RoomId) -> F + Send + Sync>;
 
+/// Gives a room its own initial projection when it is hosted or joined, `None`
+/// for the server's template: rooms may start from different states (e.g. each
+/// from its own imported document). Called again whenever a room is reopened,
+/// so it must return the same initial state for the same room.
+pub type ProjectionProvider<P> = Box<dyn Fn(RoomId) -> Option<P> + Send + Sync>;
+
 /// A node's collection of rooms.
 pub struct RoomServer<F: StoreFactory, P: Projection> {
     identity_seed: [u8; 32],
@@ -40,6 +46,7 @@ pub struct RoomServer<F: StoreFactory, P: Projection> {
     replica_stale_after: Option<core::time::Duration>,
     rooms: BTreeMap<RoomId, Room<F, P>>,
     projection: P,
+    own_projection: Option<ProjectionProvider<P>>,
     new_store: StoreProvider<F>,
 }
 
@@ -62,8 +69,27 @@ where
             replica_stale_after: cfg.replica_stale_after,
             rooms: BTreeMap::new(),
             projection,
+            own_projection: None,
             new_store: Box::new(new_store),
         }
+    }
+
+    /// Give rooms their own initial projection where `own_projection` has one
+    /// (see [`ProjectionProvider`]); the others clone the template.
+    pub fn with_own_projections(
+        mut self,
+        own_projection: impl Fn(RoomId) -> Option<P> + Send + Sync + 'static,
+    ) -> Self {
+        self.own_projection = Some(Box::new(own_projection));
+        self
+    }
+
+    /// The projection `room` starts from.
+    fn initial_projection(&self, room: RoomId) -> P {
+        self.own_projection
+            .as_ref()
+            .and_then(|own| own(room))
+            .unwrap_or_else(|| self.projection.clone())
     }
 
     /// Host a room locally (creating it if absent). Never auto-deleted. Fallible
@@ -71,7 +97,7 @@ where
     pub fn host(&mut self, room: RoomId) -> Result<&mut Room<F, P>, Error<StoreErr<F>>> {
         if !self.rooms.contains_key(&room) {
             let cfg = RoomConfig::original(self.mint_identity(), self.indexers.clone());
-            let r = Room::open(cfg, (self.new_store)(room), self.projection.clone())?;
+            let r = Room::open(cfg, (self.new_store)(room), self.initial_projection(room))?;
             self.rooms.insert(room, r);
         }
         Ok(self.rooms.get_mut(&room).expect("just inserted"))
@@ -97,7 +123,7 @@ where
         if !self.rooms.contains_key(&room) {
             let cfg =
                 RoomConfig::replicated(self.mint_identity(), indexers, self.replica_stale_after);
-            let r = Room::open(cfg, (self.new_store)(room), self.projection.clone())?;
+            let r = Room::open(cfg, (self.new_store)(room), self.initial_projection(room))?;
             self.rooms.insert(room, r);
         }
         Ok(self.rooms.get_mut(&room).expect("just inserted"))
