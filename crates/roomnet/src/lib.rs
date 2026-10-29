@@ -59,7 +59,7 @@ pub use sync::SyncMessage;
 pub use transport::{Both, CompositeTransport, Inbound, ProjectionSink, Transport};
 
 #[cfg(feature = "iroh")]
-pub use native::{run_server, Command, DriverOpts, IrohConfig, IrohTransport};
+pub use native::{run_server, Answer, Command, DriverOpts, IrohConfig, IrohTransport, Requester, Service};
 
 #[cfg(feature = "ws")]
 pub use ws::WsTransport;

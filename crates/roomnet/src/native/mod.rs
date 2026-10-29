@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use std::future::Future;
+use std::pin::Pin;
 
 use futures_lite::StreamExt as _;
 use iroh::endpoint::{presets::N0, Connection};
@@ -52,6 +53,89 @@ pub struct IrohConfig {
     pub bootstrap: Vec<[u8; 32]>,
     /// Max inbound frame size accepted per stream.
     pub max_message_bytes: usize,
+    /// Request/response protocols served beside roomnet's own (a node's room
+    /// list, say), answered on this endpoint and asked with a [`Requester`].
+    pub services: Vec<Service>,
+}
+
+/// The answering half of a [`Service`]: the asking peer's id and its request,
+/// to the response.
+pub type Answer = Arc<dyn Fn([u8; 32], Vec<u8>) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> + Send + Sync>;
+
+/// A request/response protocol on the transport's endpoint: each connection
+/// carries one request and gets one response, both whole messages.
+#[derive(Clone)]
+pub struct Service {
+    pub alpn: Vec<u8>,
+    pub max_request_bytes: usize,
+    answer: Answer,
+}
+
+impl Service {
+    /// Serve `alpn`, answering each request (at most `max_request_bytes`) with
+    /// `answer`.
+    pub fn new<F, Fut>(alpn: impl Into<Vec<u8>>, max_request_bytes: usize, answer: F) -> Self
+    where
+        F: Fn([u8; 32], Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        let answer: Answer = Arc::new(move |peer, request| Box::pin(answer(peer, request)));
+        Self { alpn: alpn.into(), max_request_bytes, answer }
+    }
+}
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service").field("alpn", &String::from_utf8_lossy(&self.alpn)).finish()
+    }
+}
+
+impl ProtocolHandler for Service {
+    fn accept(&self, conn: Connection) -> impl Future<Output = Result<(), AcceptError>> + Send {
+        let service = self.clone();
+        async move {
+            let from = *conn.remote_id().as_bytes();
+            let (mut send, mut recv) = conn.accept_bi().await.map_err(AcceptError::from_err)?;
+            let request = recv.read_to_end(service.max_request_bytes).await.map_err(AcceptError::from_err)?;
+            let response = (service.answer)(from, request).await;
+            send.write_all(&response).await.map_err(AcceptError::from_err)?;
+            send.finish().map_err(AcceptError::from_err)?;
+            conn.closed().await;
+            Ok(())
+        }
+    }
+}
+
+/// Asks peers' [`Service`]s from a transport's endpoint; cheap to clone and
+/// usable apart from the driver loop that owns the transport.
+#[derive(Clone, Debug)]
+pub struct Requester {
+    endpoint: Endpoint,
+}
+
+impl Requester {
+    /// Ask peer `peer`'s service `alpn` with `request`; its response, at most
+    /// `max_response_bytes`.
+    pub async fn request(&self, peer: [u8; 32], alpn: &[u8], request: &[u8], max_response_bytes: usize) -> IrohResult<Vec<u8>> {
+        let id = PublicKey::from_bytes(&peer)?;
+        // as dispatch: through our home relay when there is one, else by key
+        let dest: EndpointAddr = match self.endpoint.addr().relay_urls().next() {
+            Some(relay) => EndpointAddr::new(id).with_relay_url(relay.clone()),
+            None => id.into(),
+        };
+        self.request_at(dest, alpn, request, max_response_bytes).await
+    }
+
+    /// [`Requester::request`] to a peer at a known address.
+    pub async fn request_at(&self, peer: EndpointAddr, alpn: &[u8], request: &[u8], max_response_bytes: usize) -> IrohResult<Vec<u8>> {
+        let conn = self.endpoint.connect(peer, alpn).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(request).await?;
+        send.finish()?;
+        let response = recv.read_to_end(max_response_bytes).await?;
+        conn.close(0u32.into(), b"done");
+        Ok(response)
+    }
 }
 
 impl Default for IrohConfig {
@@ -62,6 +146,7 @@ impl Default for IrohConfig {
             bind_port: None,
             bootstrap: Vec::new(),
             max_message_bytes: 16 * 1024 * 1024,
+            services: Vec::new(),
         }
     }
 }
@@ -113,7 +198,12 @@ impl IrohTransport {
         let sk = SecretKey::from_bytes(&cfg.seed);
         let mut builder = Endpoint::builder(N0)
             .secret_key(sk)
-            .alpns(vec![cfg.alpn.clone(), GOSSIP_ALPN.to_vec()]);
+            .alpns(
+                [cfg.alpn.clone(), GOSSIP_ALPN.to_vec()]
+                    .into_iter()
+                    .chain(cfg.services.iter().map(|service| service.alpn.clone()))
+                    .collect(),
+            );
         if let Some(port) = cfg.bind_port {
             builder = builder.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))?;
         }
@@ -124,10 +214,13 @@ impl IrohTransport {
             Arc::new(Mutex::new(cfg.bootstrap.iter().copied().collect()));
         let handler = SyncHandler { inbound: tx, peers: peers.clone(), max: cfg.max_message_bytes };
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let router = Router::builder(endpoint.clone())
+        let mut router = Router::builder(endpoint.clone())
             .accept(cfg.alpn.clone(), handler)
-            .accept(GOSSIP_ALPN.to_vec(), gossip.clone())
-            .spawn();
+            .accept(GOSSIP_ALPN.to_vec(), gossip.clone());
+        for service in &cfg.services {
+            router = router.accept(service.alpn.clone(), service.clone());
+        }
+        let router = router.spawn();
 
         Ok(Self {
             endpoint,
@@ -166,6 +259,16 @@ impl IrohTransport {
     }
 
     /// This node's 32-byte endpoint id (== its writer key).
+    /// Asks peers' services from this endpoint (see [`Service`]).
+    pub fn requester(&self) -> Requester {
+        Requester { endpoint: self.endpoint.clone() }
+    }
+
+    /// Where this endpoint can be reached, as far as it knows.
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        self.endpoint.addr()
+    }
+
     pub fn endpoint_id(&self) -> [u8; 32] {
         *self.endpoint.id().as_bytes()
     }
@@ -334,5 +437,32 @@ pub async fn run_server<F, P, Sink>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "binds UDP sockets; run outside a restricted sandbox"]
+    async fn a_service_answers_a_peers_request() {
+        let echo = Service::new(b"test/echo/0".to_vec(), 1024, |peer: [u8; 32], request: Vec<u8>| async move {
+            [&peer[..1], &request[..]].concat()
+        });
+        let a = IrohTransport::bind(&IrohConfig { seed: [1; 32], services: vec![echo], ..Default::default() }).await.unwrap();
+        let b = IrohTransport::bind(&IrohConfig { seed: [2; 32], ..Default::default() }).await.unwrap();
+        let mut at = a.endpoint_addr();
+        for _ in 0..50 {
+            if at.ip_addrs().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            at = a.endpoint_addr();
+        }
+        // a direct address only, so the test needs no relay
+        let direct = EndpointAddr::from_parts(at.id, at.ip_addrs().map(|addr| iroh::TransportAddr::Ip(*addr)));
+        let answer = b.requester().request_at(direct, b"test/echo/0", b"hello", 1024).await.unwrap();
+        assert_eq!(answer, [&b.endpoint_id()[..1], b"hello"].concat(), "answered with the asking peer's id and its request");
     }
 }
