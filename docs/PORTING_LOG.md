@@ -2162,3 +2162,13 @@ over from an anchored head.
 
 **Next:** consumer side — the node assigns committees from its chain, reopens and reconfigures rooms
 per term, and anchors heads.
+
+## roomnet: shared endpoint, key-only dials (ADR-0050)
+
+**Did**
+- `IrohTransport::attach` runs roomnet on a consumer-owned endpoint; `bind` is now `attach` plus
+  its own router.
+- Dispatch and `Requester::request` dial peers by key alone, resolved through address lookup.
+
+**Lesson:** one key, one endpoint. Two endpoints under one key race on the relay and the lookup
+record, and dials by key land on the wrong one.

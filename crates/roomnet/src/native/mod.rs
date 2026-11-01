@@ -24,7 +24,7 @@ use std::pin::Pin;
 
 use futures_lite::StreamExt as _;
 use iroh::endpoint::{presets::N0, Connection};
-use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use iroh_gossip::{api::Event, Gossip, TopicId, ALPN as GOSSIP_ALPN};
 use tokio::sync::mpsc;
@@ -117,13 +117,9 @@ impl Requester {
     /// Ask peer `peer`'s service `alpn` with `request`; its response, at most
     /// `max_response_bytes`.
     pub async fn request(&self, peer: [u8; 32], alpn: &[u8], request: &[u8], max_response_bytes: usize) -> IrohResult<Vec<u8>> {
+        // by key alone: the endpoint's address lookup finds where the peer is
         let id = PublicKey::from_bytes(&peer)?;
-        // as dispatch: through our home relay when there is one, else by key
-        let dest: EndpointAddr = match self.endpoint.addr().relay_urls().next() {
-            Some(relay) => EndpointAddr::new(id).with_relay_url(relay.clone()),
-            None => id.into(),
-        };
-        self.request_at(dest, alpn, request, max_response_bytes).await
+        self.request_at(EndpointAddr::new(id), alpn, request, max_response_bytes).await
     }
 
     /// [`Requester::request`] to a peer at a known address.
@@ -182,7 +178,8 @@ impl Default for DriverOpts {
 /// A bound iroh endpoint that ships `[RoomId | wire]` frames between peers.
 pub struct IrohTransport {
     endpoint: Endpoint,
-    _router: Router,
+    /// The accept loop, when the transport bound its endpoint itself.
+    router: Option<Router>,
     alpn: Vec<u8>,
     inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     peers: Arc<Mutex<BTreeSet<[u8; 32]>>>,
@@ -193,43 +190,45 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    /// Bind the endpoint and start accepting sync connections.
+    /// Bind an endpoint of its own and start accepting sync connections.
     pub async fn bind(cfg: &IrohConfig) -> IrohResult<Self> {
         let sk = SecretKey::from_bytes(&cfg.seed);
-        let mut builder = Endpoint::builder(N0)
-            .secret_key(sk)
-            .alpns(
-                [cfg.alpn.clone(), GOSSIP_ALPN.to_vec()]
-                    .into_iter()
-                    .chain(cfg.services.iter().map(|service| service.alpn.clone()))
-                    .collect(),
-            );
+        let mut builder = Endpoint::builder(N0).secret_key(sk);
         if let Some(port) = cfg.bind_port {
             builder = builder.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))?;
         }
         let endpoint = builder.bind().await?;
+        let mut router = Some(Router::builder(endpoint.clone()));
+        let mut transport = Self::attach(endpoint, cfg, |alpn, handler| {
+            router = router.take().map(|router| router.accept(alpn, handler));
+        });
+        transport.router = router.map(|router| router.spawn());
+        Ok(transport)
+    }
 
+    /// Run on an endpoint someone else accepts connections for (one endpoint per key: a
+    /// node that speaks more protocols than roomnet's). `serve` is handed each protocol
+    /// roomnet answers — its sync ALPN, gossip, and `cfg.services` — to accept on the
+    /// endpoint. `cfg.seed` and `cfg.bind_port` are the endpoint's business, not read.
+    pub fn attach(endpoint: Endpoint, cfg: &IrohConfig, mut serve: impl FnMut(Vec<u8>, Box<dyn DynProtocolHandler>)) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let peers: Arc<Mutex<BTreeSet<[u8; 32]>>> =
             Arc::new(Mutex::new(cfg.bootstrap.iter().copied().collect()));
         let handler = SyncHandler { inbound: tx, peers: peers.clone(), max: cfg.max_message_bytes };
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let mut router = Router::builder(endpoint.clone())
-            .accept(cfg.alpn.clone(), handler)
-            .accept(GOSSIP_ALPN.to_vec(), gossip.clone());
+        serve(cfg.alpn.clone(), Box::new(handler));
+        serve(GOSSIP_ALPN.to_vec(), Box::new(gossip.clone()));
         for service in &cfg.services {
-            router = router.accept(service.alpn.clone(), service.clone());
+            serve(service.alpn.clone(), Box::new(service.clone()));
         }
-        let router = router.spawn();
-
-        Ok(Self {
+        Self {
             endpoint,
-            _router: router,
+            router: None,
             alpn: cfg.alpn.clone(),
             inbound_rx: rx,
             peers,
             gossip,
-        })
+        }
     }
 
     /// Join a room's gossip topic for peer discovery. `bootstrap` are peers to seed
@@ -312,15 +311,9 @@ impl IrohTransport {
         let alpn = self.alpn.clone();
         tokio::spawn(async move {
             let Ok(id) = PublicKey::from_bytes(&target) else { return };
-            // Dial via our home relay (peers share the same n0 relay) so we don't
-            // wait on discovery resolving the peer's key by DNS — which is slow and,
-            // as observed, asymmetric. Fall back to a bare-key dial (discovery) if
-            // the relay isn't up yet.
-            let dest: EndpointAddr = match endpoint.addr().relay_urls().next() {
-                Some(relay) => EndpointAddr::new(id).with_relay_url(relay.clone()),
-                None => id.into(),
-            };
-            let Ok(conn) = endpoint.connect(dest, alpn.as_slice()).await else { return };
+            // By key alone: the endpoint's address lookup finds where the peer is
+            // (its home relay, or its direct addresses), and remembers it after.
+            let Ok(conn) = endpoint.connect(EndpointAddr::new(id), alpn.as_slice()).await else { return };
             if let Ok((mut send, mut recv)) = conn.open_bi().await {
                 let _ = send.write_all(&frame).await;
                 let _ = send.finish();

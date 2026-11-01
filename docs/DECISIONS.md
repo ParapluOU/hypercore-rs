@@ -1093,3 +1093,27 @@ committee's checkpoints, and both replicas converge on the same finalized state.
 **Notes / scope:** resume after a restart replays the DAG under the configured indexers; the consumer
 re-applies the current term's reconfiguration after reopening. Term tags and anchor signatures are the
 consumer's (they bind to its chain), never read here.
+
+## ADR-0050 — roomnet: run on a shared endpoint, dial peers by key alone
+
+**Status:** adopted. A consumer node speaks more protocols than roomnet's over one Iroh endpoint and
+one key. Two endpoints under one key overwrite each other's address-lookup record and evict each
+other from the relay, so a dial by key reaches either one. The node therefore owns the endpoint and
+its accept loop, and roomnet joins it.
+
+**What:**
+- `IrohTransport::attach(endpoint, cfg, serve)` runs the transport on an endpoint someone else
+  accepts for. `serve` is handed each protocol roomnet answers (its sync ALPN, gossip,
+  `cfg.services`) as a boxed `DynProtocolHandler`. `cfg.seed` and `cfg.bind_port` are left to the
+  endpoint's owner.
+- `IrohTransport::bind` is `attach` on an endpoint of its own, with its own router (unchanged
+  behaviour for standalone use and the tests).
+- Frame dispatch and `Requester::request` dial a peer by key alone (`EndpointAddr::new(key)`), so
+  the endpoint's address lookup finds the peer: its home relay, or its published direct addresses
+  when it runs without relays. Before, they dialed through *our* home relay, which fails for a peer
+  on another relay or on none.
+
+**Validation:** the roomnet suite is unchanged and green. The consumer's multi-node cluster forms
+committees with nodes named only by key.
+
+**Notes / scope:** transport only; ordering and verification are untouched.
