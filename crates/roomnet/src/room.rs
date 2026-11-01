@@ -593,6 +593,11 @@ where
         Ok(Reconfigured { kept, dropped })
     }
 
+    /// The decoded op payload of delivered node `node` (empty for a checkpoint).
+    pub fn payload(&self, node: &NodeId) -> Option<&[u8]> {
+        self.payloads.get(node).map(Vec::as_slice)
+    }
+
     /// Drain the finalized mutations produced since the last call (Lane 3). One
     /// entry per finalized mutation — never coalesced.
     pub fn poll_finalized(&mut self) -> Vec<Finalized> {
