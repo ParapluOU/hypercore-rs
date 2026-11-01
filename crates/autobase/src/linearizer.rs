@@ -1365,6 +1365,30 @@ mod tests {
         assert_eq!(lin.reconfigure_at(vec![n(A, 0)], [wk(A)]), Err(ReconfigureError::BaseShrinks));
     }
 
+    // Heads (frontier) mirror upstream `getHeads()`: the links a new local
+    // append must reference. Distinct from tails (the roots).
+    #[test]
+    fn heads_track_the_frontier_not_the_roots() {
+        let mut lin = Linearizer::new();
+        add(&mut lin, n(A, 0), &[]);
+        add(&mut lin, n(C, 0), &[]);
+        // Two concurrent roots: each is both a tail and a head.
+        assert_eq!(lin.heads(), [n(A, 0), n(C, 0)].into_iter().collect());
+        assert_eq!(lin.heads(), lin.tails());
+
+        // b0 links both: it becomes the sole head; the tails are unchanged.
+        add(&mut lin, n(B, 0), &[n(A, 0), n(C, 0)]);
+        assert_eq!(lin.heads(), [n(B, 0)].into_iter().collect());
+        assert_eq!(lin.tails(), [n(A, 0), n(C, 0)].into_iter().collect());
+
+        // Full DESIGN.md dag: only the causally-latest node is a head.
+        let mut lin = Linearizer::new();
+        for (node, heads) in recursive_dag() {
+            add(&mut lin, node, &heads);
+        }
+        assert_eq!(lin.heads(), [n(B, 2)].into_iter().collect());
+    }
+
     #[test]
     fn confirmed_prefix_equals_finalized_on_fork_free() {
         let lin = chain();

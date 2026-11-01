@@ -482,3 +482,93 @@ fn a_new_committee_takes_over_and_both_replicas_converge() {
     assert_eq!(a.snapshot_finalized(), b.snapshot_finalized(), "both replicas converge");
     assert_eq!(a.snapshot_finalized().get(b"k".as_slice()), Some(&vec![7]));
 }
+
+
+// ---- ported from an earlier branch: frontier linking and non-indexer finality ----
+
+/// Deliver every network-bound Outbound between two rooms until quiescent.
+/// `Fanout::Clients` is a local push, not network traffic.
+fn pump2<P: crate::projection::Projection + Clone>(
+    a: &mut Room<MemStoreFactory, P>,
+    a_id: [u8; 32],
+    b: &mut Room<MemStoreFactory, P>,
+    b_id: [u8; 32],
+    outs: Vec<(bool, Vec<crate::room::Outbound>)>,
+) {
+    use crate::room::Fanout;
+    let mut pending = outs;
+    while let Some((from_a, outs)) = pending.pop() {
+        for out in outs {
+            match out.to {
+                Fanout::Clients => continue,
+                Fanout::Gossip | Fanout::Peer(_) => {
+                    let (target, source) = if from_a { (&mut *b, a_id) } else { (&mut *a, b_id) };
+                    let more = target.on_inbound(source, out.msg).unwrap();
+                    pending.push((!from_a, more));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn appends_after_sync_order_after_what_they_saw() {
+    // "I replied after seeing your write" must hold in the linearized order for
+    // BOTH replicas, regardless of which writer key sorts first: local appends
+    // link the DAG frontier (upstream getHeads()), not the roots.
+    let (a, b) = (seed(1), seed(2));
+    let (ak, bk) = (a.public().to_bytes(), b.public().to_bytes());
+    let indexers = vec![ak, bk];
+    let mut ra = Room::open(RoomConfig::original(a, indexers.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, indexers), MemStoreFactory, KvProjection::new()).unwrap();
+
+    // Whoever has the LARGER key writes first — under root-linking, the other
+    // side's later reply would have tiebroken *before* this write.
+    let (first, first_id, second, second_id) =
+        if ak > bk { (&mut ra, ak, &mut rb, bk) } else { (&mut rb, bk, &mut ra, ak) };
+
+    let outs = first.local_append(&put(b"k", b"first")).unwrap();
+    pump2(first, first_id, second, second_id, vec![(true, outs)]);
+
+    // `second` has replicated the write; its overwrite is causally later.
+    let outs = second.local_append(&put(b"k", b"second")).unwrap();
+    pump2(first, first_id, second, second_id, vec![(false, outs)]);
+
+    for room in [&*first, &*second] {
+        assert_eq!(
+            room.snapshot_live().get(b"k".as_slice()).map(Vec::as_slice),
+            Some(b"second".as_slice()),
+            "the causally-later overwrite wins on both replicas"
+        );
+    }
+}
+
+#[test]
+fn non_indexer_writes_finalize_once_an_indexer_references_them() {
+    // A non-indexing writer (e.g. a browser client) appends; the sole indexer
+    // then appends something. The indexer's entry links the frontier, so it
+    // causally sees — and thereby confirms — the client's entry.
+    let (idx, client) = (seed(3), seed(4));
+    let idx_key = idx.public().to_bytes();
+    let indexers = vec![idx_key];
+    let mut ri = Room::open(RoomConfig::original(idx, indexers.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rc = Room::open(RoomConfig::original(client, indexers), MemStoreFactory, KvProjection::new()).unwrap();
+    let client_key = rc.local_key();
+
+    let outs = rc.local_append(&put(b"from-client", b"1")).unwrap();
+    pump2(&mut ri, idx_key, &mut rc, client_key, vec![(false, outs)]);
+
+    // Not yet confirmed: no indexer entry references it.
+    assert!(ri.snapshot_finalized().get(b"from-client".as_slice()).is_none());
+
+    let outs = ri.local_append(&put(b"from-indexer", b"2")).unwrap();
+    pump2(&mut ri, idx_key, &mut rc, client_key, vec![(true, outs)]);
+
+    for room in [&ri, &rc] {
+        assert_eq!(
+            room.snapshot_finalized().get(b"from-client".as_slice()).map(Vec::as_slice),
+            Some(b"1".as_slice()),
+            "the client's entry is finalized on both replicas"
+        );
+    }
+}
