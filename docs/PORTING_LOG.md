@@ -2133,3 +2133,20 @@ Added `Replica::persist`/`open` (L1), a native on-disk `StdFile`/`LogStore<StdFi
 replays the DAG, so a room recovers its full finalized/live state with no peers. Persist is per-op.
 Tests: hypercore replica round-trip, storage disk contract+reopen, roomnet two-/single-writer resume
 from a temp dir (zero network). Gate: 233 workspace tests, 0 warnings; wasm core still clean.
+
+## autobase: reconfigurable indexers + non-indexer ambiguity fix (ADR-0048)
+
+**Did**
+- `Linearizer::reconfigure` / `reconfigure_at` pin a confirmed, causally closed base and install a new
+  indexer set. Confirmation resumes from the base with the new set alone, so the old indexers are fenced.
+- Fixed `strictly_newer`: only indexers' clock entries can make a vote ambiguous, as upstream's
+  indexer-only writer map has it. A plain writer's concurrent node referenced by an indexer had stalled
+  multi-indexer confirmation.
+- Tests: reconfiguration no-op, fencing plus new-quorum confirmation (base first, causally closed),
+  convergence across two delivery orders, refused bases, and the plain-writer regression.
+
+**Lessons:** a guard ported as "does the next node exist" is not "is it an indexer": upstream's
+indexer-only map made the filter implicit. Multi-indexer tests need plain writers in them.
+
+**Next:** roomnet term plumbing — rotating indexer sets per term, term-tagged checkpoints, and taking
+over from an anchored head.

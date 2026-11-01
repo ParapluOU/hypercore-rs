@@ -149,6 +149,29 @@ pub struct Linearizer {
     /// node from a writer outside this set is still ordered but never votes
     /// (a non-indexing writer).
     indexers: Option<BTreeSet<WriterKey>>,
+    /// The **pinned base**: a confirmed prefix carried over a reconfiguration
+    /// ([`reconfigure`](Self::reconfigure)), in its confirmed order. It stays finalized
+    /// whatever the current indexers do; confirmation continues after it with the
+    /// current set alone. Empty until a reconfiguration.
+    base: Vec<NodeId>,
+    /// Per writer, how many of its nodes the base holds (the base is causally closed,
+    /// so this is its exact frontier).
+    base_clock: Clock,
+}
+
+/// Why a [`Linearizer::reconfigure`] was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconfigureError {
+    /// The new base does not start with the current base (a base only grows).
+    BaseShrinks,
+    /// The new base names a node this linearizer has not been given.
+    MissingNode(NodeId),
+    /// A base node depends on a node outside the base (a base is causally closed).
+    NotCausallyClosed { node: NodeId, missing: NodeId },
+    /// The base names a node twice.
+    Duplicate(NodeId),
+    /// The base is longer than what this linearizer has confirmed.
+    BeyondConfirmed { confirmed: usize, wanted: usize },
 }
 
 mod linearizer;

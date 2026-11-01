@@ -1030,3 +1030,37 @@ Room generics are unchanged; the node uses it by default in production. Write-th
 (fsync'd on the cache side). Unix-only (needs a filesystem); on wasm the implementor's factory is used
 directly. If the primary and cache diverge (e.g. the primary was written out-of-band), `get`'s
 prefer-primary policy wins — the cache is a backup, not a merge.
+
+## ADR-0048 — autobase: reconfigurable indexers (a pinned base), and non-indexers never make a vote ambiguous
+
+**Status:** adopted. Upstream changes its indexer set through membership ops in its system core. Our
+consumer rotates indexer committees per term from an external authority (a chain that assigns
+committees and anchors confirmed heads), so reconfiguration here is an explicit, external input, not an
+in-log op.
+
+**What:**
+- `Linearizer::reconfigure(through, indexers)` pins the first `through` nodes of the current confirmed
+  view as a **base** and installs a new indexer set. `reconfigure_at(base, indexers)` takes an explicit
+  base, e.g. one carried from a verified archive. A base must extend the current base, name only
+  delivered nodes, once each, and be causally closed. `ReconfigureError` names each refusal.
+- The confirmed machine (`confirmed_view`, `confirmed_prefix`) starts from the base, not from scratch:
+  `removed` starts at the base's per-writer clock, and the base is emitted first. The base therefore stays
+  finalized and leads `order()`. Confirmation after it counts only the new indexers' references, so the
+  previous indexers are **fenced**. Replicas holding the same nodes and given the same `(through,
+  indexers)` reconfigure alike: `order()`/`finalized()` remain pure functions of the node set and the
+  reconfiguration inputs.
+- **Fix:** `strictly_newer` iterated the parent's whole clock and treated an un-acknowledging node of
+  *any* writer as ambiguity. Upstream looks each clock key up in an indexer-only writer map and passes
+  over the rest. A plain (non-indexer) writer's concurrent node, referenced by an indexer, therefore
+  stalled confirmation with more than one indexer (hidden while every room had a single indexer). It now
+  skips non-indexer keys.
+
+**Validation:** reconfiguring onto the whole confirmed view changes nothing confirmed; after a
+reconfiguration the old indexers' references confirm nothing (fenced) while the new ones' quorum
+confirms, the base first and causally closed; two delivery orders converge; refused bases (beyond
+confirmed, not closed, duplicate, missing, shrinking); and a plain writer's node referenced by an
+indexer no longer stalls a three-indexer chain (which confirmed nothing before the fix).
+
+**Notes / scope:** joint (old ∧ new) switch checkpoints, recovering confirmations past the last anchor,
+and the consumer's checkpoint/term plumbing live above this layer (roomnet). This layer stays
+content-blind: the base and indexers are inputs, never read from payloads.

@@ -164,6 +164,55 @@ impl Linearizer {
         }
     }
 
+    /// **Reconfigure** the indexers (ADR-0048): pin the first `through` nodes of the
+    /// current confirmed view as the base, then confirm what follows with `indexers`
+    /// alone. The base stays finalized; the previous indexers' references after it no
+    /// longer count (they are fenced). Every replica holding the same nodes, given the
+    /// same `through` (a length a ledger anchored) and `indexers`, reconfigures alike.
+    pub fn reconfigure(&mut self, through: usize, indexers: impl IntoIterator<Item = WriterKey>) -> Result<(), ReconfigureError> {
+        let confirmed = self.confirmed_view();
+        if through > confirmed.len() {
+            return Err(ReconfigureError::BeyondConfirmed { confirmed: confirmed.len(), wanted: through });
+        }
+        self.reconfigure_at(confirmed[..through].to_vec(), indexers)
+    }
+
+    /// [`reconfigure`](Self::reconfigure) onto an explicit `base` (a confirmed prefix
+    /// carried from elsewhere, e.g. a verified archive): it must extend the current base,
+    /// name only delivered nodes, once each, and be causally closed.
+    pub fn reconfigure_at(&mut self, base: Vec<NodeId>, indexers: impl IntoIterator<Item = WriterKey>) -> Result<(), ReconfigureError> {
+        if !base.starts_with(&self.base) {
+            return Err(ReconfigureError::BaseShrinks);
+        }
+        let mut members: BTreeSet<NodeId> = BTreeSet::new();
+        for node in &base {
+            if !self.deps.contains_key(node) {
+                return Err(ReconfigureError::MissingNode(*node));
+            }
+            if !members.insert(*node) {
+                return Err(ReconfigureError::Duplicate(*node));
+            }
+        }
+        let mut clock = Clock::default();
+        for node in &base {
+            for dep in &self.deps[node] {
+                if !members.contains(dep) {
+                    return Err(ReconfigureError::NotCausallyClosed { node: *node, missing: *dep });
+                }
+            }
+            clock.raise(node.key, node.seq + 1);
+        }
+        self.base = base;
+        self.base_clock = clock;
+        self.indexers = Some(indexers.into_iter().collect());
+        Ok(())
+    }
+
+    /// The pinned base (see [`reconfigure`](Self::reconfigure)).
+    pub fn base(&self) -> &[NodeId] {
+        &self.base
+    }
+
     /// Majority of the indexer set (`⌊n/2⌋ + 1`), or `None` when quorum is disabled.
     fn majority(&self) -> Option<usize> {
         self.indexers.as_ref().map(|ix| ix.len() / 2 + 1)
@@ -317,7 +366,13 @@ impl Linearizer {
         }
         let pclk = self.clock(parent);
         let oclk = self.clock(object);
+        let indexers = self.indexers.as_ref();
         for (key, latest) in pclk.iter() {
+            // only indexers' knowledge can make a vote ambiguous: upstream looks each key
+            // up in its indexer-only writer map and passes over the rest (ADR-0048)
+            if indexers.is_some_and(|indexers| !indexers.contains(&key)) {
+                continue;
+            }
             let oldest = removed.get(&key);
             if latest <= oldest {
                 continue;
@@ -657,10 +712,11 @@ impl Linearizer {
     /// onto the precise machine.
     pub fn confirmed_prefix(&self) -> Vec<NodeId> {
         if self.majority().is_none() {
-            return Vec::new();
+            return self.base.clone();
         }
-        let mut removed = Clock::default();
-        let mut out = Vec::new();
+        // after a reconfiguration, confirmation continues from the pinned base
+        let mut removed = self.base_clock.clone();
+        let mut out = self.base.clone();
         loop {
             let batch = self.shift_once(&mut removed);
             if batch.is_empty() {
@@ -683,11 +739,13 @@ impl Linearizer {
     /// [`order`](Self::order) is being aligned to (ADR-0043 / the swap).
     pub fn confirmed_view(&self) -> Vec<NodeId> {
         if self.majority().is_none() {
-            return Vec::new();
+            return self.base.clone();
         }
-        let mut removed = Clock::default();
-        let mut emitted: BTreeSet<NodeId> = BTreeSet::new();
-        let mut out: Vec<NodeId> = Vec::new();
+        // after a reconfiguration, the pinned base first; confirmation continues from it
+        // with the current indexers alone
+        let mut removed = self.base_clock.clone();
+        let mut emitted: BTreeSet<NodeId> = self.base.iter().copied().collect();
+        let mut out: Vec<NodeId> = self.base.clone();
         loop {
             let batch = self.shift_once(&mut removed);
             if batch.is_empty() {
@@ -1206,6 +1264,107 @@ mod tests {
         lin
     }
 
+    // ---- reconfiguration (ADR-0048) -----------------------------------------
+
+    // The incoming indexers d=4 (D, declared below), e=5, f=6.
+    const E: u8 = 5;
+    const F: u8 = 6;
+
+    #[test]
+    fn reconfiguring_onto_the_whole_confirmed_view_changes_nothing_confirmed() {
+        let mut lin = chain();
+        let before = lin.finalized();
+        lin.reconfigure(before.len(), [wk(A), wk(B), wk(C)]).unwrap();
+        assert_eq!(lin.base(), &before[..]);
+        assert_eq!(lin.finalized(), before, "the same indexers, the same confirmation");
+        assert_eq!(&lin.order()[..before.len()], &before[..], "the base leads the order");
+    }
+
+    #[test]
+    fn after_a_reconfiguration_only_the_new_indexers_confirm() {
+        let mut lin = chain(); // a, b, c confirm [a0, b0]
+        lin.reconfigure(2, [wk(D), wk(E), wk(F)]).unwrap();
+        // the old indexers keep writing: their votes no longer count (fenced)
+        add(&mut lin, n(B, 1), &[n(A, 1)]);
+        add(&mut lin, n(C, 1), &[n(B, 1)]);
+        add(&mut lin, n(A, 2), &[n(C, 1)]);
+        assert_eq!(lin.finalized(), vec![n(A, 0), n(B, 0)], "the old committee is fenced");
+        // the new ones write, seeing everything; a chain of their references confirms
+        add(&mut lin, n(D, 0), &[n(A, 2)]);
+        add(&mut lin, n(E, 0), &[n(D, 0)]);
+        assert_eq!(lin.finalized().len(), 2, "no quorum of the new committee yet");
+        add(&mut lin, n(F, 0), &[n(E, 0)]);
+        add(&mut lin, n(D, 1), &[n(F, 0)]);
+        let finalized = lin.finalized();
+        assert_eq!(&finalized[..2], &[n(A, 0), n(B, 0)], "the base stays first");
+        assert!(finalized.contains(&n(D, 0)) && finalized.contains(&n(E, 0)), "the new committee confirms: {finalized:?}");
+        assert!(finalized.contains(&n(A, 2)), "and with it what it saw, the old writers' later entries too");
+        let set: BTreeSet<NodeId> = finalized.iter().copied().collect();
+        for node in &finalized {
+            assert!(lin.deps[node].iter().all(|d| set.contains(d)), "causally closed at {node:?}");
+        }
+    }
+
+    #[test]
+    fn replicas_reconfiguring_alike_converge_whatever_the_delivery_order() {
+        let build = |late_first: bool| {
+            let mut lin = chain();
+            lin.reconfigure(2, [wk(D), wk(E), wk(F)]).unwrap();
+            let (b1, c1, d0, e0, f0, d1) = (
+                (n(B, 1), vec![n(A, 1)]),
+                (n(C, 1), vec![n(B, 1)]),
+                (n(D, 0), vec![n(A, 1)]),
+                (n(E, 0), vec![n(D, 0)]),
+                (n(F, 0), vec![n(E, 0), n(C, 1)]),
+                (n(D, 1), vec![n(F, 0)]),
+            );
+            // two causal delivery orders: the new committee's start first, or the old writers' tail
+            let rest = if late_first { vec![d0, e0, b1, c1, f0, d1] } else { vec![b1, c1, d0, e0, f0, d1] };
+            for (node, heads) in rest {
+                add(&mut lin, node, &heads);
+            }
+            // a second round of the new committee's references, past the merge
+            add(&mut lin, n(E, 1), &[n(D, 1)]);
+            add(&mut lin, n(F, 1), &[n(E, 1)]);
+            add(&mut lin, n(D, 2), &[n(F, 1)]);
+            lin
+        };
+        let (one, two) = (build(false), build(true));
+        assert_eq!(one.finalized(), two.finalized());
+        assert_eq!(one.order(), two.order());
+        assert!(one.finalized().len() > 2);
+    }
+
+    #[test]
+    fn a_plain_writers_node_an_indexer_references_does_not_stall_confirmation() {
+        // indexers d, e, f; b is a plain writer, concurrent with the indexers' chain
+        let chain = |with_plain: bool| {
+            let mut lin = indexed(&[D, E, F]);
+            if with_plain {
+                add(&mut lin, n(B, 0), &[]);
+            }
+            add(&mut lin, n(D, 0), &[]);
+            add(&mut lin, n(E, 0), &[n(D, 0)]);
+            add(&mut lin, n(F, 0), &if with_plain { vec![n(E, 0), n(B, 0)] } else { vec![n(E, 0)] });
+            add(&mut lin, n(D, 1), &[n(F, 0)]);
+            lin
+        };
+        let (plain, without) = (chain(true), chain(false));
+        assert_eq!(without.finalized(), vec![n(D, 0), n(E, 0)]);
+        assert_eq!(plain.finalized(), vec![n(D, 0), n(E, 0)], "only indexers' knowledge makes a vote ambiguous (upstream skips the rest)");
+    }
+
+    #[test]
+    fn a_reconfiguration_names_a_confirmed_causally_closed_base_that_only_grows() {
+        let mut lin = chain();
+        assert_eq!(lin.reconfigure(3, [wk(D)]), Err(ReconfigureError::BeyondConfirmed { confirmed: 2, wanted: 3 }));
+        assert_eq!(lin.reconfigure_at(vec![n(B, 0)], [wk(D)]), Err(ReconfigureError::NotCausallyClosed { node: n(B, 0), missing: n(A, 0) }));
+        assert_eq!(lin.reconfigure_at(vec![n(A, 0), n(A, 0)], [wk(D)]), Err(ReconfigureError::Duplicate(n(A, 0))));
+        assert_eq!(lin.reconfigure_at(vec![n(E, 0)], [wk(D)]), Err(ReconfigureError::MissingNode(n(E, 0))));
+        lin.reconfigure(2, [wk(D), wk(E), wk(F)]).unwrap();
+        assert_eq!(lin.reconfigure_at(vec![n(A, 0)], [wk(A)]), Err(ReconfigureError::BaseShrinks));
+    }
+
     #[test]
     fn confirmed_prefix_equals_finalized_on_fork_free() {
         let lin = chain();
@@ -1578,3 +1737,4 @@ mod tests {
     }
 
 }
+
