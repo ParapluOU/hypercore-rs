@@ -397,3 +397,88 @@ fn own_feed_conflicting_prefix_never_promotes_or_reenables_writes() {
     assert!(trusted.local_append(&[]).is_err());
     assert!(!trusted.needs_checkpoint());
 }
+
+// ---- reconfiguration (ADR-0048) ---------------------------------------------
+
+#[test]
+fn after_a_handover_the_old_indexer_finalizes_nothing() {
+    let a = seed(81);
+    let ak = a.public().to_bytes();
+    let bk = seed(82).public().to_bytes();
+    let mut room = Room::open(RoomConfig::original(a, vec![ak]), MemStoreFactory, KvProjection::new()).unwrap();
+    for value in 0..3 {
+        room.local_append(&put(b"k", &[value])).unwrap();
+    }
+    let through = room.finalized_len();
+    assert!(through >= 1);
+    let reconfigured = room.reconfigure(through, vec![bk]).unwrap();
+    assert_eq!((reconfigured.kept, reconfigured.dropped), (through, 0));
+    room.local_append(&put(b"k", &[9])).unwrap();
+    room.checkpoint().unwrap();
+    assert_eq!(room.finalized_len(), through, "a's own entries no longer finalize: it is fenced");
+    assert_eq!(room.snapshot_live().get(b"k".as_slice()), Some(&vec![9]), "but they stand in the live view");
+    assert!(!room.needs_checkpoint(), "a fenced writer is no indexer: it does not checkpoint");
+}
+
+#[test]
+fn a_reconfiguration_below_what_was_finalized_refolds_from_the_base() {
+    let a = seed(83);
+    let ak = a.public().to_bytes();
+    let bk = seed(84).public().to_bytes();
+    let mut room = Room::open(RoomConfig::original(a, vec![ak]), MemStoreFactory, KvProjection::new()).unwrap();
+    for value in 0..6 {
+        room.local_append(&put(&[b'k', value], &[value])).unwrap();
+    }
+    let finalized = room.finalized_len();
+    assert!(finalized >= 4, "a self-indexing writer finalizes its prefix ({finalized})");
+    // the anchor the new committee takes over from is behind what the old one finalized
+    let reconfigured = room.reconfigure(2, vec![bk]).unwrap();
+    assert_eq!(reconfigured, crate::room::Reconfigured { kept: 2, dropped: finalized - 2 });
+    assert_eq!(room.finalized_len(), 2);
+    assert_eq!(room.snapshot_finalized().len(), 2, "the finalized state is the base's, refolded");
+    assert_eq!(room.snapshot_live().len(), 6, "every entry still stands in the live view");
+    assert!(matches!(room.reconfigure(1, vec![bk]), Err(crate::room::Error::Reconfigure(autobase::ReconfigureError::BaseShrinks))));
+}
+
+#[test]
+fn a_new_committee_takes_over_and_both_replicas_converge() {
+    let host = seed(85);
+    let next = seed(86);
+    let (hk, nk) = (host.public().to_bytes(), next.public().to_bytes());
+    let mut a = Room::open(RoomConfig::original(host, vec![hk]), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut b = Room::open(RoomConfig::original(next, vec![hk]), MemStoreFactory, KvProjection::new()).unwrap();
+    let pump = |a: &mut Room<MemStoreFactory, KvProjection>, b: &mut Room<MemStoreFactory, KvProjection>| {
+        let mut to_a: Vec<_> = b.announce().into_iter().map(|o| o.msg).collect();
+        let mut to_b: Vec<_> = a.announce().into_iter().map(|o| o.msg).collect();
+        for _ in 0..10 {
+            for msg in std::mem::take(&mut to_a) {
+                to_b.extend(a.on_inbound(nk, msg).unwrap().into_iter().map(|o| o.msg));
+            }
+            for msg in std::mem::take(&mut to_b) {
+                to_a.extend(b.on_inbound(hk, msg).unwrap().into_iter().map(|o| o.msg));
+            }
+            for out in a.checkpoint().unwrap() {
+                to_b.push(out.msg);
+            }
+            for out in b.checkpoint().unwrap() {
+                to_a.push(out.msg);
+            }
+        }
+    };
+    // term 1: the host indexes; b writes
+    for value in 0..3 {
+        b.local_append(&put(b"k", &[value])).unwrap();
+    }
+    pump(&mut a, &mut b);
+    let through = a.finalized_len();
+    assert!(through >= 3, "the host confirmed b's entries ({through})");
+    assert_eq!(b.finalized_len(), through, "b sees the host's confirmations");
+    // term 2: b's committee; both reconfigure onto the anchored head
+    a.reconfigure(through, vec![nk]).unwrap();
+    b.reconfigure(through, vec![nk]).unwrap();
+    a.local_append(&put(b"k", &[7])).unwrap();
+    pump(&mut a, &mut b);
+    assert!(a.finalized_len() > through, "the new committee confirmed the host's later entry");
+    assert_eq!(a.snapshot_finalized(), b.snapshot_finalized(), "both replicas converge");
+    assert_eq!(a.snapshot_finalized().get(b"k".as_slice()), Some(&vec![7]));
+}

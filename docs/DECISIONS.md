@@ -1064,3 +1064,32 @@ indexer no longer stalls a three-indexer chain (which confirmed nothing before t
 **Notes / scope:** joint (old ∧ new) switch checkpoints, recovering confirmations past the last anchor,
 and the consumer's checkpoint/term plumbing live above this layer (roomnet). This layer stays
 content-blind: the base and indexers are inputs, never read from payloads.
+
+## ADR-0049 — roomnet: rooms take a new indexer set at a term boundary
+
+**Status:** adopted. Builds on ADR-0048. A consumer rotating indexer committees tells each room when
+a new term starts: the length of the confirmed order the new committee takes over from (a head an
+external authority anchored) and the new indexer set.
+
+**What:**
+- `Room::reconfigure(through, indexers)` reconfigures the room's linearizer (the base is the first
+  `through` confirmed entries; the previous indexers are fenced) and reports `Reconfigured { kept,
+  dropped }`. If the previous indexers had finalized past `through`, those entries are finalized no
+  more: the finalized fold is **refolded** from the projection the room opened with (kept as
+  `genesis_proj`), and the entries stay in the live view until the new indexers confirm them again.
+  Finalized deltas after such a rollback restart at version `kept + 1`.
+- `needs_checkpoint` follows the indexer set, not the origin: a room checkpoints peers' pending ops
+  when its own writer **is an indexer** (the host of a hosted room, every member of a committee). With
+  no indexers set, an original room checkpoints as before. A non-indexer writer (a client whose
+  host indexes, a fenced former indexer) no longer checkpoints.
+- `Error::Reconfigure` carries the linearizer's refusal.
+
+**Validation:** after a handover, the old indexer's own new entries no longer finalize and it stops
+checkpointing; a reconfiguration behind what was finalized refolds the finalized state to the base
+while the live view keeps every entry, and a shrinking base is refused; a two-room handover (the host
+indexes, then the other writer's committee) confirms the host's later entry through the new
+committee's checkpoints, and both replicas converge on the same finalized state.
+
+**Notes / scope:** resume after a restart replays the DAG under the configured indexers; the consumer
+re-applies the current term's reconfiguration after reopening. Term tags and anchor signatures are the
+consumer's (they bind to its chain), never read here.

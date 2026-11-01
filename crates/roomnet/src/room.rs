@@ -83,6 +83,18 @@ pub enum Error<SE> {
     Projection(String),
     /// A [`StoreFactory`] failed to open a writer's store (rendered via `Debug`).
     StoreOpen(String),
+    /// A reconfiguration of the indexers was refused (see [`Room::reconfigure`]).
+    Reconfigure(autobase::ReconfigureError),
+}
+
+/// What a [`Room::reconfigure`] did to the finalized state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconfigured {
+    /// finalized entries kept (the pinned base, and what still extends it)
+    pub kept: usize,
+    /// entries the previous indexers had finalized past the base, finalized no more: they
+    /// stay in the live view and the new indexers confirm them again
+    pub dropped: usize,
 }
 
 impl<SE> From<hypercore::Error<SE>> for Error<SE> {
@@ -123,6 +135,9 @@ pub struct Room<F: StoreFactory, P: Projection> {
     finalized_len: usize,
     /// Finalized mutations not yet drained by [`poll_finalized`].
     finalized_since_poll: Vec<Finalized>,
+    /// The projection as the room opened (nothing folded): what a reconfiguration that
+    /// drops finalized entries refolds the finalized state from.
+    genesis_proj: P,
 
     /// Monotone logical activity counter (bumped on every append/ingest). The
     /// driver reads it to time stale-eviction of replicated rooms.
@@ -179,6 +194,7 @@ where
             payloads: BTreeMap::new(),
             pending: Vec::new(),
             live_proj: projection.clone(),
+            genesis_proj: projection.clone(),
             finalized_proj: projection,
             finalized_len: 0,
             finalized_since_poll: Vec::new(),
@@ -550,6 +566,33 @@ where
         out
     }
 
+    /// **Reconfigure** the room's indexers (a new committee's term): pin the first
+    /// `through` entries of the confirmed order as the base (a length a ledger
+    /// anchored) and confirm what follows with `indexers` alone; the previous
+    /// indexers are fenced (ADR-0048). If they had finalized past `through`, those
+    /// entries are finalized no more: the finalized state is refolded from the base
+    /// and they stay in the live view until the new indexers confirm them again.
+    pub fn reconfigure(&mut self, through: usize, indexers: Vec<WriterKey>) -> Result<Reconfigured, Error<StoreErr<F>>> {
+        let before = self.lin.finalized();
+        self.lin.reconfigure(through, indexers).map_err(Error::Reconfigure)?;
+        let after = self.lin.finalized();
+        let kept = before.iter().zip(&after).take_while(|(a, b)| a == b).count();
+        let dropped = self.finalized_len.saturating_sub(kept);
+        if dropped > 0 {
+            // refold the finalized state up to what still stands
+            self.finalized_proj = self.genesis_proj.clone();
+            for node in &after[..kept] {
+                let payload = self.payloads.get(node).cloned().unwrap_or_default();
+                if !payload.is_empty() {
+                    self.finalized_proj.apply(*node, &payload).map_err(|e| Error::Projection(format!("{:?}", e)))?;
+                }
+            }
+            self.finalized_len = kept;
+        }
+        self.advance()?;
+        Ok(Reconfigured { kept, dropped })
+    }
+
     /// Drain the finalized mutations produced since the last call (Lane 3). One
     /// entry per finalized mutation — never coalesced.
     pub fn poll_finalized(&mut self) -> Vec<Finalized> {
@@ -570,8 +613,14 @@ where
     /// forever between two Originals (each side's checkpoint is the other's next
     /// pending peer op).
     pub fn needs_checkpoint(&self) -> bool {
+        // an indexer references peers' pending ops so they confirm: the host of a
+        // hosted room, every member of a committee
+        let indexing = match self.lin.indexers() {
+            Some(indexers) => indexers.contains(&self.local_key),
+            None => matches!(self.origin(), Origin::Original),
+        };
         self.own_recovery.is_none()
-            && matches!(self.origin(), Origin::Original)
+            && indexing
             && self
                 .order()
                 .into_iter()

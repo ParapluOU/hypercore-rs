@@ -2150,3 +2150,15 @@ indexer-only map made the filter implicit. Multi-indexer tests need plain writer
 
 **Next:** roomnet term plumbing — rotating indexer sets per term, term-tagged checkpoints, and taking
 over from an anchored head.
+
+## roomnet: per-term reconfiguration (ADR-0049)
+
+**Did**
+- `Room::reconfigure` takes a new indexer set over an anchored confirmed length. It refolds the
+  finalized state when it rolls back, and reports what it kept and dropped.
+- `needs_checkpoint` now follows indexer membership, so committee members checkpoint and fenced
+  writers stop.
+- Tests: fencing, rollback refold, and a two-room committee handover that converges.
+
+**Next:** consumer side — the node assigns committees from its chain, reopens and reconfigures rooms
+per term, and anchors heads.
