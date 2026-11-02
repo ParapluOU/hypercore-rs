@@ -1117,3 +1117,21 @@ its accept loop, and roomnet joins it.
 committees with nodes named only by key.
 
 **Notes / scope:** transport only; ordering and verification are untouched.
+
+## ADR-0051 — roomnet: a refused op takes no effect, and the room folds on
+
+**Status:** adopted. Found live: a room whose confirmed log held one malformed entry could no
+longer be opened on any node, because its replay hit the projection's error.
+
+**What:** when the [`Projection`] returns `Err` for a confirmed op, the room skips it — the op
+stays in the confirmed order (which nobody can change), takes no effect, and the fold continues.
+This holds for finalizing, for refolding after a reconfiguration, and for the replay on open. The
+`Projection::apply` contract now says an `Err` must leave the state unchanged. `Error::Projection`
+is gone (no path returns it any more). The live view already ignored apply errors.
+
+**Why:** the alternative — stop at the first refused op — lets any writer halt finality for every
+replica with one bad entry, and makes the room unopenable after a restart. Every replica skips the
+same ops in the same order, so they still converge.
+
+**Validation:** a room with a malformed op between two valid ones finalizes all three, reflects
+only the valid ones, and reopens from disk to the same state.

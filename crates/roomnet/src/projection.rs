@@ -19,6 +19,9 @@ pub trait Projection {
     /// Apply one ordered mutation. `payload` is the opaque domain op (the
     /// [`Entry::payload`](crate::entry::Entry) bytes); `node` is its stable causal
     /// id. Must be a pure function of the prior state and `(node, payload)`.
+    ///
+    /// An `Err` refuses the op: the state must be left as it was. The room skips a
+    /// refused op and folds on — it stays in the log, which no one can change.
     fn apply(&mut self, node: NodeId, payload: &[u8]) -> Result<(), Self::Error>;
 
     /// The current materialized snapshot.

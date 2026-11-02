@@ -195,3 +195,29 @@ fn room_recovers_from_the_disk_cache_when_the_implementor_store_is_lost() {
 
     let _ = std::fs::remove_dir_all(&cache_dir);
 }
+
+/// An op the projection refuses (here: malformed bytes) takes no effect, and neither
+/// stops the room finalizing past it nor stops it reopening: it stays in the confirmed
+/// log, which nobody can change, and every replay skips it alike.
+#[test]
+fn a_refused_op_is_skipped_and_the_room_still_reopens() {
+    let a = SecretKey::from_seed(&[4; 32]);
+    let ak = a.public().to_bytes();
+    let dir = tmpdir("refused");
+
+    let (finalized, finalized_len) = {
+        let mut r = Room::open(RoomConfig::original(a, vec![ak]), DiskStoreFactory::new(&dir).unwrap(), KvProjection::new()).unwrap();
+        r.local_append(&put(b"k", b"1")).unwrap();
+        r.local_append(b"\xffnot an op").unwrap();
+        r.local_append(&put(b"k", b"2")).unwrap();
+        assert_eq!(r.finalized_len(), 3, "finalized past the refused op");
+        assert_eq!(r.snapshot_finalized().get(b"k".as_slice()), Some(&b"2".to_vec()));
+        (r.snapshot_finalized().clone(), r.finalized_len())
+    };
+
+    let r2 = Room::open(RoomConfig::original(SecretKey::from_seed(&[4; 32]), vec![ak]), DiskStoreFactory::new(&dir).unwrap(), KvProjection::new())
+        .expect("a refused op does not stop the room reopening");
+    assert_eq!((r2.snapshot_finalized(), r2.finalized_len()), (&finalized, finalized_len));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

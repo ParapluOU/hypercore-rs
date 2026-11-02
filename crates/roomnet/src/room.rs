@@ -79,8 +79,6 @@ pub enum Error<SE> {
     BadWriterKey,
     /// An authenticated newer own feed must be recovered before signing again.
     RecoveringOwnFeed,
-    /// The [`Projection`] rejected a mutation (rendered via its `Debug`).
-    Projection(String),
     /// A [`StoreFactory`] failed to open a writer's store (rendered via `Debug`).
     StoreOpen(String),
     /// A reconfiguration of the indexers was refused (see [`Room::reconfigure`]).
@@ -584,7 +582,8 @@ where
             for node in &after[..kept] {
                 let payload = self.payloads.get(node).cloned().unwrap_or_default();
                 if !payload.is_empty() {
-                    self.finalized_proj.apply(*node, &payload).map_err(|e| Error::Projection(format!("{:?}", e)))?;
+                    // a refused op takes no effect (see `advance`)
+                    let _ = self.finalized_proj.apply(*node, &payload);
                 }
             }
             self.finalized_len = kept;
@@ -832,9 +831,11 @@ where
                 let node = fin[i];
                 let payload = self.payloads.get(&node).cloned().unwrap_or_default();
                 if !payload.is_empty() {
-                    self.finalized_proj
-                        .apply(node, &payload)
-                        .map_err(|e| Error::Projection(format!("{:?}", e)))?;
+                    // An op the domain refuses (malformed, or breaking an invariant) takes
+                    // no effect: it stays in the confirmed order, which cannot change, and
+                    // every replica skips it alike. Failing here instead would let one bad
+                    // entry from any writer stop the room from finalizing — or reopening.
+                    let _ = self.finalized_proj.apply(node, &payload);
                 }
                 self.finalized_since_poll.push(Finalized {
                     node,

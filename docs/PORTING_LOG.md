@@ -2183,3 +2183,10 @@ record, and dials by key land on the wrong one.
   and catches up.
 
 **Lesson:** see LESSONS.md (a replica may hold more blocks than its verified head covers).
+
+## roomnet: refused ops are skipped (ADR-0051)
+
+**Did**
+- The finalized fold, the reconfiguration refold and the open replay skip an op the projection
+  refuses, instead of failing; `Error::Projection` removed.
+- Test: a refused op between valid ones finalizes, takes no effect, and the room reopens.
