@@ -29,6 +29,40 @@ impl Store for SharedStore {
     }
 }
 
+/// A replica's blocks can run ahead of the last head it fully matched: each block is
+/// verified against the head it arrived with, and a writer that keeps appending moves
+/// that head on before the replica catches up. Persisted that way, it must reopen —
+/// at its verified head, the unmatched tail to be fetched again — not as corrupt.
+#[test]
+fn a_replica_ahead_of_its_verified_head_reopens_at_that_head() {
+    let mut src = Hypercore::<Vec<u8>, _, _>::new(author(42), Bytes, MemoryStore::new());
+    src.append(&b"a".to_vec()).unwrap();
+    let pk = src.public_key();
+    let head1 = src.head().unwrap().clone();
+    let store = SharedStore::default();
+    let mut rep = Replica::<Vec<u8>, _, _>::new(pk, Bytes, store.clone());
+    assert!(rep.add_block(&head1, 0, &src.block(0).unwrap().unwrap(), &src.proof(0).unwrap()).unwrap());
+    assert_eq!(rep.verified_head(), Some(&head1));
+
+    // the writer moves on to three blocks; the replica gets one more, against that head
+    src.append(&b"bb".to_vec()).unwrap();
+    src.append(&b"ccc".to_vec()).unwrap();
+    let head3 = src.head().unwrap().clone();
+    assert!(rep.add_block(&head3, 1, &src.block(1).unwrap().unwrap(), &src.proof(1).unwrap()).unwrap());
+    assert_eq!((rep.len(), rep.verified_head()), (2, Some(&head1)), "ahead of its verified head");
+    rep.persist().unwrap();
+    drop(rep);
+
+    let mut reopened = Replica::<Vec<u8>, _, _>::open(pk, Bytes, store.clone()).expect("reopens, not corrupt");
+    assert_eq!((reopened.len(), reopened.verified_head()), (1, Some(&head1)), "at its verified head");
+    assert_eq!(reopened.get(0).unwrap(), Some(b"a".to_vec()));
+    // and it catches up from there
+    for i in 1..3u64 {
+        assert!(reopened.add_block(&head3, i, &src.block(i).unwrap().unwrap(), &src.proof(i).unwrap()).unwrap());
+    }
+    assert_eq!(reopened.verified_head(), Some(&head3));
+}
+
 #[test]
 fn replica_persist_open_round_trips() {
     // A source core produces signed blocks + inclusion proofs.

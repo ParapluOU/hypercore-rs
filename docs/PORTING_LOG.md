@@ -2172,3 +2172,14 @@ per term, and anchors heads.
 
 **Lesson:** one key, one endpoint. Two endpoints under one key race on the relay and the lookup
 record, and dials by key land on the wrong one.
+
+## hypercore: a replica ahead of its verified head reopens
+
+**Did**
+- `Replica::open` truncates a persisted tree that runs past its verified head back to that head
+  (the tail is fetched again) instead of failing with `Corrupt`. Found live: a busy writer left a
+  replica 468 blocks past its last fully matched head, and the room could no longer be opened.
+- Test: a replica that took a block against a newer head persists, reopens at its verified head,
+  and catches up.
+
+**Lesson:** see LESSONS.md (a replica may hold more blocks than its verified head covers).

@@ -480,3 +480,10 @@ personal data** (this repo is public; use repo-relative paths).
   cached crate with `cargo install wasm-bindgen-cli --version <X> --root <tmp>` if absent. To read the
   verdict from the page, use the raw page text (`document.body.innerText`), not the accessibility tree —
   the a11y label truncates the result line mid-word.
+- **A replica may hold more blocks than its verified head covers.** `add_block` verifies each
+  block against the head it arrived with, and only adopts that head once the tree reaches it. A
+  writer that keeps appending moves the head on before the replica catches up, so the tree can sit
+  far ahead of the last head it fully matched (seen live: 469 blocks against a head of length 1,
+  with a writer checkpointing every second). Anything that checks "tree length == head length" on
+  persisted state must allow for this; `Replica::open` now truncates to the verified head instead
+  of reporting the store corrupt (which made the whole room unopenable).

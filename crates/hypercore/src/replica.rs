@@ -277,8 +277,16 @@ impl<T, C: Codec<T>, S: Store> Replica<T, C, S> {
         let (Some(tree_bytes), Some(meta_bytes)) = (tree_bytes, meta_bytes) else {
             return Err(Error::NotPersisted);
         };
-        let tree = MerkleTree::deserialize(&tree_bytes).ok_or(Error::Corrupt)?;
+        let mut tree = MerkleTree::deserialize(&tree_bytes).ok_or(Error::Corrupt)?;
         let head = decode_replica_meta(&meta_bytes).ok_or(Error::Corrupt)?;
+        // Blocks may run ahead of the last head the replica fully matched (each was
+        // verified against the newer head it arrived with). Only the verified head can
+        // vouch for the tree after a restart: reopen there, and fetch the rest again.
+        if let Some(h) = &head {
+            if tree.len() > h.length {
+                tree.truncate(h.length);
+            }
+        }
         let replica = Self { public, codec, store, tree, head, _t: PhantomData };
         // A persisted head must be signed by this writer *and* consistent with the
         // persisted tree — catches a wrong key or tampered metadata.
