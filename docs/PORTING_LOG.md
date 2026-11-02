@@ -2190,3 +2190,14 @@ record, and dials by key land on the wrong one.
 - The finalized fold, the reconfiguration refold and the open replay skip an op the projection
   refuses, instead of failing; `Error::Projection` removed.
 - Test: a refused op between valid ones finalizes, takes no effect, and the room reopens.
+
+## roomnet: appends wait while own entries are undelivered
+
+**Did**
+- `local_append` (and so `checkpoint`) returns `Error::OwnFeedPending` while the writer's
+  previous own entry is not in the DAG. A room can reopen with own entries waiting on remote
+  entries it no longer holds (a lost replica, or one reopened shorter); a new entry would then
+  follow an undelivered one, which tripped "local append violated causal delivery" (seen live).
+  The driver retries its checkpoint once the remote entries are fetched again.
+- Test: a room that lost a peer's log refuses to append, then appends once the peer's entries are
+  back.

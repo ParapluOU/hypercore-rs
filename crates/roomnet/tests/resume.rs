@@ -221,3 +221,39 @@ fn a_refused_op_is_skipped_and_the_room_still_reopens() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A room that reopens without some remote entries its own entries build on (their
+/// replica was lost, or reopened shorter) holds those own entries back until the
+/// remote ones arrive again. Until then it refuses to append — a new entry would follow
+/// its own undelivered one — and once they are back it appends again.
+#[test]
+fn own_entries_waiting_on_lost_remote_ones_hold_appends_back_until_they_return() {
+    let a = SecretKey::from_seed(&[5; 32]);
+    let b = SecretKey::from_seed(&[6; 32]);
+    let (ak, bk) = (a.public().to_bytes(), b.public().to_bytes());
+    let idx = vec![ak, bk];
+    let (dir_a, dir_b) = (tmpdir("held-a"), tmpdir("held-b"));
+
+    {
+        let mut ra = Room::open(RoomConfig::original(a, idx.clone()), DiskStoreFactory::new(&dir_a).unwrap(), KvProjection::new()).unwrap();
+        let mut rb = Room::open(RoomConfig::original(b, idx.clone()), DiskStoreFactory::new(&dir_b).unwrap(), KvProjection::new()).unwrap();
+        rb.local_append(&put(b"b", b"1")).unwrap();
+        converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
+        ra.local_append(&put(b"a", b"1")).unwrap(); // builds on B's entry
+    }
+    // A loses its copy of B's log
+    let b_file: String = bk.iter().map(|x| format!("{x:02x}")).collect();
+    std::fs::remove_file(dir_a.join(b_file)).unwrap();
+
+    let mut ra = Room::open(RoomConfig::original(SecretKey::from_seed(&[5; 32]), idx.clone()), DiskStoreFactory::new(&dir_a).unwrap(), KvProjection::new()).unwrap();
+    assert!(matches!(ra.local_append(&put(b"a", b"2")), Err(roomnet::Error::OwnFeedPending)), "an append would follow an undelivered own entry");
+
+    let mut rb = Room::open(RoomConfig::original(SecretKey::from_seed(&[6; 32]), idx.clone()), DiskStoreFactory::new(&dir_b).unwrap(), KvProjection::new()).unwrap();
+    converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
+    ra.local_append(&put(b"a", b"2")).expect("appends again once B's entries are back");
+    converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
+    assert_eq!(ra.snapshot_live().get(b"a".as_slice()), Some(&b"2".to_vec()));
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

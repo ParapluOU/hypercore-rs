@@ -79,6 +79,9 @@ pub enum Error<SE> {
     BadWriterKey,
     /// An authenticated newer own feed must be recovered before signing again.
     RecoveringOwnFeed,
+    /// Some of this writer's own entries wait on remote entries not delivered yet (a
+    /// replica was lost or reopened shorter); a new entry would follow them out of order.
+    OwnFeedPending,
     /// A [`StoreFactory`] failed to open a writer's store (rendered via `Debug`).
     StoreOpen(String),
     /// A reconfiguration of the indexers was refused (see [`Room::reconfigure`]).
@@ -290,6 +293,9 @@ where
             return Err(Error::RecoveringOwnFeed);
         }
         let seq = self.local.len();
+        if seq > 0 && !self.lin.contains(&NodeId::new(self.local_key, seq - 1)) {
+            return Err(Error::OwnFeedPending);
+        }
         let heads: Vec<NodeId> = self.lin.heads().into_iter().collect();
         let entry = Entry::new(heads.clone(), op.to_vec());
         self.local.append(&entry)?;
