@@ -1135,3 +1135,16 @@ same ops in the same order, so they still converge.
 
 **Validation:** a room with a malformed op between two valid ones finalizes all three, reflects
 only the valid ones, and reopens from disk to the same state.
+
+## ADR-0052 — roomnet: an indexer checkpoints only to reference something new
+
+**Status:** adopted. Found live: three committee nodes each burned 2–3 cores, their DAGs growing
+by about twenty checkpoints a second, and requests to them timed out.
+
+**What:** `needs_checkpoint` is false while the linearizer's only head is this writer's latest
+entry: a checkpoint references every head, so a second one would reference nothing the first did
+not. A peer's op that cannot confirm yet (an indexer is absent, a term is changing) used to earn a
+checkpoint on every driver poll; now it earns one, plus one per new entry that arrives.
+
+**Validation:** with confirmation stalled by an absent indexer, twenty checkpoint calls append one
+checkpoint (the test fails with twenty without the change); a new entry from the peer earns more.

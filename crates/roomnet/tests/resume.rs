@@ -257,3 +257,35 @@ fn own_entries_waiting_on_lost_remote_ones_hold_appends_back_until_they_return()
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// With confirmation stalled (an indexer that never answers), an indexer checkpoints a
+/// peer's pending op once, not on every poll: a second checkpoint would reference nothing
+/// the first did not.
+#[test]
+fn a_stalled_room_is_checkpointed_once_per_new_entry() {
+    let a = SecretKey::from_seed(&[7; 32]);
+    let b = SecretKey::from_seed(&[8; 32]);
+    let absent = SecretKey::from_seed(&[9; 32]).public().to_bytes();
+    let (ak, bk) = (a.public().to_bytes(), b.public().to_bytes());
+    let idx = vec![ak, absent, bk];
+    let mut ra = Room::open(RoomConfig::original(a, idx.clone()), MemStoreFactory, KvProjection::new()).unwrap();
+    let mut rb = Room::open(RoomConfig::original(b, vec![ak, absent]), MemStoreFactory, KvProjection::new()).unwrap();
+    let _ = &idx;
+    rb.local_append(&put(b"b", b"1")).unwrap();
+    converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
+    assert!(ra.needs_checkpoint(), "a peer's op waits");
+    let before = ra.writer_lengths()[&ak];
+    for _ in 0..20 {
+        ra.checkpoint().unwrap();
+    }
+    assert_eq!(ra.writer_lengths()[&ak], before + 1, "one checkpoint, however often asked");
+    assert!(!ra.needs_checkpoint());
+
+    // a new entry from the peer earns one more
+    rb.local_append(&put(b"b", b"2")).unwrap();
+    converge(&mut [(ak, &mut ra), (bk, &mut rb)]);
+    for _ in 0..20 {
+        ra.checkpoint().unwrap();
+    }
+    assert!(ra.writer_lengths()[&ak] <= before + 3, "a few checkpoints per new entry, not one per poll");
+}

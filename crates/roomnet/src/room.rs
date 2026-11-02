@@ -629,8 +629,15 @@ where
             Some(indexers) => indexers.contains(&self.local_key),
             None => matches!(self.origin(), Origin::Original),
         };
+        // a checkpoint references every head; when the only head is our own latest
+        // entry, we already reference everything — another would add nothing (and with
+        // confirmation stalled, a checkpoint per poll swells the DAG without end)
+        let latest = self.local.len().checked_sub(1).map(|seq| NodeId::new(self.local_key, seq));
+        let heads = self.lin.heads();
+        let referenced = latest.is_some_and(|latest| heads.len() == 1 && heads.contains(&latest));
         self.own_recovery.is_none()
             && indexing
+            && !referenced
             && self
                 .order()
                 .into_iter()

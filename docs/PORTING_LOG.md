@@ -2201,3 +2201,10 @@ record, and dials by key land on the wrong one.
   The driver retries its checkpoint once the remote entries are fetched again.
 - Test: a room that lost a peer's log refuses to append, then appends once the peer's entries are
   back.
+
+## roomnet: checkpoint only to reference something new (ADR-0052)
+
+**Did**
+- `needs_checkpoint` is false when the only head is the writer's own latest entry. Stalled
+  confirmation no longer adds a checkpoint per poll (seen live: ~20/s per node, CPU-bound nodes).
+- Test: a stalled room is checkpointed once per new entry, not per call.
