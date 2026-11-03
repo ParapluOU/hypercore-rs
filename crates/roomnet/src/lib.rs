@@ -12,7 +12,7 @@
 //!
 //! # Three pluggable seams
 //!
-//! - **[`Transport`]** — how [`Outbound`]s move (native: Iroh; browser: WS/Trystero).
+//! - **[`Transport`]** — how [`Outbound`]s move (native: Iroh; browser: WebSocket to its homeserver).
 //! - **[`StoreFactory`]/[`storage::Store`]** — where each writer's blocks live.
 //! - **[`ProjectionSink`]** — where finalized projection versions are persisted.
 //!
@@ -26,6 +26,7 @@
 pub mod config;
 pub mod driver;
 pub mod entry;
+pub mod presence;
 pub mod projection;
 pub mod room;
 pub mod server;
@@ -49,6 +50,7 @@ pub use autobase::{NodeId, WriterKey};
 pub use config::{Origin, RoomConfig, ServerConfig};
 pub use driver::Driver;
 pub use entry::{Entry, EntryCodec};
+pub use presence::Presence;
 pub use projection::Projection;
 pub use room::{Error, Fanout, FeedSnapshot, Finalized, Outbound, PeerId, Reconfigured, Room, StoreErr};
 pub use server::{RoomId, RoomServer};
@@ -59,13 +61,13 @@ pub use sync::SyncMessage;
 pub use transport::{Both, CompositeTransport, Inbound, ProjectionSink, Transport};
 
 #[cfg(feature = "iroh")]
-pub use native::{run_server, Answer, Command, DriverOpts, IrohConfig, IrohTransport, Requester, Service};
+pub use native::{run_server, Answer, Command, DriverOpts, IrohConfig, IrohTransport, Requester, RoomPeers, Service};
 
 #[cfg(feature = "ws")]
 pub use ws::WsTransport;
 
 #[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
-pub use ws::WsServerTransport;
+pub use ws::{PresenceEvent, PresenceHub, WsServerTransport};
 
 #[cfg(test)]
 mod tests;

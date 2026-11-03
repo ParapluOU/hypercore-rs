@@ -19,6 +19,11 @@
 //! `from` is the authenticated QUIC peer key), a WS frame carries the sender's declared
 //! id — that only routes `Want`/`Have` replies; trust comes from the signed autobase
 //! blocks inside, not from this hint.
+//!
+//! The same socket carries [`Presence`] frames — `[room: 32][from: 32][presence::encode]`
+//! — told from sync frames by their body's first tag. Presence is ephemeral: the server
+//! keeps only what each client in a room shows now and relays it to the room's other
+//! clients ([`PresenceHub`]); it never reaches a [`Room`](crate::Room) or its log.
 
 use core::convert::Infallible;
 
@@ -26,6 +31,7 @@ use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite_wasm::Message;
 
+use crate::presence::{self, Presence};
 use crate::room::{Fanout, Outbound, PeerId};
 use crate::server::RoomId;
 use crate::sync::SyncMessage;
@@ -48,6 +54,7 @@ pub struct WsTransport {
     local_id: PeerId,
     outbound: UnboundedSender<Vec<u8>>,
     inbound: UnboundedReceiver<Inbound>,
+    presence: UnboundedReceiver<(RoomId, Presence)>,
 }
 
 impl WsTransport {
@@ -59,16 +66,21 @@ impl WsTransport {
 
         let (out_tx, mut out_rx) = mpsc::unbounded::<Vec<u8>>();
         let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
+        let (presence_tx, presence_rx) = mpsc::unbounded::<(RoomId, Presence)>();
 
-        // Reader: socket → inbound queue. Ends when the socket closes/errors.
+        // Reader: socket → inbound (sync) or presence queue. Ends when the socket
+        // closes/errors.
         spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Binary(data) = msg {
-                    if let Some(inb) = parse_frame(&data) {
-                        // Receiver dropped ⇒ the transport is gone; stop reading.
-                        if in_tx.unbounded_send(inb).is_err() {
-                            break;
-                        }
+                    // Receiver dropped ⇒ the transport is gone; stop reading.
+                    let gone = match parse(&data) {
+                        Some(Frame::Sync(inb)) => in_tx.unbounded_send(inb).is_err(),
+                        Some(Frame::Presence { room, presence, .. }) => presence_tx.unbounded_send((room, presence)).is_err(),
+                        None => false,
+                    };
+                    if gone {
+                        break;
                     }
                 }
             }
@@ -86,7 +98,23 @@ impl WsTransport {
             let _ = sink.close().await;
         });
 
-        Ok(Self { local_id, outbound: out_tx, inbound: in_rx })
+        Ok(Self { local_id, outbound: out_tx, inbound: in_rx, presence: presence_rx })
+    }
+
+    /// Tell the server what this client shows in `room` now (or that a peer of it left).
+    /// Best-effort like [`dispatch`](Transport::dispatch); the server relays it to the
+    /// room's other clients and keeps nothing once this connection closes.
+    pub fn send_presence(&mut self, room: RoomId, presence: &Presence) {
+        let _ = self.outbound.unbounded_send(presence_frame(&room, &self.local_id, presence));
+    }
+
+    /// The presence of the room's other peers received since the last call, in order.
+    pub fn drain_presence(&mut self) -> Vec<(RoomId, Presence)> {
+        let mut v = Vec::new();
+        while let Ok(p) = self.presence.try_recv() {
+            v.push(p);
+        }
+        v
     }
 }
 
@@ -100,9 +128,25 @@ fn encode_frame(room: &RoomId, from: &PeerId, msg: &SyncMessage) -> Vec<u8> {
     frame
 }
 
-/// Parse a `[room][from][wire msg]` frame. `None` if it is too short or the message
-/// body does not decode (a malformed frame is dropped, never panics).
-fn parse_frame(buf: &[u8]) -> Option<Inbound> {
+/// Build a `[room: 32][from: 32][presence::encode(p)]` frame.
+fn presence_frame(room: &RoomId, from: &PeerId, p: &Presence) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(64 + 16);
+    frame.extend_from_slice(room);
+    frame.extend_from_slice(from);
+    frame.extend_from_slice(&presence::encode(p));
+    frame
+}
+
+/// A parsed WS frame: sync for the room's log, or presence beside it.
+enum Frame {
+    Sync(Inbound),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Presence { room: RoomId, from: PeerId, presence: Presence },
+}
+
+/// Parse a frame. `None` if it is too short or its body does not decode (a malformed
+/// frame is dropped, never panics).
+fn parse(buf: &[u8]) -> Option<Frame> {
     if buf.len() < 64 {
         return None;
     }
@@ -110,8 +154,21 @@ fn parse_frame(buf: &[u8]) -> Option<Inbound> {
     room.copy_from_slice(&buf[0..32]);
     let mut from: PeerId = [0u8; 32];
     from.copy_from_slice(&buf[32..64]);
-    let msg = wire::decode(&buf[64..]).ok()?;
-    Some(Inbound { room, from, msg })
+    let body = &buf[64..];
+    if presence::is_presence(body) {
+        return Some(Frame::Presence { room, from, presence: presence::decode(body).ok()? });
+    }
+    let msg = wire::decode(body).ok()?;
+    Some(Frame::Sync(Inbound { room, from, msg }))
+}
+
+/// Parse a `[room][from][wire msg]` sync frame (`None` for presence or malformed).
+#[cfg(test)]
+fn parse_frame(buf: &[u8]) -> Option<Inbound> {
+    match parse(buf)? {
+        Frame::Sync(inb) => Some(inb),
+        Frame::Presence { .. } => None,
+    }
 }
 
 impl Transport for WsTransport {
@@ -158,6 +215,7 @@ impl Transport for WsTransport {
 #[cfg(not(target_arch = "wasm32"))]
 mod server {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -166,7 +224,8 @@ mod server {
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message as TMessage;
 
-    use super::{encode_frame, parse_frame};
+    use super::{encode_frame, parse, presence_frame, Frame};
+    use crate::presence::Presence;
     use crate::room::{Fanout, Outbound, PeerId};
     use crate::server::RoomId;
     use crate::transport::{Inbound, Transport};
@@ -179,6 +238,226 @@ mod server {
     type Seen = Arc<Mutex<HashSet<RoomId>>>;
     /// The clients connected now, by the rooms they have framed to this server.
     type Present = Arc<Mutex<HashMap<RoomId, HashSet<PeerId>>>>;
+    /// One accepted connection (two may share a peer id: one identity, two pages).
+    type ConnId = u64;
+
+    /// A change in who is in a room on this server, for the node to relay to the other
+    /// nodes hosting it (see [`PresenceHub`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PresenceEvent {
+        /// The room's first client here came in: its presence elsewhere is wanted now.
+        Entered(RoomId),
+        /// A client here changed what it shows in the room (or left it).
+        Changed(RoomId, Presence),
+        /// The room's last client here went: nobody here wants its presence any more.
+        Emptied(RoomId),
+    }
+
+    #[derive(Default)]
+    struct Hub {
+        /// the connections in each room (that have framed to it)
+        rooms: HashMap<RoomId, HashMap<ConnId, UnboundedSender<Vec<u8>>>>,
+        /// what each client here shows, by room and peer, with the connection that said it
+        local: HashMap<RoomId, HashMap<Vec<u8>, (ConnId, Vec<u8>)>>,
+        /// what other nodes' clients show, by room and peer, with the node that relayed it
+        remote: HashMap<RoomId, HashMap<Vec<u8>, ([u8; 32], Vec<u8>)>>,
+        events: Option<UnboundedSender<PresenceEvent>>,
+    }
+
+    impl Hub {
+        fn event(&mut self, event: PresenceEvent) {
+            if let Some(tx) = &self.events {
+                if tx.unbounded_send(event).is_err() {
+                    self.events = None;
+                }
+            }
+        }
+
+        /// Send `p` to the room's connections, but `except`.
+        fn fan(&self, local_id: &PeerId, room: &RoomId, p: &Presence, except: Option<ConnId>) {
+            let frame = presence_frame(room, local_id, p);
+            for (conn, tx) in self.rooms.get(room).into_iter().flatten() {
+                if Some(*conn) != except {
+                    let _ = tx.unbounded_send(frame.clone());
+                }
+            }
+        }
+    }
+
+    /// Who is in each room on this server, and on the other nodes that relay theirs here.
+    ///
+    /// A client's presence frames are kept (the latest per peer) only while its
+    /// connection is open and are relayed to the room's other clients; a client coming
+    /// into a room is first told everyone already there. Nothing is persisted, and no
+    /// presence reaches the room's log. The node relays [`PresenceEvent`]s to the other
+    /// nodes hosting a room and hands what they relay back to [`relay`](Self::relay):
+    /// a client only ever talks to this server. Cheap to clone; shared with the
+    /// transport's connection tasks.
+    #[derive(Clone)]
+    pub struct PresenceHub {
+        local_id: PeerId,
+        hub: Arc<Mutex<Hub>>,
+    }
+
+    impl PresenceHub {
+        /// The changes from now on, until the returned receiver is dropped (one
+        /// listener: a later call replaces an earlier one).
+        pub fn events(&self) -> UnboundedReceiver<PresenceEvent> {
+            let (tx, rx) = mpsc::unbounded();
+            self.hub.lock().unwrap().events = Some(tx);
+            rx
+        }
+
+        /// What the clients here show in `room` now.
+        pub fn local(&self, room: RoomId) -> Vec<Presence> {
+            let hub = self.hub.lock().unwrap();
+            hub.local
+                .get(&room)
+                .into_iter()
+                .flatten()
+                .map(|(peer, (_, state))| Presence::Here { peer: peer.clone(), state: state.clone() })
+                .collect()
+        }
+
+        /// Whether a client here is in `room` now.
+        pub fn has_clients(&self, room: RoomId) -> bool {
+            self.hub.lock().unwrap().rooms.get(&room).is_some_and(|conns| !conns.is_empty())
+        }
+
+        /// The rooms a client here is in now.
+        pub fn rooms(&self) -> Vec<RoomId> {
+            self.hub.lock().unwrap().rooms.keys().copied().collect()
+        }
+
+        /// Node `node` relays changes of its clients' presence in `room`: tell the
+        /// room's clients here. Ignored when nobody here is in the room, and for a peer
+        /// a client here shows (a node does not speak for this server's clients).
+        pub fn relay(&self, room: RoomId, node: [u8; 32], changes: Vec<Presence>) {
+            let mut hub = self.hub.lock().unwrap();
+            if !hub.rooms.contains_key(&room) {
+                return;
+            }
+            for p in changes {
+                if !p.fits() || hub.local.get(&room).is_some_and(|local| local.contains_key(p.peer())) {
+                    continue;
+                }
+                let remote = hub.remote.entry(room).or_default();
+                match &p {
+                    Presence::Here { peer, state } => {
+                        if remote.get(peer).is_some_and(|(_, shown)| shown == state) {
+                            continue;
+                        }
+                        remote.insert(peer.clone(), (node, state.clone()));
+                    }
+                    Presence::Gone { peer } => {
+                        if !remote.get(peer).is_some_and(|(from, _)| *from == node) {
+                            continue;
+                        }
+                        remote.remove(peer);
+                    }
+                }
+                hub.fan(&self.local_id, &room, &p, None);
+            }
+        }
+
+        /// Node `node`'s clients in `room` are `now` (a node's whole list, as it
+        /// answers when asked): the ones it relayed before and no longer lists left.
+        pub fn replace(&self, room: RoomId, node: [u8; 32], now: Vec<Presence>) {
+            let listed: HashSet<Vec<u8>> = now.iter().map(|p| p.peer().to_vec()).collect();
+            let gone: Vec<Presence> = {
+                let hub = self.hub.lock().unwrap();
+                hub.remote
+                    .get(&room)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(peer, (from, _))| *from == node && !listed.contains(*peer))
+                    .map(|(peer, _)| Presence::Gone { peer: peer.clone() })
+                    .collect()
+            };
+            let here = now.into_iter().filter(|p| matches!(p, Presence::Here { .. }));
+            self.relay(room, node, gone.into_iter().chain(here).collect());
+        }
+
+        /// Node `node` relays nobody in `room` any more (it went, or its clients did).
+        pub fn drop_node(&self, room: RoomId, node: [u8; 32]) {
+            self.replace(room, node, Vec::new());
+        }
+
+        /// Connection `conn` came into `room` (its first frame there): tell it who is
+        /// here already.
+        fn enter(&self, conn: ConnId, tx: &UnboundedSender<Vec<u8>>, room: RoomId) {
+            let mut hub = self.hub.lock().unwrap();
+            let conns = hub.rooms.entry(room).or_default();
+            let first = conns.is_empty();
+            conns.insert(conn, tx.clone());
+            let local = hub.local.get(&room).into_iter().flatten().map(|(peer, (_, state))| (peer, state));
+            let remote = hub.remote.get(&room).into_iter().flatten().map(|(peer, (_, state))| (peer, state));
+            for (peer, state) in local.chain(remote) {
+                let p = Presence::Here { peer: peer.clone(), state: state.clone() };
+                let _ = tx.unbounded_send(presence_frame(&room, &self.local_id, &p));
+            }
+            if first {
+                hub.event(PresenceEvent::Entered(room));
+            }
+        }
+
+        /// Connection `conn` says `p` in `room`.
+        fn said(&self, conn: ConnId, room: RoomId, p: Presence) {
+            if !p.fits() {
+                return;
+            }
+            let mut hub = self.hub.lock().unwrap();
+            let local = hub.local.entry(room).or_default();
+            match &p {
+                Presence::Here { peer, state } => {
+                    if local.get(peer).is_some_and(|(_, shown)| shown == state) {
+                        return;
+                    }
+                    local.insert(peer.clone(), (conn, state.clone()));
+                }
+                Presence::Gone { peer } => {
+                    if !local.get(peer).is_some_and(|(by, _)| *by == conn) {
+                        return;
+                    }
+                    local.remove(peer);
+                }
+            }
+            hub.fan(&self.local_id, &room, &p, Some(conn));
+            hub.event(PresenceEvent::Changed(room, p));
+        }
+
+        /// Connection `conn` closed: the peers it showed left its `rooms`.
+        fn left(&self, conn: ConnId, rooms: &HashSet<RoomId>) {
+            let mut hub = self.hub.lock().unwrap();
+            for room in rooms {
+                if let Some(conns) = hub.rooms.get_mut(room) {
+                    conns.remove(&conn);
+                }
+                let gone: Vec<Vec<u8>> = hub
+                    .local
+                    .get(room)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, (by, _))| *by == conn)
+                    .map(|(peer, _)| peer.clone())
+                    .collect();
+                for peer in gone {
+                    if let Some(local) = hub.local.get_mut(room) {
+                        local.remove(&peer);
+                    }
+                    let p = Presence::Gone { peer };
+                    hub.fan(&self.local_id, room, &p, None);
+                    hub.event(PresenceEvent::Changed(*room, p));
+                }
+                if hub.rooms.get(room).is_some_and(|conns| conns.is_empty()) {
+                    hub.rooms.remove(room);
+                    hub.local.remove(room);
+                    hub.remote.remove(room);
+                    hub.event(PresenceEvent::Emptied(*room));
+                }
+            }
+        }
+    }
 
     /// A native WebSocket server transport. See the type-level docs above the module.
     pub struct WsServerTransport {
@@ -187,6 +466,7 @@ mod server {
         conns: Conns,
         seen: Seen,
         present: Present,
+        presence: PresenceHub,
         inbound: UnboundedReceiver<Inbound>,
     }
 
@@ -200,17 +480,21 @@ mod server {
             let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
             let seen: Seen = Arc::new(Mutex::new(HashSet::new()));
             let present: Present = Arc::new(Mutex::new(HashMap::new()));
+            let presence = PresenceHub { local_id, hub: Arc::new(Mutex::new(Hub::default())) };
             let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
 
             let conns_accept = conns.clone();
             let seen_accept = seen.clone();
             let present_accept = present.clone();
+            let presence_accept = presence.clone();
+            let next_conn = Arc::new(AtomicU64::new(0));
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else { break };
                     let Ok(ws) = accept_async(tcp).await else { continue };
                     let (mut sink, mut stream) = ws.split();
                     let (out_tx, mut out_rx) = mpsc::unbounded::<Vec<u8>>();
+                    let conn: ConnId = next_conn.fetch_add(1, Ordering::Relaxed);
 
                     // Writer: this connection's outbound queue → socket.
                     tokio::spawn(async move {
@@ -222,35 +506,46 @@ mod server {
                     });
 
                     // Reader: socket → learn the peer id (first frame) → register this
-                    // connection's outbound channel → record the room → forward the frame.
+                    // connection's outbound channel → record the room → forward the frame
+                    // (sync to the driver; presence to the hub).
                     let conns_conn = conns_accept.clone();
                     let seen_conn = seen_accept.clone();
                     let present_conn = present_accept.clone();
+                    let presence_conn = presence_accept.clone();
                     let in_tx_conn = in_tx.clone();
                     tokio::spawn(async move {
                         let mut registered: Option<PeerId> = None;
                         let mut rooms: HashSet<RoomId> = HashSet::new();
                         while let Some(Ok(msg)) = stream.next().await {
-                            if let TMessage::Binary(data) = msg {
-                                if let Some(inb) = parse_frame(&data) {
-                                    if registered.is_none() {
-                                        conns_conn.lock().unwrap().insert(inb.from, out_tx.clone());
-                                        registered = Some(inb.from);
-                                    }
-                                    if rooms.insert(inb.room) {
-                                        present_conn.lock().unwrap().entry(inb.room).or_default().insert(inb.from);
-                                    }
+                            let TMessage::Binary(data) = msg else { continue };
+                            let Some(frame) = parse(&data) else { continue };
+                            let (room, from) = match &frame {
+                                Frame::Sync(inb) => (inb.room, inb.from),
+                                Frame::Presence { room, from, .. } => (*room, *from),
+                            };
+                            if registered.is_none() {
+                                conns_conn.lock().unwrap().insert(from, out_tx.clone());
+                                registered = Some(from);
+                            }
+                            if rooms.insert(room) {
+                                present_conn.lock().unwrap().entry(room).or_default().insert(from);
+                                presence_conn.enter(conn, &out_tx, room);
+                            }
+                            match frame {
+                                Frame::Sync(inb) => {
                                     // Record the room BEFORE forwarding, so a homeserver
                                     // polling `seen_rooms()` can host it before the driver
                                     // drains (and would otherwise drop) this frame.
-                                    seen_conn.lock().unwrap().insert(inb.room);
+                                    seen_conn.lock().unwrap().insert(room);
                                     if in_tx_conn.unbounded_send(inb).is_err() {
                                         break;
                                     }
                                 }
+                                Frame::Presence { presence, .. } => presence_conn.said(conn, room, presence),
                             }
                         }
                         // Gone: no longer a client to relay to, nor present in its rooms.
+                        presence_conn.left(conn, &rooms);
                         if let Some(peer) = registered {
                             let mut conns = conns_conn.lock().unwrap();
                             if conns.get(&peer).is_some_and(|tx| tx.same_receiver(&out_tx)) {
@@ -270,12 +565,17 @@ mod server {
                 }
             });
 
-            Ok(Self { local_id, local_addr, conns, seen, present, inbound: in_rx })
+            Ok(Self { local_id, local_addr, conns, seen, present, presence, inbound: in_rx })
         }
 
         /// The address the server is bound to (resolves a `:0` request to a real port).
         pub fn local_addr(&self) -> std::net::SocketAddr {
             self.local_addr
+        }
+
+        /// Who is in each room here (see [`PresenceHub`]), apart from the transport.
+        pub fn presence(&self) -> PresenceHub {
+            self.presence.clone()
         }
 
         /// Every room id a client has framed to this server so far. A homeserver polls
@@ -339,7 +639,7 @@ mod server {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use server::WsServerTransport;
+pub use server::{PresenceEvent, PresenceHub, WsServerTransport};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -573,5 +873,105 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!((now.get(&room), now.get(&other)), (Some(&1), None), "a closed client is gone from its rooms");
+    }
+
+    async fn wait_for_presence(t: &mut WsTransport, n: usize) -> Vec<(RoomId, Presence)> {
+        let mut v = Vec::new();
+        for _ in 0..100 {
+            v.extend(t.drain_presence());
+            if v.len() >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        v
+    }
+
+    fn here(peer: &str, state: &str) -> Presence {
+        Presence::Here { peer: peer.as_bytes().to_vec(), state: state.as_bytes().to_vec() }
+    }
+
+    /// Presence reaches only the clients in its room (a newcomer is told who is there
+    /// first), leaves with its connection, never reaches the driver (so never the
+    /// room's log), and what other nodes relay reaches the room's clients here.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn server_relays_presence_within_a_room_and_never_into_the_log() {
+        let node: [u8; 32] = [4u8; 32];
+        let mut server = WsServerTransport::bind("127.0.0.1:0".parse().unwrap(), [9u8; 32]).await.unwrap();
+        let hub = server.presence();
+        let mut events = hub.events();
+        let url = format!("ws://{}", server.local_addr());
+        let (room, other): (RoomId, RoomId) = ([7u8; 32], [8u8; 32]);
+        let have = |writer| Outbound { to: Fanout::Gossip, msg: SyncMessage::Have { writer, length: 1 } };
+        let mut a = WsTransport::connect(&url, [1u8; 32]).await.unwrap();
+        let mut b = WsTransport::connect(&url, [2u8; 32]).await.unwrap();
+        let mut c = WsTransport::connect(&url, [3u8; 32]).await.unwrap();
+        a.dispatch(room, have([1u8; 32])).unwrap();
+        b.dispatch(room, have([2u8; 32])).unwrap();
+        c.dispatch(other, have([3u8; 32])).unwrap();
+        let mut synced = Vec::new();
+        for _ in 0..100 {
+            synced.extend(server.drain_inbound());
+            if synced.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(synced.len(), 3, "all three clients came in");
+
+        a.send_presence(room, &here("a", "cursor 1"));
+        let got = wait_for_presence(&mut b, 1).await;
+        assert_eq!(got, vec![(room, here("a", "cursor 1"))], "B, in the room, sees A");
+
+        // A newcomer is told who is here before anything else.
+        let mut d = WsTransport::connect(&url, [5u8; 32]).await.unwrap();
+        d.send_presence(room, &here("d", "cursor 2"));
+        assert_eq!(wait_for_presence(&mut d, 1).await, vec![(room, here("a", "cursor 1"))], "D is told A is here");
+        assert_eq!(wait_for_presence(&mut b, 1).await, vec![(room, here("d", "cursor 2"))], "B sees D come");
+
+        // What another node relays reaches this room's clients, and is not this node's own.
+        hub.relay(room, node, vec![here("x", "elsewhere")]);
+        assert_eq!(wait_for_presence(&mut b, 1).await, vec![(room, here("x", "elsewhere"))]);
+        assert_eq!(wait_for_presence(&mut d, 1).await, vec![(room, here("x", "elsewhere"))]);
+        let mut local = hub.local(room);
+        local.sort_by(|p, q| p.peer().cmp(q.peer()));
+        assert_eq!(local, vec![here("a", "cursor 1"), here("d", "cursor 2")], "the node lists only its own clients");
+
+        // A leaves: the others see it go.
+        drop(a);
+        let gone = Presence::Gone { peer: b"a".to_vec() };
+        assert_eq!(wait_for_presence(&mut b, 1).await, vec![(room, gone.clone())], "B sees A leave");
+        assert_eq!(wait_for_presence(&mut d, 1).await, vec![(room, gone.clone())], "D sees A leave");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(c.drain_presence().is_empty(), "C, in another room only, hears nothing of it");
+        assert!(server.drain_inbound().is_empty(), "presence never reaches the driver, nor the room's log");
+
+        drop(b);
+        drop(d);
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            while let Ok(event) = events.try_recv() {
+                seen.push(event);
+            }
+            if seen.contains(&PresenceEvent::Emptied(room)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for event in [
+            PresenceEvent::Entered(room),
+            PresenceEvent::Entered(other),
+            PresenceEvent::Changed(room, here("a", "cursor 1")),
+            PresenceEvent::Changed(room, here("d", "cursor 2")),
+            PresenceEvent::Changed(room, gone),
+            PresenceEvent::Emptied(room),
+        ] {
+            assert!(seen.contains(&event), "the node hears {event:?}: {seen:?}");
+        }
+        assert_eq!(seen.iter().filter(|e| **e == PresenceEvent::Entered(room)).count(), 1, "a room is entered once");
+        assert!(!seen.iter().any(|e| matches!(e, PresenceEvent::Changed(_, p) if p.peer() == b"x")), "relayed presence is not echoed back out");
+        assert!(!hub.has_clients(room), "nobody is left in the room");
     }
 }

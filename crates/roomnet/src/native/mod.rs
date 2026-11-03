@@ -14,7 +14,7 @@
 //! and its iroh [`EndpointId`](iroh::EndpointId) (both raw ed25519), so peers are
 //! dialed directly by their writer key.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -106,6 +106,18 @@ impl ProtocolHandler for Service {
     }
 }
 
+/// The peers met in each room's discovery overlay (and those a room was joined
+/// through): the nodes that hold the room, as far as this one knows. Cheap to clone.
+#[derive(Clone, Debug, Default)]
+pub struct RoomPeers(Arc<Mutex<HashMap<RoomId, BTreeSet<[u8; 32]>>>>);
+
+impl RoomPeers {
+    /// The peers met in `room`.
+    pub fn of(&self, room: RoomId) -> Vec<[u8; 32]> {
+        self.0.lock().unwrap().get(&room).map(|set| set.iter().copied().collect()).unwrap_or_default()
+    }
+}
+
 /// Asks peers' [`Service`]s from a transport's endpoint; cheap to clone and
 /// usable apart from the driver loop that owns the transport.
 #[derive(Clone, Debug)]
@@ -183,6 +195,8 @@ pub struct IrohTransport {
     alpn: Vec<u8>,
     inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     peers: Arc<Mutex<BTreeSet<[u8; 32]>>>,
+    /// The peers met in each room's discovery overlay (see [`RoomPeers`]).
+    room_peers: RoomPeers,
     /// Per-room peer discovery. Subscribing to a room's topic finds co-subscribers
     /// (their `NeighborUp`s populate `peers`) and, because the overlay dials them,
     /// teaches the endpoint their addresses so the direct-dial sync path resolves.
@@ -227,6 +241,7 @@ impl IrohTransport {
             alpn: cfg.alpn.clone(),
             inbound_rx: rx,
             peers,
+            room_peers: RoomPeers::default(),
             gossip,
         }
     }
@@ -239,6 +254,8 @@ impl IrohTransport {
     pub fn discover_room(&self, room: [u8; 32], bootstrap: Vec<[u8; 32]>) {
         let gossip = self.gossip.clone();
         let peers = self.peers.clone();
+        let room_peers = self.room_peers.clone();
+        room_peers.0.lock().unwrap().entry(room).or_default().extend(bootstrap.iter().copied());
         tokio::spawn(async move {
             let topic = TopicId::from_bytes(room);
             let boot: Vec<PublicKey> = bootstrap
@@ -250,14 +267,27 @@ impl IrohTransport {
                 Err(_) => return,
             };
             while let Some(ev) = sub.next().await {
-                if let Ok(Event::NeighborUp(id)) = ev {
-                    peers.lock().unwrap().insert(*id.as_bytes());
+                match ev {
+                    Ok(Event::NeighborUp(id)) => {
+                        peers.lock().unwrap().insert(*id.as_bytes());
+                        room_peers.0.lock().unwrap().entry(room).or_default().insert(*id.as_bytes());
+                    }
+                    Ok(Event::NeighborDown(id)) => {
+                        if let Some(set) = room_peers.0.lock().unwrap().get_mut(&room) {
+                            set.remove(id.as_bytes());
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
     }
 
-    /// This node's 32-byte endpoint id (== its writer key).
+    /// The peers met per room in discovery, apart from the transport.
+    pub fn room_peers(&self) -> RoomPeers {
+        self.room_peers.clone()
+    }
+
     /// Asks peers' services from this endpoint (see [`Service`]).
     pub fn requester(&self) -> Requester {
         Requester { endpoint: self.endpoint.clone() }
@@ -268,6 +298,7 @@ impl IrohTransport {
         self.endpoint.addr()
     }
 
+    /// This node's 32-byte endpoint id (== its writer key).
     pub fn endpoint_id(&self) -> [u8; 32] {
         *self.endpoint.id().as_bytes()
     }

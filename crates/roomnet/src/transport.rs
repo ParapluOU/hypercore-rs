@@ -19,7 +19,7 @@ pub struct Inbound {
 ///
 /// The room core is **sans-IO**: it consumes inbound `(PeerId, SyncMessage)` and
 /// emits [`Outbound`]s. A driver moves those over a real network — natively Iroh
-/// (gossip + streams), in the browser WebSockets + WebRTC/Trystero. This trait is
+/// (gossip + streams), in the browser a WebSocket to its homeserver. This trait is
 /// the per-room dispatch boundary: [`dispatch`](Self::dispatch) ships one outbound
 /// frame for a room, [`drain_inbound`](Self::drain_inbound) collects the frames
 /// received since the last call. It mirrors exactly how the native

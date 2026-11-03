@@ -1148,3 +1148,25 @@ checkpoint on every driver poll; now it earns one, plus one per new entry that a
 
 **Validation:** with confirmation stalled by an absent indexer, twenty checkpoint calls append one
 checkpoint (the test fails with twenty without the change); a new entry from the peer earns more.
+
+## ADR-0053 — roomnet: ephemeral presence beside sync on the WebSocket
+
+**Status:** adopted. Upstream has no presence; Hypercore swarms leave it to the application.
+
+**What:** the WS transport carries `presence::Presence` frames (`Here { peer, state }` /
+`Gone { peer }`, tags distinct from every `SyncMessage` tag) beside the sync frames. The server's
+`PresenceHub` keeps each open connection's latest state per room, relays changes to the room's
+other connections, tells a connection coming into a room who is there, and sends `Gone` for a
+connection's peers when it closes. It emits `PresenceEvent`s (`Entered` / `Changed` / `Emptied`)
+so a node can relay presence to the other nodes hosting the room, and takes theirs back through
+`relay` / `replace` / `drop_node`. `IrohTransport::room_peers` names the peers met per room.
+State is opaque bytes and peers are a client-chosen key (not a writer key: one identity may be
+present twice).
+
+**Why:** presence must reach a room's clients without entering its log (never persisted, never
+confirmed), and a client should need only its one connection to its server — the server, not the
+client, reaches the other nodes.
+
+**Validation:** over a real WebSocket, presence reaches only the room's clients (a newcomer is
+told who is there first), leaves with its connection, never reaches the driver, and what another
+node relays reaches the room's clients and is not echoed back out.

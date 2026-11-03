@@ -30,9 +30,17 @@ WebSocket edit fanout.
 
 | Seam | Trait | node | browser |
 |---|---|---|---|
-| Transport | `Transport` / `IrohTransport` | Iroh QUIC | WS + WebRTC/Trystero |
+| Transport | `Transport` / `IrohTransport` | Iroh QUIC | WS to its homeserver |
 | Storage (per writer) | `StoreFactory` → `storage::Store` | file-WAL | in-mem |
 | Projection sink | `ProjectionSink` | throttled → TerminusDB | render callback |
+
+**Presence** (who is in a room, what each shows) rides the same WebSocket as
+`presence::Presence` frames, beside sync and never in the log: the server's
+`PresenceHub` keeps each connected client's latest state per room, relays it to the
+room's other clients (a newcomer is told who is there first), forgets it when the
+connection closes, and emits `PresenceEvent`s so a node can relay presence to the other
+nodes hosting the room (the hub's `relay`/`replace`/`drop_node` take theirs back).
+The state is opaque bytes; peers are named by a client-chosen key, not a writer key.
 
 The domain fold itself is the `Projection` trait (`apply` / `snapshot` /
 `reset_to`) — deterministic, portable, the one place domain logic lives.
