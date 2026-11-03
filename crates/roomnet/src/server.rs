@@ -137,6 +137,12 @@ where
         self.rooms.get_mut(&room)
     }
 
+    /// Stop serving `room` (hosted or replicated), dropping it and its store
+    /// handles; what its store kept stays where it is. Returns it, if it was served.
+    pub fn remove(&mut self, room: RoomId) -> Option<Room<F, P>> {
+        self.rooms.remove(&room)
+    }
+
     pub fn rooms(&self) -> impl Iterator<Item = (&RoomId, &Room<F, P>)> {
         self.rooms.iter()
     }

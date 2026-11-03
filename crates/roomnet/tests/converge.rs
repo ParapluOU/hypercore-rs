@@ -233,3 +233,18 @@ fn replicated_rooms_are_evictable_originals_are_not() {
     assert!(s.get([1u8; 32]).is_some(), "the original is kept");
     assert!(s.get([2u8; 32]).is_none(), "the replica is gone");
 }
+
+#[test]
+fn a_removed_room_is_no_longer_served_whatever_its_origin() {
+    let mut s: RoomServer<MemStoreFactory, KvProjection> = RoomServer::open(
+        ServerConfig { identity_seed: [5; 32], indexers: vec![], replica_stale_after: None },
+        KvProjection::new(),
+        |_| MemStoreFactory,
+    );
+    s.host([1u8; 32]).unwrap();
+    s.join_remote([2u8; 32]).unwrap();
+    assert!(s.remove([1u8; 32]).is_some(), "an original is removed on request");
+    assert!(s.remove([1u8; 32]).is_none(), "and only once");
+    assert!(s.get([1u8; 32]).is_none());
+    assert!(s.get([2u8; 32]).is_some(), "the others stay");
+}
