@@ -148,9 +148,10 @@ impl Transport for WsTransport {
 /// Each client stamps its own `from` id on every frame (see the module wire format), so
 /// the server learns a connection's peer id from its first frame and registers that
 /// connection's outbound channel under it. `dispatch` routes `Fanout::Peer` to that one
-/// connection; `Fanout::Gossip` AND `Fanout::Clients` both go to every connected client
-/// — a homeserver's WS clients ARE its local clients, so a block the room relays from
-/// one writer (emitted to `Clients` on ingest) reaches that writer's co-editors here.
+/// connection; `Fanout::Gossip` AND `Fanout::Clients` both go to every client connected
+/// in THAT room (one that has framed to it) — a homeserver's WS clients ARE its local
+/// clients, so a block the room relays from one writer (emitted to `Clients` on ingest)
+/// reaches that writer's co-editors here, and a client hears nothing of rooms it is not in.
 /// (This is the opposite of `IrohTransport`, whose peers are nodes, not clients — it
 /// skips `Clients`.) Outbound frames are stamped with the server's own `local_id` so
 /// clients address their replies back to the node.
@@ -305,7 +306,10 @@ mod server {
                     }
                 }
                 // A homeserver's WS clients ARE its local clients, so BOTH peer gossip
-                // (head adverts) AND `Fanout::Clients` go to every connected client.
+                // (head adverts) AND `Fanout::Clients` go to the clients in this room:
+                // the ones that framed to it (a joiner's first frame is its hello). A
+                // client in other rooms only would otherwise hear every hosted room's
+                // periodic adverts — traffic it cannot use, and what the node hosts.
                 // The room emits a verified REMOTE writer's block to `Clients` on ingest
                 // (room.rs on_inbound), so routing `Clients` here is exactly what relays
                 // one browser's edit to its co-editors on the same homeserver. (The
@@ -313,8 +317,11 @@ mod server {
                 // key. The client `WsTransport` still skips `Clients`: a browser has no
                 // clients of its own.)
                 Fanout::Gossip | Fanout::Clients => {
-                    for tx in conns.values() {
-                        let _ = tx.unbounded_send(frame.clone());
+                    let present = self.present.lock().unwrap();
+                    for peer in present.get(&room).into_iter().flatten() {
+                        if let Some(tx) = conns.get(peer) {
+                            let _ = tx.unbounded_send(frame.clone());
+                        }
                     }
                 }
             }
@@ -495,6 +502,38 @@ mod tests {
 
         // A must NOT receive B's peer-addressed frame.
         assert!(a.drain_inbound().is_empty(), "A does not receive a frame addressed to B");
+    }
+
+    /// Gossip for a room reaches only the clients in that room: a client in another
+    /// room hears nothing of it.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn server_gossips_a_room_only_to_its_clients() {
+        let (a_id, b_id): (PeerId, PeerId) = ([1u8; 32], [2u8; 32]);
+        let mut server = WsServerTransport::bind("127.0.0.1:0".parse().unwrap(), [9u8; 32]).await.unwrap();
+        let url = format!("ws://{}", server.local_addr());
+        let mut a = WsTransport::connect(&url, a_id).await.unwrap();
+        let mut b = WsTransport::connect(&url, b_id).await.unwrap();
+        let (room, other): (RoomId, RoomId) = ([7u8; 32], [8u8; 32]);
+        let have = |writer| Outbound { to: Fanout::Gossip, msg: SyncMessage::Have { writer, length: 1 } };
+        a.dispatch(room, have(a_id)).unwrap();
+        b.dispatch(other, have(b_id)).unwrap();
+        let mut seen = 0usize;
+        for _ in 0..100 {
+            seen += server.drain_inbound().len();
+            if seen >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(seen >= 2, "both clients registered");
+
+        server.dispatch(room, have([5u8; 32])).unwrap();
+        let got_a = wait_for_inbound(&mut a).await;
+        assert_eq!(got_a.len(), 1, "A, in the room, hears its gossip");
+        assert_eq!(got_a[0].room, room);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(b.drain_inbound().is_empty(), "B, in another room only, hears nothing of it");
     }
 
     /// The server counts the clients connected now per room they framed to it, and
