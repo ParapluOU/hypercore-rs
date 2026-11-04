@@ -41,6 +41,15 @@ room's other clients (a newcomer is told who is there first), forgets it when th
 connection closes, and emits `PresenceEvent`s so a node can relay presence to the other
 nodes hosting the room (the hub's `relay`/`replace`/`drop_node` take theirs back).
 The state is opaque bytes; peers are named by a client-chosen key, not a writer key.
+A peer that is `direct` (a flag of its `Here`) takes **signals** (`signal::Signal`):
+opaque messages from another direct peer in the same room (an offer, an answer), which
+the server routes to that one peer — through the node relaying its presence for another
+node's peer (`PresenceEvent::Signal` out, `PresenceHub::signal` in) — and never keeps.
+A peer that is not direct is never signalled and signals nobody. The server tells each
+client coming into a room its `Signal::Config` (opaque: how its clients connect
+directly) when one is set. Two direct peers may then connect directly and exchange the
+same frames (`frame`) as over the WebSocket; the room's log still reaches the server
+over it.
 
 The domain fold itself is the `Projection` trait (`apply` / `snapshot` /
 `reset_to`) — deterministic, portable, the one place domain logic lives.

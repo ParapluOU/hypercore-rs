@@ -1170,3 +1170,27 @@ client, reaches the other nodes.
 **Validation:** over a real WebSocket, presence reaches only the room's clients (a newcomer is
 told who is there first), leaves with its connection, never reaches the driver, and what another
 node relays reaches the room's clients and is not echoed back out.
+
+## ADR-0054 — roomnet: signals between direct peers, through the server
+
+**Status:** adopted. Upstream has no signalling; Hypercore swarms find each other through a DHT.
+
+**What:** `Presence::Here` carries `direct`: whether the peer takes signals for a direct
+connection with the room's other peers. The WS transport carries `signal::Signal` frames (tags
+distinct from sync and presence): `Peer { from, to, data }`, which the server's `PresenceHub`
+routes to the one peer `to` when the sending connection shows `from` in that room, both are
+direct, and `to` is in the room — here, or on the node relaying its presence
+(`PresenceEvent::Signal`; that node hands it in through `PresenceHub::signal`, checked against
+who it relays) — and `Config { data }`, which the server tells every client coming into a room
+when its operator set one. Nothing of either is kept. The frame codec (`frame`) is shared so two
+peers connected directly speak the same frames as over the WebSocket.
+
+**Why:** two clients in a room may want a faster path to each other than through their servers,
+yet should discover each other only through their own server (no third-party tracker), and a
+client that wants no direct connection must never be offered one.
+
+**Validation:** over a real WebSocket, a signal reaches only the addressed direct peer in the
+room; one to or from a peer that is not direct, for another room, or claiming a peer another
+connection shows is dropped; none reaches the driver; another node's peer is reached through
+its node only, and what a node hands in is accepted only from the node relaying the sender.
+

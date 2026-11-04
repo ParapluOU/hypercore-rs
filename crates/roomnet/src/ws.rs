@@ -24,6 +24,12 @@
 //! — told from sync frames by their body's first tag. Presence is ephemeral: the server
 //! keeps only what each client in a room shows now and relays it to the room's other
 //! clients ([`PresenceHub`]); it never reaches a [`Room`](crate::Room) or its log.
+//!
+//! And [`Signal`] frames: a direct peer's signal to another direct peer in the room
+//! (an offer, an answer — to connect directly, e.g. over a WebRTC data channel), which
+//! the server routes to that one peer (through the node relaying it, for another
+//! node's) and keeps nothing of; and the server's [`Signal::Config`], told to every
+//! client coming into a room when the operator set one. See [`frame`](crate::frame).
 
 use core::convert::Infallible;
 
@@ -31,12 +37,12 @@ use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite_wasm::Message;
 
-use crate::presence::{self, Presence};
+use crate::frame::{parse, presence_frame, signal_frame, sync_frame, Frame};
+use crate::presence::Presence;
 use crate::room::{Fanout, Outbound, PeerId};
 use crate::server::RoomId;
-use crate::sync::SyncMessage;
+use crate::signal::Signal;
 use crate::transport::{Inbound, Transport};
-use crate::wire;
 
 /// Spawn a pump task on the ambient runtime (tokio natively, the browser event loop
 /// on wasm) — roomnet stays independent of any app-level runtime wrapper.
@@ -55,6 +61,7 @@ pub struct WsTransport {
     outbound: UnboundedSender<Vec<u8>>,
     inbound: UnboundedReceiver<Inbound>,
     presence: UnboundedReceiver<(RoomId, Presence)>,
+    signals: UnboundedReceiver<(RoomId, Signal)>,
 }
 
 impl WsTransport {
@@ -67,9 +74,10 @@ impl WsTransport {
         let (out_tx, mut out_rx) = mpsc::unbounded::<Vec<u8>>();
         let (in_tx, in_rx) = mpsc::unbounded::<Inbound>();
         let (presence_tx, presence_rx) = mpsc::unbounded::<(RoomId, Presence)>();
+        let (signal_tx, signal_rx) = mpsc::unbounded::<(RoomId, Signal)>();
 
-        // Reader: socket → inbound (sync) or presence queue. Ends when the socket
-        // closes/errors.
+        // Reader: socket → inbound (sync), presence or signal queue. Ends when the
+        // socket closes/errors.
         spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 if let Message::Binary(data) = msg {
@@ -77,6 +85,7 @@ impl WsTransport {
                     let gone = match parse(&data) {
                         Some(Frame::Sync(inb)) => in_tx.unbounded_send(inb).is_err(),
                         Some(Frame::Presence { room, presence, .. }) => presence_tx.unbounded_send((room, presence)).is_err(),
+                        Some(Frame::Signal { room, signal, .. }) => signal_tx.unbounded_send((room, signal)).is_err(),
                         None => false,
                     };
                     if gone {
@@ -98,7 +107,7 @@ impl WsTransport {
             let _ = sink.close().await;
         });
 
-        Ok(Self { local_id, outbound: out_tx, inbound: in_rx, presence: presence_rx })
+        Ok(Self { local_id, outbound: out_tx, inbound: in_rx, presence: presence_rx, signals: signal_rx })
     }
 
     /// Tell the server what this client shows in `room` now (or that a peer of it left).
@@ -116,58 +125,35 @@ impl WsTransport {
         }
         v
     }
-}
 
-/// Build a `[room: 32][from: 32][wire::encode(msg)]` frame — the inverse of
-/// [`parse_frame`]. Shared by `dispatch` and the codec test.
-fn encode_frame(room: &RoomId, from: &PeerId, msg: &SyncMessage) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(64 + 16);
-    frame.extend_from_slice(room);
-    frame.extend_from_slice(from);
-    frame.extend_from_slice(&wire::encode(msg));
-    frame
-}
-
-/// Build a `[room: 32][from: 32][presence::encode(p)]` frame.
-fn presence_frame(room: &RoomId, from: &PeerId, p: &Presence) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(64 + 16);
-    frame.extend_from_slice(room);
-    frame.extend_from_slice(from);
-    frame.extend_from_slice(&presence::encode(p));
-    frame
-}
-
-/// A parsed WS frame: sync for the room's log, or presence beside it.
-enum Frame {
-    Sync(Inbound),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    Presence { room: RoomId, from: PeerId, presence: Presence },
-}
-
-/// Parse a frame. `None` if it is too short or its body does not decode (a malformed
-/// frame is dropped, never panics).
-fn parse(buf: &[u8]) -> Option<Frame> {
-    if buf.len() < 64 {
-        return None;
+    /// Signal another direct peer in `room` through the server (best-effort; the server
+    /// drops it unless both peers are direct and in the room).
+    pub fn send_signal(&mut self, room: RoomId, signal: &Signal) {
+        let _ = self.outbound.unbounded_send(signal_frame(&room, &self.local_id, signal));
     }
-    let mut room: RoomId = [0u8; 32];
-    room.copy_from_slice(&buf[0..32]);
-    let mut from: PeerId = [0u8; 32];
-    from.copy_from_slice(&buf[32..64]);
-    let body = &buf[64..];
-    if presence::is_presence(body) {
-        return Some(Frame::Presence { room, from, presence: presence::decode(body).ok()? });
+
+    /// The signals received since the last call, in order: other peers' to this
+    /// client's, and the server's [`Signal::Config`].
+    pub fn drain_signals(&mut self) -> Vec<(RoomId, Signal)> {
+        let mut v = Vec::new();
+        while let Ok(s) = self.signals.try_recv() {
+            v.push(s);
+        }
+        v
     }
-    let msg = wire::decode(body).ok()?;
-    Some(Frame::Sync(Inbound { room, from, msg }))
+
+    /// Whether the connection is still open (its reader still running).
+    pub fn is_open(&self) -> bool {
+        !self.outbound.is_closed()
+    }
 }
 
-/// Parse a `[room][from][wire msg]` sync frame (`None` for presence or malformed).
+/// Parse a `[room][from][wire msg]` sync frame (`None` for presence, signals or malformed).
 #[cfg(test)]
 fn parse_frame(buf: &[u8]) -> Option<Inbound> {
     match parse(buf)? {
         Frame::Sync(inb) => Some(inb),
-        Frame::Presence { .. } => None,
+        _ => None,
     }
 }
 
@@ -181,7 +167,7 @@ impl Transport for WsTransport {
         if let Fanout::Clients = out.to {
             return Ok(());
         }
-        let frame = encode_frame(&room, &self.local_id, &out.msg);
+        let frame = sync_frame(&room, &self.local_id, &out.msg);
         let _ = self.outbound.unbounded_send(frame);
         Ok(())
     }
@@ -224,8 +210,9 @@ mod server {
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message as TMessage;
 
-    use super::{encode_frame, parse, presence_frame, Frame};
+    use crate::frame::{parse, presence_frame, signal_frame, sync_frame, Frame};
     use crate::presence::Presence;
+    use crate::signal::Signal;
     use crate::room::{Fanout, Outbound, PeerId};
     use crate::server::RoomId;
     use crate::transport::{Inbound, Transport};
@@ -251,6 +238,28 @@ mod server {
         Changed(RoomId, Presence),
         /// The room's last client here went: nobody here wants its presence any more.
         Emptied(RoomId),
+        /// A direct client here signals a direct peer of node `node` in the room: the
+        /// node relays it there.
+        Signal { room: RoomId, node: [u8; 32], signal: Signal },
+    }
+
+    /// What one peer shows in a room, and who said it (a connection here, or the node
+    /// that relayed it).
+    #[derive(Clone)]
+    struct Shown<By> {
+        by: By,
+        state: Vec<u8>,
+        direct: bool,
+    }
+
+    impl<By> Shown<By> {
+        fn here(&self, peer: &[u8]) -> Presence {
+            Presence::Here { peer: peer.to_vec(), state: self.state.clone(), direct: self.direct }
+        }
+
+        fn same(&self, p: &Presence) -> bool {
+            matches!(p, Presence::Here { state, direct, .. } if *state == self.state && *direct == self.direct)
+        }
     }
 
     #[derive(Default)]
@@ -258,9 +267,11 @@ mod server {
         /// the connections in each room (that have framed to it)
         rooms: HashMap<RoomId, HashMap<ConnId, UnboundedSender<Vec<u8>>>>,
         /// what each client here shows, by room and peer, with the connection that said it
-        local: HashMap<RoomId, HashMap<Vec<u8>, (ConnId, Vec<u8>)>>,
+        local: HashMap<RoomId, HashMap<Vec<u8>, Shown<ConnId>>>,
         /// what other nodes' clients show, by room and peer, with the node that relayed it
-        remote: HashMap<RoomId, HashMap<Vec<u8>, ([u8; 32], Vec<u8>)>>,
+        remote: HashMap<RoomId, HashMap<Vec<u8>, Shown<[u8; 32]>>>,
+        /// what this server tells its clients about connecting directly ([`Signal::Config`])
+        config: Option<Vec<u8>>,
         events: Option<UnboundedSender<PresenceEvent>>,
     }
 
@@ -315,8 +326,32 @@ mod server {
                 .get(&room)
                 .into_iter()
                 .flatten()
-                .map(|(peer, (_, state))| Presence::Here { peer: peer.clone(), state: state.clone() })
+                .map(|(peer, shown)| shown.here(peer))
                 .collect()
+        }
+
+        /// Tell every client coming into a room `config` about connecting directly
+        /// ([`Signal::Config`]: opaque here, the operator's choice); `None` tells nothing.
+        pub fn set_direct_config(&self, config: Option<Vec<u8>>) {
+            self.hub.lock().unwrap().config = config.filter(|c| Signal::Config { data: c.clone() }.fits());
+        }
+
+        /// Node `node` relays a signal from one of its direct clients in `room` to one
+        /// here: delivered when the sender is a direct peer that node relays and the
+        /// addressee a direct client here, else dropped.
+        pub fn signal(&self, room: RoomId, node: [u8; 32], signal: Signal) {
+            let Signal::Peer { from, to, .. } = &signal else { return };
+            if !signal.fits() {
+                return;
+            }
+            let hub = self.hub.lock().unwrap();
+            if !hub.remote.get(&room).and_then(|r| r.get(from)).is_some_and(|s| s.by == node && s.direct) {
+                return;
+            }
+            let Some(target) = hub.local.get(&room).and_then(|l| l.get(to)).filter(|s| s.direct) else { return };
+            if let Some(tx) = hub.rooms.get(&room).and_then(|conns| conns.get(&target.by)) {
+                let _ = tx.unbounded_send(signal_frame(&room, &self.local_id, &signal));
+            }
         }
 
         /// Whether a client here is in `room` now.
@@ -343,14 +378,14 @@ mod server {
                 }
                 let remote = hub.remote.entry(room).or_default();
                 match &p {
-                    Presence::Here { peer, state } => {
-                        if remote.get(peer).is_some_and(|(_, shown)| shown == state) {
+                    Presence::Here { peer, state, direct } => {
+                        if remote.get(peer).is_some_and(|shown| shown.same(&p)) {
                             continue;
                         }
-                        remote.insert(peer.clone(), (node, state.clone()));
+                        remote.insert(peer.clone(), Shown { by: node, state: state.clone(), direct: *direct });
                     }
                     Presence::Gone { peer } => {
-                        if !remote.get(peer).is_some_and(|(from, _)| *from == node) {
+                        if !remote.get(peer).is_some_and(|shown| shown.by == node) {
                             continue;
                         }
                         remote.remove(peer);
@@ -370,7 +405,7 @@ mod server {
                     .get(&room)
                     .into_iter()
                     .flatten()
-                    .filter(|(peer, (from, _))| *from == node && !listed.contains(*peer))
+                    .filter(|(peer, shown)| shown.by == node && !listed.contains(*peer))
                     .map(|(peer, _)| Presence::Gone { peer: peer.clone() })
                     .collect()
             };
@@ -390,10 +425,12 @@ mod server {
             let conns = hub.rooms.entry(room).or_default();
             let first = conns.is_empty();
             conns.insert(conn, tx.clone());
-            let local = hub.local.get(&room).into_iter().flatten().map(|(peer, (_, state))| (peer, state));
-            let remote = hub.remote.get(&room).into_iter().flatten().map(|(peer, (_, state))| (peer, state));
-            for (peer, state) in local.chain(remote) {
-                let p = Presence::Here { peer: peer.clone(), state: state.clone() };
+            if let Some(config) = &hub.config {
+                let _ = tx.unbounded_send(signal_frame(&room, &self.local_id, &Signal::Config { data: config.clone() }));
+            }
+            let local = hub.local.get(&room).into_iter().flatten().map(|(peer, shown)| shown.here(peer));
+            let remote = hub.remote.get(&room).into_iter().flatten().map(|(peer, shown)| shown.here(peer));
+            for p in local.chain(remote) {
                 let _ = tx.unbounded_send(presence_frame(&room, &self.local_id, &p));
             }
             if first {
@@ -409,14 +446,14 @@ mod server {
             let mut hub = self.hub.lock().unwrap();
             let local = hub.local.entry(room).or_default();
             match &p {
-                Presence::Here { peer, state } => {
-                    if local.get(peer).is_some_and(|(_, shown)| shown == state) {
+                Presence::Here { peer, state, direct } => {
+                    if local.get(peer).is_some_and(|shown| shown.by == conn && shown.same(&p)) {
                         return;
                     }
-                    local.insert(peer.clone(), (conn, state.clone()));
+                    local.insert(peer.clone(), Shown { by: conn, state: state.clone(), direct: *direct });
                 }
                 Presence::Gone { peer } => {
-                    if !local.get(peer).is_some_and(|(by, _)| *by == conn) {
+                    if !local.get(peer).is_some_and(|shown| shown.by == conn) {
                         return;
                     }
                     local.remove(peer);
@@ -424,6 +461,34 @@ mod server {
             }
             hub.fan(&self.local_id, &room, &p, Some(conn));
             hub.event(PresenceEvent::Changed(room, p));
+        }
+
+        /// Connection `conn` signals in `room`: routed to the one peer addressed, here
+        /// or through the node relaying it, when the sender is a direct peer this
+        /// connection shows in the room and the addressee a direct peer in it too; else
+        /// dropped. Nothing is kept.
+        fn signalled(&self, conn: ConnId, room: RoomId, signal: Signal) {
+            let Signal::Peer { from, to, .. } = &signal else { return };
+            if !signal.fits() {
+                return;
+            }
+            let mut hub = self.hub.lock().unwrap();
+            if !hub.local.get(&room).and_then(|l| l.get(from)).is_some_and(|s| s.by == conn && s.direct) {
+                return;
+            }
+            if let Some(target) = hub.local.get(&room).and_then(|l| l.get(to)) {
+                if target.direct {
+                    if let Some(tx) = hub.rooms.get(&room).and_then(|conns| conns.get(&target.by)) {
+                        let _ = tx.unbounded_send(signal_frame(&room, &self.local_id, &signal));
+                    }
+                }
+                return;
+            }
+            let node = match hub.remote.get(&room).and_then(|r| r.get(to)) {
+                Some(target) if target.direct => target.by,
+                _ => return,
+            };
+            hub.event(PresenceEvent::Signal { room, node, signal });
         }
 
         /// Connection `conn` closed: the peers it showed left its `rooms`.
@@ -438,7 +503,7 @@ mod server {
                     .get(room)
                     .into_iter()
                     .flatten()
-                    .filter(|(_, (by, _))| *by == conn)
+                    .filter(|(_, shown)| shown.by == conn)
                     .map(|(peer, _)| peer.clone())
                     .collect();
                 for peer in gone {
@@ -521,7 +586,7 @@ mod server {
                             let Some(frame) = parse(&data) else { continue };
                             let (room, from) = match &frame {
                                 Frame::Sync(inb) => (inb.room, inb.from),
-                                Frame::Presence { room, from, .. } => (*room, *from),
+                                Frame::Presence { room, from, .. } | Frame::Signal { room, from, .. } => (*room, *from),
                             };
                             if registered.is_none() {
                                 conns_conn.lock().unwrap().insert(from, out_tx.clone());
@@ -542,6 +607,7 @@ mod server {
                                     }
                                 }
                                 Frame::Presence { presence, .. } => presence_conn.said(conn, room, presence),
+                                Frame::Signal { signal, .. } => presence_conn.signalled(conn, room, signal),
                             }
                         }
                         // Gone: no longer a client to relay to, nor present in its rooms.
@@ -597,7 +663,7 @@ mod server {
         type Error = Infallible;
 
         fn dispatch(&mut self, room: RoomId, out: Outbound) -> Result<(), Infallible> {
-            let frame = encode_frame(&room, &self.local_id, &out.msg);
+            let frame = sync_frame(&room, &self.local_id, &out.msg);
             let conns = self.conns.lock().unwrap();
             match out.to {
                 Fanout::Peer(p) => {
@@ -644,18 +710,19 @@ pub use server::{PresenceEvent, PresenceHub, WsServerTransport};
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::sync::SyncMessage;
     use futures::{SinkExt as _, StreamExt as _};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
-    /// The wire frame round-trips through the real `encode_frame`/`parse_frame` code
+    /// The wire frame round-trips through the real `sync_frame`/`parse_frame` code
     /// path. Sandbox-safe (no socket), so it always runs — this is what guarantees the
     /// framing even where the WebSocket test below can't bind a port.
     #[test]
     fn frame_codec_round_trips() {
         let room: RoomId = [9u8; 32];
         let from: PeerId = [1u8; 32];
-        let frame = encode_frame(&room, &from, &SyncMessage::Have { writer: [3u8; 32], length: 7 });
+        let frame = sync_frame(&room, &from, &SyncMessage::Have { writer: [3u8; 32], length: 7 });
 
         let inb = parse_frame(&frame).expect("a well-formed frame parses");
         assert_eq!(inb.room, room, "room id survives encode→parse");
@@ -888,7 +955,7 @@ mod tests {
     }
 
     fn here(peer: &str, state: &str) -> Presence {
-        Presence::Here { peer: peer.as_bytes().to_vec(), state: state.as_bytes().to_vec() }
+        Presence::Here { peer: peer.as_bytes().to_vec(), state: state.as_bytes().to_vec(), direct: false }
     }
 
     /// Presence reaches only the clients in its room (a newcomer is told who is there
@@ -973,5 +1040,114 @@ mod tests {
         assert_eq!(seen.iter().filter(|e| **e == PresenceEvent::Entered(room)).count(), 1, "a room is entered once");
         assert!(!seen.iter().any(|e| matches!(e, PresenceEvent::Changed(_, p) if p.peer() == b"x")), "relayed presence is not echoed back out");
         assert!(!hub.has_clients(room), "nobody is left in the room");
+    }
+
+    async fn wait_for_signals(t: &mut WsTransport, n: usize) -> Vec<(RoomId, Signal)> {
+        let mut v = Vec::new();
+        for _ in 0..100 {
+            v.extend(t.drain_signals());
+            if v.len() >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        v
+    }
+
+    fn direct(peer: &str) -> Presence {
+        Presence::Here { peer: peer.as_bytes().to_vec(), state: vec![], direct: true }
+    }
+
+    fn signal(from: &str, to: &str, data: &str) -> Signal {
+        Signal::Peer { from: from.as_bytes().to_vec(), to: to.as_bytes().to_vec(), data: data.as_bytes().to_vec() }
+    }
+
+    /// Signals reach only the one peer addressed, within the room, and only between
+    /// two direct peers: a relay-only peer is never signalled and signals nobody, a
+    /// sender cannot speak for a peer another connection shows, nothing reaches the
+    /// driver, and a signal for another node's peer goes to that node (and theirs
+    /// comes back only from the node relaying the sender). A newcomer is told the
+    /// server's direct configuration first.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn server_routes_signals_only_between_direct_peers_in_a_room() {
+        let node: [u8; 32] = [4u8; 32];
+        let mut server = WsServerTransport::bind("127.0.0.1:0".parse().unwrap(), [9u8; 32]).await.unwrap();
+        let hub = server.presence();
+        hub.set_direct_config(Some(b"ice".to_vec()));
+        let mut events = hub.events();
+        let url = format!("ws://{}", server.local_addr());
+        let (room, other): (RoomId, RoomId) = ([7u8; 32], [8u8; 32]);
+        let mut a = WsTransport::connect(&url, [1u8; 32]).await.unwrap();
+        let mut b = WsTransport::connect(&url, [2u8; 32]).await.unwrap();
+        let mut c = WsTransport::connect(&url, [3u8; 32]).await.unwrap();
+        let mut d = WsTransport::connect(&url, [5u8; 32]).await.unwrap();
+        a.send_presence(room, &direct("a"));
+        b.send_presence(room, &direct("b"));
+        c.send_presence(room, &here("c", "relay only"));
+        d.send_presence(other, &direct("d"));
+        // everyone is told the configuration, then who is there
+        for t in [&mut a, &mut b, &mut c, &mut d] {
+            let got = wait_for_signals(t, 1).await;
+            assert!(matches!(&got[..], [(_, Signal::Config { data })] if data == b"ice"), "told the config: {got:?}");
+        }
+        assert_eq!(wait_for_presence(&mut c, 2).await.len(), 2, "C sees A and B");
+
+        // A to B: B alone hears it
+        a.send_signal(room, &signal("a", "b", "offer"));
+        assert_eq!(wait_for_signals(&mut b, 1).await, vec![(room, signal("a", "b", "offer"))]);
+        // to a relay-only peer, from one, for a peer in another room, or as someone else: dropped
+        a.send_signal(room, &signal("a", "c", "offer"));
+        c.send_signal(room, &signal("c", "a", "offer"));
+        a.send_signal(room, &signal("a", "d", "offer"));
+        a.send_signal(other, &signal("a", "d", "offer"));
+        c.send_signal(room, &signal("b", "a", "spoofed"));
+        b.send_signal(room, &signal("b", "a", "answer"));
+        // (A framing to the other room entered it: it is told the config there)
+        let peers_only = |v: Vec<(RoomId, Signal)>| v.into_iter().filter(|(_, s)| matches!(s, Signal::Peer { .. })).collect::<Vec<_>>();
+        assert_eq!(peers_only(wait_for_signals(&mut a, 2).await), vec![(room, signal("b", "a", "answer"))], "A hears B's answer only");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        for t in [&mut a, &mut b, &mut c, &mut d] {
+            assert!(peers_only(t.drain_signals()).is_empty(), "nothing else was delivered");
+        }
+        assert!(server.drain_inbound().is_empty(), "signals never reach the driver, nor the room's log");
+
+        // another node's peers: relayed out to that node, and back in only from it
+        hub.relay(room, node, vec![direct("x"), here("y", "relay only")]);
+        a.send_signal(room, &signal("a", "x", "offer"));
+        a.send_signal(room, &signal("a", "y", "offer"));
+        let mut relayed = Vec::new();
+        for _ in 0..100 {
+            while let Ok(event) = events.try_recv() {
+                if let PresenceEvent::Signal { .. } = event {
+                    relayed.push(event);
+                }
+            }
+            if !relayed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        while let Ok(event) = events.try_recv() {
+            if let PresenceEvent::Signal { .. } = event {
+                relayed.push(event);
+            }
+        }
+        assert_eq!(relayed, vec![PresenceEvent::Signal { room, node, signal: signal("a", "x", "offer") }], "only the direct peer's signal goes out, to its node");
+        hub.signal(room, [6u8; 32], signal("x", "a", "not its node"));
+        hub.signal(room, node, signal("y", "a", "relay only"));
+        hub.signal(room, node, signal("x", "c", "to relay only"));
+        hub.signal(room, node, signal("x", "a", "answer"));
+        assert_eq!(wait_for_signals(&mut a, 1).await, vec![(room, signal("x", "a", "answer"))]);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(a.drain_signals().is_empty() && c.drain_signals().is_empty(), "the rest was dropped");
+
+        // A turns relay-only: it is signalled no more
+        a.send_presence(room, &here("a", "relay only now"));
+        assert!(!wait_for_presence(&mut b, 3).await.is_empty());
+        b.send_signal(room, &signal("b", "a", "offer"));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(a.drain_signals().is_empty(), "a relay-only peer is not signalled");
     }
 }

@@ -8,6 +8,11 @@
 //!
 //! A peer is named by a short key of the client's own choosing (a random id per open
 //! page, say), not by a writer key: one identity may be present several times.
+//!
+//! A peer that is `direct` takes [signals](crate::signal) for a connection of its own
+//! with the room's other direct peers (a WebRTC data channel, say); a peer that is not
+//! is never signalled and signals nobody — everything it says and hears goes through
+//! its server.
 
 use codec::varint;
 
@@ -26,8 +31,9 @@ const T_GONE: u64 = 0x11;
 /// One peer's presence in a room, as it changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Presence {
-    /// `peer` is in the room, showing `state` (replacing what it showed before).
-    Here { peer: Vec<u8>, state: Vec<u8> },
+    /// `peer` is in the room, showing `state` (replacing what it showed before);
+    /// `direct`: it takes signals for direct connections with the room's other peers.
+    Here { peer: Vec<u8>, state: Vec<u8>, direct: bool },
     /// `peer` left the room.
     Gone { peer: Vec<u8> },
 }
@@ -43,7 +49,7 @@ impl Presence {
     /// Whether the message is within the size limits ([`MAX_PEER`], [`MAX_STATE`]).
     pub fn fits(&self) -> bool {
         match self {
-            Self::Here { peer, state } => !peer.is_empty() && peer.len() <= MAX_PEER && state.len() <= MAX_STATE,
+            Self::Here { peer, state, .. } => !peer.is_empty() && peer.len() <= MAX_PEER && state.len() <= MAX_STATE,
             Self::Gone { peer } => !peer.is_empty() && peer.len() <= MAX_PEER,
         }
     }
@@ -100,10 +106,11 @@ pub fn decode_all(mut b: &[u8]) -> Result<Vec<Presence>, WireError> {
 
 fn write(out: &mut Vec<u8>, p: &Presence) {
     match p {
-        Presence::Here { peer, state } => {
+        Presence::Here { peer, state, direct } => {
             varint::write(out, T_HERE);
             wr_bytes(out, peer);
             wr_bytes(out, state);
+            varint::write(out, u64::from(*direct));
         }
         Presence::Gone { peer } => {
             varint::write(out, T_GONE);
@@ -117,19 +124,24 @@ fn read(b: &mut &[u8]) -> Result<Presence, WireError> {
         T_HERE => {
             let peer = rd_bytes(b, MAX_PEER)?;
             let state = rd_bytes(b, MAX_STATE)?;
-            Ok(Presence::Here { peer, state })
+            let direct = match rd_u64(b)? {
+                0 => false,
+                1 => true,
+                other => return Err(WireError::BadTag(other)),
+            };
+            Ok(Presence::Here { peer, state, direct })
         }
         T_GONE => Ok(Presence::Gone { peer: rd_bytes(b, MAX_PEER)? }),
         other => Err(WireError::BadTag(other)),
     }
 }
 
-fn wr_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn wr_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     varint::write(out, bytes.len() as u64);
     out.extend_from_slice(bytes);
 }
 
-fn rd_bytes(b: &mut &[u8], max: usize) -> Result<Vec<u8>, WireError> {
+pub(crate) fn rd_bytes(b: &mut &[u8], max: usize) -> Result<Vec<u8>, WireError> {
     let n = rd_u64(b)? as usize;
     if n > max || b.len() < n {
         return Err(WireError::Eof);
@@ -139,7 +151,7 @@ fn rd_bytes(b: &mut &[u8], max: usize) -> Result<Vec<u8>, WireError> {
     Ok(head.to_vec())
 }
 
-fn rd_u64(b: &mut &[u8]) -> Result<u64, WireError> {
+pub(crate) fn rd_u64(b: &mut &[u8]) -> Result<u64, WireError> {
     varint::read(b).map_err(|_| WireError::Varint)
 }
 
@@ -149,7 +161,7 @@ mod tests {
 
     #[test]
     fn presence_round_trips_and_is_told_from_sync() {
-        let here = Presence::Here { peer: b"tab-1".to_vec(), state: br#"{"cursor":1}"#.to_vec() };
+        let here = Presence::Here { peer: b"tab-1".to_vec(), state: br#"{"cursor":1}"#.to_vec(), direct: true };
         let gone = Presence::Gone { peer: b"tab-2".to_vec() };
         assert_eq!(decode(&encode(&here)).unwrap(), here);
         assert_eq!(decode(&encode(&gone)).unwrap(), gone);
@@ -158,7 +170,7 @@ mod tests {
         let sync = crate::wire::encode(&crate::SyncMessage::Have { writer: [1; 32], length: 2 });
         assert!(!is_presence(&sync), "a sync message is not presence");
         assert!(decode(&encode(&here)[..4]).is_err(), "a truncated message is refused");
-        let big = Presence::Here { peer: vec![1; MAX_PEER + 1], state: vec![] };
+        let big = Presence::Here { peer: vec![1; MAX_PEER + 1], state: vec![], direct: false };
         assert!(decode(&encode(&big)).is_err(), "an oversized peer key is refused");
     }
 }
