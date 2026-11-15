@@ -6,7 +6,8 @@
 //! driver feeds it inbound `(PeerId, SyncMessage)` and ships the [`Outbound`]s it
 //! returns; the node and the browser share this exact code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use autobase::{AddError, Linearizer, NodeId, WriterKey};
 use codec::Codec;
@@ -14,6 +15,7 @@ use hypercore::{Hypercore, Replica, SignedHead};
 use identity::PublicKey;
 use storage::Store;
 
+use crate::authority::Authority;
 use crate::config::{Origin, RoomConfig};
 use crate::entry::{Entry, EntryCodec};
 use crate::projection::Projection;
@@ -140,6 +142,13 @@ pub struct Room<F: StoreFactory, P: Projection> {
     /// drops finalized entries refolds the finalized state from.
     genesis_proj: P,
 
+    /// Set when the room is gated (see [`authority`](crate::authority)).
+    authority: Option<Arc<dyn Authority>>,
+    /// Finalized entries no authority has settled yet, in the confirmed order.
+    awaiting: Vec<NodeId>,
+    /// Finalized entries an authority refused.
+    refused: BTreeSet<NodeId>,
+
     /// Monotone logical activity counter (bumped on every append/ingest). The
     /// driver reads it to time stale-eviction of replicated rooms.
     last_activity: u64,
@@ -199,6 +208,9 @@ where
             finalized_proj: projection,
             finalized_len: 0,
             finalized_since_poll: Vec::new(),
+            authority: None,
+            awaiting: Vec::new(),
+            refused: BTreeSet::new(),
             last_activity: 0,
         };
 
@@ -222,6 +234,39 @@ where
         // Rebuild the DAG + projections deterministically from the reopened cores.
         room.replay()?;
         Ok(room)
+    }
+
+    /// Gate the room on `authority`'s verdicts (see [`authority`](crate::authority)),
+    /// or lift the gate with `None`. The finalized state is refolded from the start
+    /// under the new rule, so call this straight after [`open`](Self::open), before
+    /// draining [`poll_finalized`](Self::poll_finalized): deltas not yet drained are
+    /// dropped, as on a reopen. Every replica of a room must be gated alike.
+    pub fn set_authority(&mut self, authority: Option<Arc<dyn Authority>>) -> Result<(), Error<StoreErr<F>>> {
+        self.authority = authority;
+        self.finalized_proj = self.genesis_proj.clone();
+        self.finalized_len = 0;
+        self.awaiting.clear();
+        self.refused.clear();
+        self.advance()?;
+        self.finalized_since_poll.clear();
+        Ok(())
+    }
+
+    /// Is the room gated on an authority's verdicts?
+    pub fn is_gated(&self) -> bool {
+        self.authority.is_some()
+    }
+
+    /// In a gated room: the finalized entries no authority has settled yet, in the
+    /// confirmed order — what an authority has left to decide, and what a client may
+    /// show as pending. Always empty in a room that is not gated.
+    pub fn awaiting(&self) -> &[NodeId] {
+        &self.awaiting
+    }
+
+    /// In a gated room: did an authority refuse the finalized entry `node`?
+    pub fn is_refused(&self, node: &NodeId) -> bool {
+        self.refused.contains(node)
     }
 
     /// This node's writer key.
@@ -585,11 +630,21 @@ where
         if dropped > 0 {
             // refold the finalized state up to what still stands
             self.finalized_proj = self.genesis_proj.clone();
+            self.awaiting.clear();
+            self.refused.clear();
             for node in &after[..kept] {
                 let payload = self.payloads.get(node).cloned().unwrap_or_default();
                 if !payload.is_empty() {
                     // a refused op takes no effect (see `advance`)
-                    let _ = self.finalized_proj.apply(*node, &payload);
+                    fold(
+                        self.authority.as_deref(),
+                        &mut self.finalized_proj,
+                        &self.payloads,
+                        &mut self.awaiting,
+                        &mut self.refused,
+                        *node,
+                        &payload,
+                    );
                 }
             }
             self.finalized_len = kept;
@@ -848,7 +903,15 @@ where
                     // no effect: it stays in the confirmed order, which cannot change, and
                     // every replica skips it alike. Failing here instead would let one bad
                     // entry from any writer stop the room from finalizing — or reopening.
-                    let _ = self.finalized_proj.apply(node, &payload);
+                    fold(
+                        self.authority.as_deref(),
+                        &mut self.finalized_proj,
+                        &self.payloads,
+                        &mut self.awaiting,
+                        &mut self.refused,
+                        node,
+                        &payload,
+                    );
                 }
                 self.finalized_since_poll.push(Finalized {
                     node,
@@ -867,14 +930,75 @@ where
             order.len() >= self.finalized_len,
             "finalized must be a prefix of order"
         );
+        // In a gated room the live view settles the tail by the verdicts already in
+        // it, then shows whatever is still waiting as if it were accepted next.
+        let mut awaiting = self.awaiting.clone();
+        let mut refused = BTreeSet::new();
         for node in &order[self.finalized_len..] {
             let payload = self.payloads.get(node).cloned().unwrap_or_default();
             if payload.is_empty() {
                 continue;
             }
             // Live is best-effort/optimistic; a tail apply error must not abort ingest.
-            let _ = self.live_proj.apply(*node, &payload);
+            fold(
+                self.authority.as_deref(),
+                &mut self.live_proj,
+                &self.payloads,
+                &mut awaiting,
+                &mut refused,
+                *node,
+                &payload,
+            );
+        }
+        for node in awaiting {
+            if let Some(payload) = self.payloads.get(&node) {
+                let _ = self.live_proj.apply(node, payload);
+            }
         }
         Ok(())
+    }
+}
+
+/// Fold one non-empty entry at its place in the order.
+///
+/// Without an authority the projection decides alone: an op it refuses takes no
+/// effect and the fold goes on. With one the room is gated: an authority's verdict
+/// settles the entries it names — the accepted ones take effect here, in the order
+/// the verdict lists them — an authority's other entries take effect where they
+/// stand, and anyone else's entry waits in `awaiting` for a verdict.
+fn fold<P: Projection>(
+    authority: Option<&dyn Authority>,
+    proj: &mut P,
+    payloads: &BTreeMap<NodeId, Vec<u8>>,
+    awaiting: &mut Vec<NodeId>,
+    refused: &mut BTreeSet<NodeId>,
+    node: NodeId,
+    payload: &[u8],
+) {
+    let Some(authority) = authority else {
+        let _ = proj.apply(node, payload);
+        return;
+    };
+    if !authority.is_authority(&node.key) {
+        awaiting.push(node);
+        return;
+    }
+    let Some(verdict) = authority.verdict(payload) else {
+        let _ = proj.apply(node, payload);
+        return;
+    };
+    for id in verdict.accept {
+        if let Some(at) = awaiting.iter().position(|waiting| *waiting == id) {
+            awaiting.remove(at);
+            if let Some(accepted) = payloads.get(&id) {
+                let _ = proj.apply(id, accepted);
+            }
+        }
+    }
+    for id in verdict.refuse {
+        if let Some(at) = awaiting.iter().position(|waiting| *waiting == id) {
+            awaiting.remove(at);
+            refused.insert(id);
+        }
     }
 }

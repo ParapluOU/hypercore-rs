@@ -2208,3 +2208,37 @@ record, and dials by key land on the wrong one.
 - `needs_checkpoint` is false when the only head is the writer's own latest entry. Stalled
   confirmation no longer adds a checkpoint per poll (seen live: ~20/s per node, CPU-bound nodes).
 - Test: a stalled room is checkpointed once per new entry, not per call.
+
+## roomnet: rooms gated on an authority's verdicts (ADR-0055)
+
+**Did**
+- `authority` module: the `Authority` trait and `Verdict`. `Room::set_authority`, `is_gated`,
+  `awaiting`, `is_refused`; `RoomServer::with_authorities` names one per room.
+- One `fold` for the finalized fold, the reconfiguration refold and the live tail: ungated it is
+  the projection alone, as before; gated, a non-authority entry waits for a verdict and takes
+  effect at the verdict's position.
+- `testkit`: `KeyAuthority` and the `verdict` op encoder.
+- Tests: waiting and optimistic display, acceptance, refusal (and that it stands), the verdict's
+  order, authority-only settling, and that a refold reproduces the settled state.
+
+**Decisions**
+- Settle at the verdict's position, not the entry's: nothing folded is ever undone, and the result
+  is defined by the order alone, not by how the finalized prefix grew on one replica.
+
+**Next**
+- A gated room's `Finalized` deltas still report each entry at its own position; a sink that
+  wants effects must apply the same `Authority`. A delta that says "took effect here" would spare
+  it that.
+
+## roomnet: admission on the WebSocket server (ADR-0056)
+
+**Did**
+- `admission` module: `Admission`, `ConnectRequest`, `Grant`, `Access`.
+  `WsServerTransport::bind_with_admission`; `bind` is unchanged.
+- The handshake asks `connect` (a refusal answers 403); each connection's first frame to a room
+  asks `access`, kept for the connection's life; a reader's `Block` and `Head` frames are dropped.
+- Tests: the per-frame gate without a socket; refusal at the handshake and per-room limits over a
+  real WebSocket.
+
+**Next**
+- Withdrawing access mid-connection; admission for the Iroh transport.

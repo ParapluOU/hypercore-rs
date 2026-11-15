@@ -10,7 +10,7 @@ use crate::entry::{Entry, EntryCodec};
 use crate::room::Room;
 use crate::store::MemStoreFactory;
 use crate::sync::SyncMessage;
-use crate::testkit::{del, put, CounterProjection, KvProjection};
+use crate::testkit::{del, put, verdict, CounterProjection, KeyAuthority, KvProjection};
 use crate::wire;
 use autobase::NodeId;
 
@@ -571,4 +571,153 @@ fn non_indexer_writes_finalize_once_an_indexer_references_them() {
             "the client's entry is finalized on both replicas"
         );
     }
+}
+
+/// A gated pair: `authority` is the sole indexer and the room's authority; `client`
+/// is an ordinary writer. Returns `(authority room, its key, client room, its key)`.
+fn gated_pair(
+    authority: u8,
+    client: u8,
+) -> (Room<MemStoreFactory, KvProjection>, [u8; 32], Room<MemStoreFactory, KvProjection>, [u8; 32]) {
+    let (s, c) = (seed(authority), seed(client));
+    let sk = s.public().to_bytes();
+    let gate = || Some(std::sync::Arc::new(KeyAuthority::new([sk])) as std::sync::Arc<dyn crate::Authority>);
+    let mut rs = Room::open(RoomConfig::original(s, vec![sk]), MemStoreFactory, KvProjection::new()).unwrap();
+    rs.set_authority(gate()).unwrap();
+    let mut rc = Room::open(RoomConfig::original(c, vec![sk]), MemStoreFactory, KvProjection::new()).unwrap();
+    rc.set_authority(gate()).unwrap();
+    let ck = rc.local_key();
+    (rs, sk, rc, ck)
+}
+
+fn value<'a>(state: &'a std::collections::BTreeMap<Vec<u8>, Vec<u8>>, key: &[u8]) -> Option<&'a [u8]> {
+    state.get(key).map(Vec::as_slice)
+}
+
+#[test]
+fn a_gated_entry_waits_for_the_authority_and_is_shown_optimistically() {
+    let (mut rs, sk, mut rc, ck) = gated_pair(21, 22);
+
+    let outs = rc.local_append(&put(b"k", b"from-client")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let entry = NodeId::new(ck, 0);
+
+    // Unsettled: no effect on the finalized state anywhere, but the live view shows it.
+    for room in [&rs, &rc] {
+        assert!(value(room.snapshot_finalized(), b"k").is_none(), "an unsettled entry takes no finalized effect");
+        assert_eq!(value(room.snapshot_live(), b"k"), Some(b"from-client".as_slice()), "it is shown optimistically");
+    }
+
+    // The authority accepts it: it takes effect on both replicas.
+    let outs = rs.local_append(&verdict(&[entry], &[])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    for room in [&rs, &rc] {
+        assert_eq!(value(room.snapshot_finalized(), b"k"), Some(b"from-client".as_slice()), "accepted entry is finalized");
+        assert!(room.awaiting().is_empty(), "nothing is left waiting");
+        assert!(!room.is_refused(&entry), "an accepted entry is not refused");
+    }
+}
+
+#[test]
+fn a_refused_entry_never_takes_effect_on_any_replica() {
+    let (mut rs, sk, mut rc, ck) = gated_pair(23, 24);
+
+    let outs = rc.local_append(&put(b"k", b"unwanted")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let entry = NodeId::new(ck, 0);
+    assert_eq!(value(rc.snapshot_live(), b"k"), Some(b"unwanted".as_slice()), "shown optimistically before the verdict");
+
+    let outs = rs.local_append(&verdict(&[], &[entry])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+
+    for room in [&rs, &rc] {
+        assert!(value(room.snapshot_finalized(), b"k").is_none(), "a refused entry takes no finalized effect");
+        assert!(value(room.snapshot_live(), b"k").is_none(), "nor is it shown any more");
+        assert!(room.is_refused(&entry), "the refusal is visible to the replica");
+        assert!(room.awaiting().is_empty(), "a refused entry is settled");
+    }
+
+    // The first verdict stands: accepting it afterwards changes nothing.
+    let outs = rs.local_append(&verdict(&[entry], &[])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    for room in [&rs, &rc] {
+        assert!(value(room.snapshot_finalized(), b"k").is_none(), "a later verdict does not revive a refused entry");
+    }
+}
+
+#[test]
+fn accepted_entries_take_effect_in_the_order_the_verdict_lists_them() {
+    let (mut rs, sk, mut rc, ck) = gated_pair(25, 26);
+
+    let outs = rc.local_append(&put(b"k", b"first")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let outs = rc.local_append(&put(b"k", b"second")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let (first, second) = (NodeId::new(ck, 0), NodeId::new(ck, 1));
+
+    // Listed second-then-first, so "first" is applied last and wins.
+    let outs = rs.local_append(&verdict(&[second, first], &[])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    for room in [&rs, &rc] {
+        assert_eq!(value(room.snapshot_finalized(), b"k"), Some(b"first".as_slice()), "the verdict's order decides");
+    }
+}
+
+#[test]
+fn an_authoritys_own_entries_need_no_verdict_and_only_it_can_settle() {
+    let (mut rs, sk, mut rc, ck) = gated_pair(27, 28);
+
+    // The authority's own op takes effect where it stands.
+    let outs = rs.local_append(&put(b"own", b"1")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    let outs = rs.local_append(&put(b"own2", b"2")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    for room in [&rs, &rc] {
+        assert_eq!(value(room.snapshot_finalized(), b"own"), Some(b"1".as_slice()), "an authority's op needs no verdict");
+    }
+
+    // A client cannot settle its own entry: its verdict-shaped op is just another
+    // entry waiting for the authority.
+    let outs = rc.local_append(&put(b"k", b"v")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let entry = NodeId::new(ck, 0);
+    let outs = rc.local_append(&verdict(&[entry], &[])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let forged = NodeId::new(ck, 1);
+    // An authority entry that is not a verdict confirms both without settling them.
+    let outs = rs.local_append(&put(b"own3", b"3")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    let outs = rs.local_append(&put(b"own4", b"4")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    for room in [&rs, &rc] {
+        assert!(value(room.snapshot_finalized(), b"k").is_none(), "a client's verdict settles nothing");
+        assert_eq!(room.awaiting(), [entry, forged].as_slice(), "both client entries wait, in the confirmed order");
+    }
+}
+
+#[test]
+fn a_gated_log_refolds_to_the_same_settled_state() {
+    let (mut rs, sk, mut rc, ck) = gated_pair(29, 30);
+    let gate = || Some(std::sync::Arc::new(KeyAuthority::new([sk])) as std::sync::Arc<dyn crate::Authority>);
+
+    let outs = rc.local_append(&put(b"kept", b"1")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let outs = rc.local_append(&put(b"dropped", b"2")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let outs = rs.local_append(&verdict(&[NodeId::new(ck, 0)], &[NodeId::new(ck, 1)])).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    let before = rs.snapshot_finalized().clone();
+    assert_eq!(value(&before, b"kept"), Some(b"1".as_slice()));
+    assert!(value(&before, b"dropped").is_none());
+
+    // Refolding the same log from the start under the same gate — what a reopen
+    // does — gives the same state, from the log alone.
+    rs.set_authority(gate()).unwrap();
+    assert_eq!(rs.snapshot_finalized(), &before, "a refold under the same gate is identical");
+    assert!(rs.is_refused(&NodeId::new(ck, 1)), "the refusal is rebuilt from the log");
+
+    // Lifting the gate gives the ungated fold: every entry takes effect where it stands.
+    rs.set_authority(None).unwrap();
+    assert_eq!(value(rs.snapshot_finalized(), b"dropped"), Some(b"2".as_slice()));
+    assert!(!rs.is_gated());
 }

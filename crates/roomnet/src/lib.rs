@@ -23,6 +23,8 @@
 //! 3. **deferred** — on autobase finality, fold the [`Projection`] and surface each
 //!    finalized mutation via [`Room::poll_finalized`] (Lane 3, throttled by the driver).
 
+pub mod admission;
+pub mod authority;
 pub mod config;
 pub mod driver;
 pub mod entry;
@@ -49,6 +51,8 @@ pub mod native;
 pub mod ws;
 
 pub use autobase::{NodeId, WriterKey};
+pub use admission::{Access, Admission, ConnectRequest, Grant};
+pub use authority::{Authority, Verdict};
 pub use config::{Origin, RoomConfig, ServerConfig};
 pub use driver::Driver;
 pub use entry::{Entry, EntryCodec};
@@ -56,7 +60,7 @@ pub use presence::Presence;
 pub use signal::Signal;
 pub use projection::Projection;
 pub use room::{Error, Fanout, FeedSnapshot, Finalized, Outbound, PeerId, Reconfigured, Room, StoreErr};
-pub use server::{RoomId, RoomServer};
+pub use server::{AuthorityProvider, RoomId, RoomServer};
 pub use store::{MemStoreFactory, StoreFactory};
 #[cfg(unix)]
 pub use store::{CachedFactory, CachedOpenError, DiskStoreFactory};

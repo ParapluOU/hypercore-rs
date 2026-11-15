@@ -207,9 +207,13 @@ mod server {
     use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    use tokio_tungstenite::tungstenite::http::StatusCode;
     use tokio_tungstenite::tungstenite::Message as TMessage;
 
+    use crate::admission::{Access, Admission, ConnectRequest, Grant};
+    use crate::sync::SyncMessage;
     use crate::frame::{parse, presence_frame, signal_frame, sync_frame, Frame};
     use crate::presence::Presence;
     use crate::signal::Signal;
@@ -524,6 +528,32 @@ mod server {
         }
     }
 
+    /// What a client presented in its opening request, for [`Admission::connect`].
+    fn connect_request(req: &Request) -> ConnectRequest {
+        ConnectRequest {
+            target: req.uri().path_and_query().map(|t| t.as_str().to_string()).unwrap_or_default(),
+            headers: req
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| Some((name.as_str().to_ascii_lowercase(), value.to_str().ok()?.to_string())))
+                .collect(),
+        }
+    }
+
+    /// May a connection with `access` to a frame's room have that frame handled?
+    /// A reader's blocks and head adverts are dropped; everything else it sends —
+    /// what it holds, what it wants, presence, signals — is how it follows the room.
+    pub(crate) fn admits(access: Access, frame: &Frame) -> bool {
+        match access {
+            Access::None => false,
+            Access::Write => true,
+            Access::Read => !matches!(
+                frame,
+                Frame::Sync(Inbound { msg: SyncMessage::Block { .. } | SyncMessage::Head { .. }, .. })
+            ),
+        }
+    }
+
     /// A native WebSocket server transport. See the type-level docs above the module.
     pub struct WsServerTransport {
         local_id: PeerId,
@@ -540,6 +570,24 @@ mod server {
         /// `local_id` is this node's id, stamped as `from` on every outbound frame.
         /// Pass a `:0` port to bind an ephemeral one; read it back via [`local_addr`](Self::local_addr).
         pub async fn bind(addr: std::net::SocketAddr, local_id: PeerId) -> std::io::Result<Self> {
+            Self::bind_inner(addr, local_id, None).await
+        }
+
+        /// Like [`bind`](Self::bind), but `admission` decides who may connect and what
+        /// each connection may do in a room (see [`admission`](crate::admission)).
+        pub async fn bind_with_admission(
+            addr: std::net::SocketAddr,
+            local_id: PeerId,
+            admission: Arc<dyn Admission>,
+        ) -> std::io::Result<Self> {
+            Self::bind_inner(addr, local_id, Some(admission)).await
+        }
+
+        async fn bind_inner(
+            addr: std::net::SocketAddr,
+            local_id: PeerId,
+            admission: Option<Arc<dyn Admission>>,
+        ) -> std::io::Result<Self> {
             let listener = TcpListener::bind(addr).await?;
             let local_addr = listener.local_addr()?;
             let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
@@ -556,7 +604,24 @@ mod server {
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else { break };
-                    let Ok(ws) = accept_async(tcp).await else { continue };
+                    // Admission at the handshake: a refused client never gets a socket.
+                    let mut grant: Option<Grant> = None;
+                    let admit = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                        let Some(admission) = &admission else { return Ok(resp) };
+                        match admission.connect(&connect_request(req)) {
+                            Some(g) => {
+                                grant = Some(g);
+                                Ok(resp)
+                            }
+                            None => {
+                                let mut refused = ErrorResponse::new(None);
+                                *refused.status_mut() = StatusCode::FORBIDDEN;
+                                Err(refused)
+                            }
+                        }
+                    };
+                    let Ok(ws) = accept_hdr_async(tcp, admit).await else { continue };
+                    let admitted = admission.clone().zip(grant);
                     let (mut sink, mut stream) = ws.split();
                     let (out_tx, mut out_rx) = mpsc::unbounded::<Vec<u8>>();
                     let conn: ConnId = next_conn.fetch_add(1, Ordering::Relaxed);
@@ -581,6 +646,7 @@ mod server {
                     tokio::spawn(async move {
                         let mut registered: Option<PeerId> = None;
                         let mut rooms: HashSet<RoomId> = HashSet::new();
+                        let mut access: HashMap<RoomId, Access> = HashMap::new();
                         while let Some(Ok(msg)) = stream.next().await {
                             let TMessage::Binary(data) = msg else { continue };
                             let Some(frame) = parse(&data) else { continue };
@@ -588,6 +654,25 @@ mod server {
                                 Frame::Sync(inb) => (inb.room, inb.from),
                                 Frame::Presence { room, from, .. } | Frame::Signal { room, from, .. } => (*room, *from),
                             };
+                            // What this connection may do in the room, decided once.
+                            if let Some((admission, grant)) = &admitted {
+                                let access = *access.entry(room).or_insert_with(|| admission.access(grant, &room));
+                                if !admits(access, &frame) {
+                                    if access == Access::None {
+                                        continue;
+                                    }
+                                    // A reader's block or advert: dropped, but it is in the room.
+                                    if registered.is_none() {
+                                        conns_conn.lock().unwrap().insert(from, out_tx.clone());
+                                        registered = Some(from);
+                                    }
+                                    if rooms.insert(room) {
+                                        present_conn.lock().unwrap().entry(room).or_default().insert(from);
+                                        presence_conn.enter(conn, &out_tx, room);
+                                    }
+                                    continue;
+                                }
+                            }
                             if registered.is_none() {
                                 conns_conn.lock().unwrap().insert(from, out_tx.clone());
                                 registered = Some(from);
@@ -1149,5 +1234,122 @@ mod tests {
         b.send_signal(room, &signal("b", "a", "offer"));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(a.drain_signals().is_empty(), "a relay-only peer is not signalled");
+    }
+
+    /// A toy admission: the token in the query names what the connection may do in
+    /// room `[7; 32]`; it may do nothing anywhere else, and no token is no connection.
+    struct TokenAdmission;
+
+    impl crate::admission::Admission for TokenAdmission {
+        fn connect(&self, request: &crate::admission::ConnectRequest) -> Option<Vec<u8>> {
+            let token = request.target.split_once("token=")?.1;
+            matches!(token, "reader" | "writer").then(|| token.as_bytes().to_vec())
+        }
+
+        fn access(&self, grant: &Vec<u8>, room: &RoomId) -> crate::admission::Access {
+            use crate::admission::Access;
+            match (room == &[7u8; 32], grant.as_slice()) {
+                (true, b"writer") => Access::Write,
+                (true, b"reader") => Access::Read,
+                _ => Access::None,
+            }
+        }
+    }
+
+    /// A genuine signed block frame's message, for the gate to judge.
+    fn a_block() -> SyncMessage {
+        use crate::entry::{Entry, EntryCodec};
+        let mut hc = hypercore::Hypercore::new(identity::SecretKey::from_seed(&[5u8; 32]), EntryCodec, storage::MemoryStore::new());
+        hc.append(&Entry::new(vec![], b"op".to_vec())).unwrap();
+        SyncMessage::Block {
+            writer: hc.public_key().to_bytes(),
+            head: hc.head().unwrap().clone(),
+            index: 0,
+            bytes: hc.block(0).unwrap().unwrap(),
+            proof: hc.proof(0).unwrap(),
+        }
+    }
+
+    /// What each level of access lets through. Sandbox-safe (no socket).
+    #[test]
+    fn access_decides_which_frames_are_handled() {
+        use crate::admission::Access;
+        use crate::frame::Frame;
+        let (room, from): (RoomId, PeerId) = ([7u8; 32], [1u8; 32]);
+        let sync = |msg| Frame::Sync(Inbound { room, from, msg });
+        let block = a_block();
+        let SyncMessage::Block { writer, head, .. } = block.clone() else { unreachable!() };
+        let frames = [
+            (sync(SyncMessage::Have { writer, length: 0 }), true),
+            (sync(SyncMessage::Want { writer, start: 0, end: 1 }), true),
+            (sync(SyncMessage::Head { writer, head }), false),
+            (sync(block), false),
+            (Frame::Presence { room, from, presence: Presence::Gone { peer: vec![1] } }, true),
+        ];
+        for (frame, a_reader_may) in &frames {
+            assert!(!server::admits(Access::None, frame), "no access handles nothing: {frame:?}");
+            assert!(server::admits(Access::Write, frame), "a writer's every frame is handled: {frame:?}");
+            assert_eq!(server::admits(Access::Read, frame), *a_reader_may, "a reader follows but does not write: {frame:?}");
+        }
+    }
+
+    /// A client the admission refuses gets no connection; one it admits does.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn admission_refuses_a_connection_at_the_handshake() {
+        let server = WsServerTransport::bind_with_admission("127.0.0.1:0".parse().unwrap(), [9u8; 32], std::sync::Arc::new(TokenAdmission))
+            .await
+            .unwrap();
+        let base = format!("ws://{}", server.local_addr());
+        assert!(WsTransport::connect(&base, [1u8; 32]).await.is_err(), "no token, no connection");
+        assert!(WsTransport::connect(&format!("{base}/?token=stranger"), [1u8; 32]).await.is_err(), "an unknown token is refused");
+        assert!(WsTransport::connect(&format!("{base}/?token=reader"), [1u8; 32]).await.is_ok(), "a known token is admitted");
+    }
+
+    /// Over a real WebSocket: a writer's block reaches the driver, a reader's does not
+    /// though the reader still hears the room, and a room a connection has no access
+    /// to neither takes its frames nor tells it anything.
+    #[tokio::test]
+    #[ignore = "binds a local TCP port; run outside a restricted sandbox"]
+    async fn admission_limits_what_a_connection_does_in_a_room() {
+        let mut server = WsServerTransport::bind_with_admission("127.0.0.1:0".parse().unwrap(), [9u8; 32], std::sync::Arc::new(TokenAdmission))
+            .await
+            .unwrap();
+        let base = format!("ws://{}", server.local_addr());
+        let (room, closed): (RoomId, RoomId) = ([7u8; 32], [8u8; 32]);
+        let mut writer = WsTransport::connect(&format!("{base}/?token=writer"), [1u8; 32]).await.unwrap();
+        let mut reader = WsTransport::connect(&format!("{base}/?token=reader"), [2u8; 32]).await.unwrap();
+        let gossip = |msg| Outbound { to: Fanout::Gossip, msg };
+
+        // The reader's block is dropped; its `Have` and the writer's block get through.
+        reader.dispatch(room, gossip(a_block())).unwrap();
+        reader.dispatch(room, gossip(SyncMessage::Have { writer: [2u8; 32], length: 0 })).unwrap();
+        writer.dispatch(room, gossip(a_block())).unwrap();
+        // Neither may do anything in the closed room.
+        writer.dispatch(closed, gossip(SyncMessage::Have { writer: [1u8; 32], length: 0 })).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got.extend(server.drain_inbound());
+            if got.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        got.extend(server.drain_inbound());
+        assert_eq!(got.len(), 2, "only the reader's Have and the writer's block reach the driver");
+        assert!(got.iter().all(|inb| inb.room == room), "nothing for the closed room gets through");
+        let blocks: Vec<_> = got.iter().filter(|inb| matches!(inb.msg, SyncMessage::Block { .. })).collect();
+        assert_eq!(blocks.len(), 1, "exactly one block was taken in");
+        assert_eq!(blocks[0].from, [1u8; 32], "and it is the writer's");
+        assert!(!server.seen_rooms().contains(&closed), "a room nobody may enter is never seen");
+
+        // Both are in the room, so both hear its gossip; the closed room tells no one.
+        server.dispatch(room, gossip(SyncMessage::Have { writer: [5u8; 32], length: 1 })).unwrap();
+        assert_eq!(wait_for_inbound(&mut reader).await.len(), 1, "the reader hears the room");
+        assert_eq!(wait_for_inbound(&mut writer).await.len(), 1, "the writer hears the room");
+        server.dispatch(closed, gossip(SyncMessage::Have { writer: [5u8; 32], length: 1 })).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(writer.drain_inbound().is_empty(), "nothing of the closed room reaches a client");
     }
 }

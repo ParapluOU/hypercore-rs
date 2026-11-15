@@ -1194,3 +1194,64 @@ room; one to or from a peer that is not direct, for another room, or claiming a 
 connection shows is dropped; none reaches the driver; another node's peer is reached through
 its node only, and what a node hands in is accepted only from the node relaying the sender.
 
+
+## ADR-0055 — roomnet: a room may be gated on an authority's verdicts
+
+**Status:** adopted. Upstream has no equivalent; an Autobase view applies every node it orders.
+
+**What:** A `Room` may be given an `Authority` (`Room::set_authority`, or per room through
+`RoomServer::with_authorities`). The application implements two pure questions: is this writer an
+authority, and is this payload — written by one — a `Verdict { accept, refuse }` naming earlier
+entries. In a gated room an entry by anyone else takes no effect where it stands: it waits
+(`Room::awaiting`) until a verdict names it, and then takes effect at the verdict's position, in
+the order the verdict lists it, or is dropped (`Room::is_refused`). An authority's other entries
+take effect where they stand. The first verdict on an entry stands; an id that is not waiting
+where the verdict stands is ignored. The live view applies the verdicts already in the unconfirmed
+tail and shows what is still waiting as if it were accepted next. A room without an authority
+folds exactly as before.
+
+**Why:** ADR-0051 lets the projection refuse an op, which covers every refusal a replica can
+reach alone from the state and the op. Some refusals cannot be reached that way: the check needs
+something only one party holds. Putting that party's decision into the log as an entry keeps the
+fold a pure function of the order — every replica settles the same entries the same way, on
+replay too, with no side channel. Settling at the verdict's position, not the entry's, means no
+replica ever has to undo an entry it already folded, and the result does not depend on how the
+finalized prefix happened to grow on a given replica. roomnet still never reads a payload: who the
+authorities are and what a verdict looks like are the application's, behind the trait.
+
+**Cost:** every entry in a gated room needs a verdict to take effect, so the authority writes
+roughly one entry per batch it settles (one id per settled entry). Every replica of a room must
+be gated alike, or they diverge.
+
+**Validation:** an unsettled entry has no finalized effect and is shown live; an accepted one
+takes effect on both replicas; a refused one never does and is reported refused, and a later
+verdict does not revive it; accepted entries apply in the verdict's order; an authority's own
+entries need no verdict and a non-authority's verdict settles nothing; refolding the same log
+under the same gate reproduces the state and the refusals.
+
+## ADR-0056 — roomnet: admission on the WebSocket server
+
+**Status:** adopted. Upstream has no equivalent at this layer.
+
+**What:** `WsServerTransport::bind_with_admission` takes an `Admission`. At the handshake the
+application sees what the client presented (`ConnectRequest`: request target and headers) and
+returns a `Grant` — opaque bytes of its own — or refuses, which answers `403 Forbidden`. The first
+time a connection frames to a room the application is asked for its `Access` there: `None` (its
+frames for the room are dropped and it is not registered in it, so it hears nothing of it),
+`Read` (it follows the room — `Have`, `Want`, presence, signals — but its `Block` and `Head`
+frames are dropped) or `Write`. The answer is kept for the connection's life. `bind` is unchanged
+and admits everyone.
+
+**Why:** signatures make the log sound but say nothing about who may reach a server, read a room
+through it, or have their blocks stored by it. Until now that needed a second listener in front of
+the server. How a client proves who it is — a token, a cookie, a signed request — is the
+application's; roomnet only carries what was presented and enforces the answer per frame.
+
+**Limits:** the `from` peer id in a frame is still the sender's own claim. Access is decided once
+per connection and room, so withdrawing it takes effect when the client reconnects. Admission
+covers the WebSocket server only.
+
+**Validation:** which frames each level of access lets through (no socket); over a real
+WebSocket, a refused client gets no connection, a reader's block never reaches the driver while
+its `Have` does and it still hears the room, and a room a connection may not enter neither takes
+its frames, is seen, nor tells it anything.

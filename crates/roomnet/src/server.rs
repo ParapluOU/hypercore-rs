@@ -39,6 +39,10 @@ pub type StoreProvider<F> = Box<dyn Fn(RoomId) -> F + Send + Sync>;
 /// so it must return the same initial state for the same room.
 pub type ProjectionProvider<P> = Box<dyn Fn(RoomId) -> Option<P> + Send + Sync>;
 
+/// Names the [`Authority`](crate::Authority) gating a room, or `None` for a room
+/// that folds every entry where it stands. Every replica of a room must answer alike.
+pub type AuthorityProvider = Box<dyn Fn(RoomId) -> Option<std::sync::Arc<dyn crate::authority::Authority>> + Send + Sync>;
+
 /// A node's collection of rooms.
 pub struct RoomServer<F: StoreFactory, P: Projection> {
     identity_seed: [u8; 32],
@@ -47,6 +51,7 @@ pub struct RoomServer<F: StoreFactory, P: Projection> {
     rooms: BTreeMap<RoomId, Room<F, P>>,
     projection: P,
     own_projection: Option<ProjectionProvider<P>>,
+    authority: Option<AuthorityProvider>,
     new_store: StoreProvider<F>,
 }
 
@@ -70,6 +75,7 @@ where
             rooms: BTreeMap::new(),
             projection,
             own_projection: None,
+            authority: None,
             new_store: Box::new(new_store),
         }
     }
@@ -82,6 +88,25 @@ where
     ) -> Self {
         self.own_projection = Some(Box::new(own_projection));
         self
+    }
+
+    /// Gate the rooms `authority` names one for (see [`authority`](crate::authority)).
+    /// Applies to rooms opened from here on.
+    pub fn with_authorities(
+        mut self,
+        authority: impl Fn(RoomId) -> Option<std::sync::Arc<dyn crate::authority::Authority>> + Send + Sync + 'static,
+    ) -> Self {
+        self.authority = Some(Box::new(authority));
+        self
+    }
+
+    /// Open `room`, gated if an authority is named for it.
+    fn open_room(&self, room: RoomId, cfg: RoomConfig) -> Result<Room<F, P>, Error<StoreErr<F>>> {
+        let mut r = Room::open(cfg, (self.new_store)(room), self.initial_projection(room))?;
+        if let Some(authority) = self.authority.as_ref().and_then(|name| name(room)) {
+            r.set_authority(Some(authority))?;
+        }
+        Ok(r)
     }
 
     /// The projection `room` starts from.
@@ -97,7 +122,7 @@ where
     pub fn host(&mut self, room: RoomId) -> Result<&mut Room<F, P>, Error<StoreErr<F>>> {
         if !self.rooms.contains_key(&room) {
             let cfg = RoomConfig::original(self.mint_identity(), self.indexers.clone());
-            let r = Room::open(cfg, (self.new_store)(room), self.initial_projection(room))?;
+            let r = self.open_room(room, cfg)?;
             self.rooms.insert(room, r);
         }
         Ok(self.rooms.get_mut(&room).expect("just inserted"))
@@ -123,7 +148,7 @@ where
         if !self.rooms.contains_key(&room) {
             let cfg =
                 RoomConfig::replicated(self.mint_identity(), indexers, self.replica_stale_after);
-            let r = Room::open(cfg, (self.new_store)(room), self.initial_projection(room))?;
+            let r = self.open_room(room, cfg)?;
             self.rooms.insert(room, r);
         }
         Ok(self.rooms.get_mut(&room).expect("just inserted"))
