@@ -721,3 +721,35 @@ fn a_gated_log_refolds_to_the_same_settled_state() {
     assert_eq!(value(rs.snapshot_finalized(), b"dropped"), Some(b"2".as_slice()));
     assert!(!rs.is_gated());
 }
+
+#[test]
+fn an_op_that_needs_no_verdict_takes_effect_where_it_stands() {
+    let (s, c) = (seed(31), seed(32));
+    let sk = s.public().to_bytes();
+    let gate = || {
+        Some(std::sync::Arc::new(KeyAuthority::new([sk]).dels_need_no_verdict()) as std::sync::Arc<dyn crate::Authority>)
+    };
+    let mut rs = Room::open(RoomConfig::original(s, vec![sk]), MemStoreFactory, KvProjection::new()).unwrap();
+    rs.set_authority(gate()).unwrap();
+    let mut rc = Room::open(RoomConfig::original(c, vec![sk]), MemStoreFactory, KvProjection::new()).unwrap();
+    rc.set_authority(gate()).unwrap();
+    let ck = rc.local_key();
+
+    let outs = rs.local_append(&put(b"k", b"v")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    // The client's DEL needs no verdict; its PUT does.
+    let outs = rc.local_append(&del(b"k")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    let outs = rc.local_append(&put(b"other", b"1")).unwrap();
+    pump2(&mut rs, sk, &mut rc, ck, vec![(false, outs)]);
+    // Two more authority entries confirm the client's, settling nothing.
+    for key in [b"a".as_slice(), b"b".as_slice()] {
+        let outs = rs.local_append(&put(key, b"1")).unwrap();
+        pump2(&mut rs, sk, &mut rc, ck, vec![(true, outs)]);
+    }
+    for room in [&rs, &rc] {
+        assert!(value(room.snapshot_finalized(), b"k").is_none(), "the DEL took effect without a verdict");
+        assert!(value(room.snapshot_finalized(), b"other").is_none(), "the PUT still waits");
+        assert_eq!(room.awaiting(), [NodeId::new(ck, 1)].as_slice(), "only the PUT is waiting");
+    }
+}

@@ -7,7 +7,8 @@
 //! Some refusals cannot be reached that way: the check needs something only one
 //! party holds (state outside the room, or a rule only it may judge). A room with an
 //! [`Authority`] is **gated** for exactly that case. An entry written by anyone but
-//! an authority then takes no effect at its own position; it waits until an
+//! an authority then takes no effect at its own position (unless the authority says
+//! its kind [needs no verdict](Authority::needs_verdict)); it waits until an
 //! authority writes a [`Verdict`] naming it, and takes effect — or is dropped — at
 //! the verdict's position. Because the verdict is itself an entry in the log, every
 //! replica reaches the same decision by folding the same order, with nothing but the
@@ -44,4 +45,12 @@ pub trait Authority: Send + Sync {
     /// The verdict `payload` carries, if it is one. Asked only about entries an
     /// authority wrote; `None` means an ordinary op, handed to the projection.
     fn verdict(&self, payload: &[u8]) -> Option<Verdict>;
+
+    /// Does an entry with this `payload`, written by someone who is not an
+    /// authority, wait for a verdict? `false` lets it take effect where it stands,
+    /// as in a room that is not gated — for ops no authority needs to judge (ones
+    /// that commute, say), so they do not cost a verdict each. Defaults to `true`.
+    fn needs_verdict(&self, _payload: &[u8]) -> bool {
+        true
+    }
 }

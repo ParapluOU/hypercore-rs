@@ -965,7 +965,8 @@ where
 /// effect and the fold goes on. With one the room is gated: an authority's verdict
 /// settles the entries it names — the accepted ones take effect here, in the order
 /// the verdict lists them — an authority's other entries take effect where they
-/// stand, and anyone else's entry waits in `awaiting` for a verdict.
+/// stand, and anyone else's entry waits in `awaiting` for a verdict — unless the
+/// authority says its kind needs none, in which case it too takes effect here.
 fn fold<P: Projection>(
     authority: Option<&dyn Authority>,
     proj: &mut P,
@@ -980,7 +981,11 @@ fn fold<P: Projection>(
         return;
     };
     if !authority.is_authority(&node.key) {
-        awaiting.push(node);
+        if authority.needs_verdict(payload) {
+            awaiting.push(node);
+        } else {
+            let _ = proj.apply(node, payload);
+        }
         return;
     }
     let Some(verdict) = authority.verdict(payload) else {

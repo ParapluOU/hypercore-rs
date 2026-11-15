@@ -2242,3 +2242,10 @@ record, and dials by key land on the wrong one.
 
 **Next**
 - Withdrawing access mid-connection; admission for the Iroh transport.
+
+## roomnet: ops that need no verdict (ADR-0055)
+
+**Did**
+- `Authority::needs_verdict(payload)`, default `true`: a non-authority entry of a kind that needs
+  none takes effect where it stands in a gated room.
+- Test: such an op takes effect while another from the same writer waits.

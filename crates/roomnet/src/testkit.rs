@@ -145,11 +145,18 @@ pub fn verdict(accept: &[NodeId], refuse: &[NodeId]) -> Vec<u8> {
 #[derive(Clone, Debug)]
 pub struct KeyAuthority {
     keys: Vec<[u8; 32]>,
+    dels_need_no_verdict: bool,
 }
 
 impl KeyAuthority {
     pub fn new(keys: impl IntoIterator<Item = [u8; 32]>) -> Self {
-        Self { keys: keys.into_iter().collect() }
+        Self { keys: keys.into_iter().collect(), dels_need_no_verdict: false }
+    }
+
+    /// Let anyone's `DEL` ops take effect where they stand, without a verdict.
+    pub fn dels_need_no_verdict(mut self) -> Self {
+        self.dels_need_no_verdict = true;
+        self
     }
 }
 
@@ -166,5 +173,8 @@ impl Authority for KeyAuthority {
         let accept = read_ids(&mut rest)?;
         let refuse = read_ids(&mut rest)?;
         Some(Verdict { accept, refuse })
+    }
+    fn needs_verdict(&self, payload: &[u8]) -> bool {
+        !(self.dels_need_no_verdict && payload.first() == Some(&OP_DEL))
     }
 }

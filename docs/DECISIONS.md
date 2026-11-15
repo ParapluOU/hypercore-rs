@@ -1205,7 +1205,9 @@ authority, and is this payload — written by one — a `Verdict { accept, refus
 entries. In a gated room an entry by anyone else takes no effect where it stands: it waits
 (`Room::awaiting`) until a verdict names it, and then takes effect at the verdict's position, in
 the order the verdict lists it, or is dropped (`Room::is_refused`). An authority's other entries
-take effect where they stand. The first verdict on an entry stands; an id that is not waiting
+take effect where they stand, and so do the entries of a kind the authority says need no verdict
+(`Authority::needs_verdict`, by payload — for ops nobody has to judge, so they cost no verdict
+each). The first verdict on an entry stands; an id that is not waiting
 where the verdict stands is ignored. The live view applies the verdicts already in the unconfirmed
 tail and shows what is still waiting as if it were accepted next. A room without an authority
 folds exactly as before.
@@ -1225,7 +1227,8 @@ be gated alike, or they diverge.
 
 **Validation:** an unsettled entry has no finalized effect and is shown live; an accepted one
 takes effect on both replicas; a refused one never does and is reported refused, and a later
-verdict does not revive it; accepted entries apply in the verdict's order; an authority's own
+verdict does not revive it; an op of a kind that needs no verdict takes effect where it stands
+while others beside it wait; accepted entries apply in the verdict's order; an authority's own
 entries need no verdict and a non-authority's verdict settles nothing; refolding the same log
 under the same gate reproduces the state and the refusals.
 
